@@ -1,0 +1,13 @@
+# Higgsfield 账号：一行一个 Clerk 的 __client cookie（higgsfield.ai 登录后，
+# 开发者工具 → Application → Cookies → clerk.higgsfield.ai → __client 的值）。
+#
+# 通常不用手抄：`npm run higgsfield:login` 会开一个无痕浏览器让人工登录（微软邮箱
+# 密码），登完自己取 cookie、验证一次、写进本文件，同账号就地替换。
+#
+# 它是长效凭据；网关要的 __session JWT 只活约一分钟，由本服务自己现换，不要往这里写。
+# 三种写法都认：
+#   <jwt>
+#   __client=<jwt>
+#   client:<jwt>
+#
+# 空行和 # 开头的行会被忽略。文件在服务运行中被重新读取，改完不用重启。

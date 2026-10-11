@@ -1,0 +1,32 @@
+{
+  "name": "browser-automation-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env --import tsx src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "browser:install": "node scripts/install-browser.mjs",
+    "higgsfield:login": "node --import tsx scripts/higgsfield-login.mjs",
+    "higgsfield:browser": "node --import tsx scripts/higgsfield-browser.mjs",
+    "higgsfield:mcp-login": "node --import tsx scripts/higgsfield-mcp-login.mjs",
+    "miora:import": "node --import tsx scripts/miora-import.mjs",
+    "miora:login": "node --import tsx scripts/miora-login.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.2.1",
+    "fastify": "^5.5.0",
+    "playwright": "^1.55.0",
+    "undici": "^8.10.2",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
