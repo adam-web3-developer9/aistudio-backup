@@ -33,6 +33,12 @@ export interface RecoverySummary {
  * Browser jobs block on the browser pool as before.
  */
 export class JobRunner {
+  private executionGuard?: (job: JobRecord) => Promise<void> | void;
+  setExecutionGuard(guard: (job: JobRecord) => Promise<void> | void) { this.executionGuard = guard; }
+  private assertSubmitAllowed(job: JobRecord) {
+    if (job.id.startsWith('job_system_') && !this.executionGuard) throw new JobError('EXECUTION_OWNER_REQUIRED', 'System execution owner is unavailable');
+    return this.executionGuard?.(job);
+  }
   constructor(
     private readonly jobs: JobStore,
     private readonly assets: AssetStore,
@@ -55,7 +61,10 @@ export class JobRunner {
     const summary: RecoverySummary = { requeued: [], resumed: [], interrupted: [] };
 
     for (const job of this.jobs.list()) {
-      if (job.status === 'queued') {
+      if (job.status === 'queued' && job.id.startsWith('job_system_')) {
+        summary.interrupted.push(job.id);
+        this.jobs.update(job.id, { status: 'failed', error: { code: 'INTERRUPTED', message: 'System execution requires reconciliation after restart' }, finishedAt: new Date().toISOString() });
+      } else if (job.status === 'queued') {
         summary.requeued.push(job.id);
         void this.execute(job.id);
       } else if (job.status === 'running') {
@@ -112,7 +121,9 @@ export class JobRunner {
           originalName: referenceAsset!.originalName
         })),
         options: job.options,
-        onProgress: (progress: JobProgressUpdate) => this.recordProgress(jobId, progress)
+        onProgress: (progress: JobProgressUpdate) => this.recordProgress(jobId, progress),
+        beforeSubmit: async () => { await this.assertSubmitAllowed(this.jobs.get(jobId)!); },
+        allowPaidRetries: !job.id.startsWith('job_system_')
       };
 
       // An adapter that can run over the API always needs an account; a browser
@@ -160,6 +171,7 @@ export class JobRunner {
         started = true;
 
         try {
+          await this.assertSubmitAllowed(this.jobs.get(jobId)!);
           const direct = session?.cookies.length
             ? adapter.runWithoutBrowser?.(session.cookies, input)
             : undefined;
@@ -217,6 +229,12 @@ export class JobRunner {
     }
   }
 
+  /** Explicit reconciliation only: requires recorded upstream identity; never starts a new generation. */
+  async resumeRecorded(jobId: string): Promise<void> {
+    if (!this.jobs.get(jobId)?.progress?.providerJobId) throw new JobError('UPSTREAM_ID_REQUIRED', 'Recorded upstream identity is required');
+    await this.resume(jobId);
+  }
+
   /** Continue polling a render that the previous process had already submitted. */
   private async resume(jobId: string): Promise<void> {
     const job = this.jobs.get(jobId);
@@ -253,7 +271,9 @@ export class JobRunner {
       const pending = adapter.resumeWithoutBrowser(session.cookies, job.progress, {
         text: job.text,
         options: job.options,
-        onProgress: (progress) => this.recordProgress(jobId, progress)
+        onProgress: (progress) => this.recordProgress(jobId, progress),
+        beforeSubmit: async () => { await this.assertSubmitAllowed(this.jobs.get(jobId)!); },
+        allowPaidRetries: !job.id.startsWith('job_system_')
       });
       if (!pending) {
         throw new JobError('INTERRUPTED', 'Session lacks the credentials needed to resume this job');

@@ -1,0 +1,60 @@
+# System sharing wire API
+
+Every system route requires a verified, currently cloud-eligible account session. Project access additionally requires `sharingEligible` and a current membership. Administrator roles never bypass project/body/blob ACL.
+
+## Projects
+
+`POST /api/system/projects/:projectId/share`: `{requestId:<stable retry id>,snapshot:{entities:[{type,id,fields}],collections:{"collection-key":["entity-id"]}},members:[{userId,role:"editor"|"viewer"}]}`. Caller becomes owner. Supply a stable `requestId` for lost-ACK replay; a superseded/disabled share request cannot re-enable sharing. `GET /api/system/projects` returns `{data,total}` containing current accessible memberships and project metadata only. IDs are stable strings, entity types are `draft|episode|asset|scene|shot|canvas`. A draft is absent from this service until explicit share. Snapshot and members publish atomically. Returns full confirmed snapshot. Enabling again after disabling increments generation; requests with old generation fail 409.
+
+`GET /api/system/projects/:projectId/snapshot` -> `{projectId,ownerId,generation,revision,entities:[{type,id,fields,versions,deleted}],collections:{key:{ids,version}},members:[{userId,role}]}`. Field versions and collection versions start at 0 in an initial snapshot. `deleted` entities are retained tombstones; do not render them.
+
+`POST /api/system/projects/:projectId/commands` accepts `{commandId,generation,operations:[...]}`. ACK `{commandId,generation,revision}` is sent only after SQLite commit. The whole command is atomic. Server hashes canonical payloads; same ID + payload returns original response, ID reuse with a different payload returns 409 `COMMAND_ID_REUSED`.
+
+Operations:
+
+- `{kind:"update",type,id,set:{field:value},unset:["field"],expected:{field:version}}`. Keys may be a top-level field name or an RFC6901 JSON pointer (`/appearance/color`). Arrays may be set as a whole, and existing elements may be selected by stable `@id=...`, `@boardId=...` or `@candidateId=...` selectors; numeric index paths are forbidden; structures use stable entity IDs. Effective version is the maximum of versions for that path, its ancestors and descendants, excluding siblings. Every touched field must have an exact base version (`0` for initially present or absent fields). Within one atomic command all field and collection preconditions compare to the snapshot at command start. Only touched fields are checked, allowing disjoint edits to merge. A successful operation assigns the command revision to touched fields, including removed fields.
+- `{kind:"insert",type,id,fields,collection?,expectedCollectionVersion?}`. An ID including a tombstone cannot be reused. If a collection is supplied, exact collection version is required and the new ID appends.
+- `{kind:"restore",type,id,fields,expectedDeletedRevision,collection?,expectedCollectionVersion?}` is an explicit conflict-resolution action requiring exact current tombstone `deletedRevision`; ordinary delayed insert/update never restores an entity.
+- `{kind:"delete",type,id,collection?,expectedCollectionVersion?,expectedVersions:{field:version}}`. Every existing entity field version must be supplied. If included in a collection, exact collection version is required. Entity becomes a tombstone.
+- `{kind:"reorder",collection,ids,expectedCollectionVersion}`. Exact collection version and a permutation of existing IDs required.
+- `{kind:"appendCandidate",assetId,candidateId,value}` or `{kind:"appendCandidate",type,id,field,candidateId,value}`. Field is a top-level name or RFC6901 path ending in candidates/imageVariants/videoVariants/audioVariants/videos. Stable array selectors such as `/storyboardBoards/@boardId=1/imageVariants` are allowed; numeric array indexes are refused. Business variant arrays append raw value with `id=candidateId`; the default candidates array appends `{candidateId,value}`. Appends a uniquely keyed media candidate to asset field `candidates`, preserving all prior candidates. Candidate IDs cannot be reused with changed values.
+
+Conflict: 409 `{error:{code:"CONFLICT",message},conflicts:[{type,id,field?,expected,actual}],snapshot:<confirmed snapshot>}`. Preserve pending local operations and their original base separately; this response does not acknowledge them. No user supplied `origin:task|workflow` or `latest` bypass is accepted. Arbitrary secrets, queues and local paths are rejected recursively.
+
+`GET /api/system/projects/:projectId/changes?generation=1&after=0` -> `{generation,revision,changes:[{revision,commandId,operations}]}`. Cursors beyond head, generation mismatch, or unavailable history return `{generation,revision,snapshotRequired:true}`. Fetch this project's snapshot and reconcile local pending operations; never replace unrelated local drafts. Polling is sufficient; notifications are optional.
+
+`PUT /api/system/projects/:projectId/members` `{members:[{userId,role}]}` replaces member whitelist atomically (owner retained). `DELETE /api/system/projects/:projectId/share` disables sharing while retaining cloud records. Only owner may change membership/sharing; editor may submit commands; viewer may read. Revocation applies on next request, including media/job endpoints. Downloaded copies cannot be remotely recalled.
+
+## Media
+
+`POST /api/system/projects/:projectId/media` JSON `{generation,assetId?,entity?:{type,id},hash:<sha256 hex>,size,mime,data:<base64>}` -> `{assetId,hash,size,mime}`. Initial implementation limits to 20 MiB and image/video/audio/PDF formats. Hash, decoded size and type signatures validated. Provide exactly one of assetId or entity. Target must exist and project must currently be shared. Content-addressed replaceable private blob store has no public URL.
+
+`GET /api/system/projects/:projectId/media/:hash` -> private binary, with MIME, no-store and nosniff. ACL on every read. Global blob existence alone never authorizes access.
+
+## System jobs
+
+`POST /api/system/projects/:projectId/jobs` `{requestId,generation,target:{type,id},inputVersion:<project revision>,executor:"server"|"local",kind,parameters:{...}}`. Local execution is bound to the current authenticated session; optional executorSessionId must equal it. Clients may omit it and never receive session IDs in job metadata. Target and confirmed input frozen in transaction. At most one active job per target (type,id). Request replay returns original job; changed payload with same ID is 409. Explicit retry uses a new requestId and increments attempt for target.
+
+`GET /api/system/projects/:projectId/jobs` and `GET .../jobs/:jobId`: member-readable status and target metadata, with frozen input available only to editor/owner; no session IDs, lease tokens, upstream credentials or queues in public status.
+
+`POST .../jobs/:jobId/claim` `{leaseMs?}` -> `{job:<public job>,fence,leaseToken,leaseUntil,input}`. Local jobs can only be claimed by designated current account/session; server jobs can only be claimed through trusted in-process runner API. Fences increase on claims. Lost/expired lease does not authorize automatic repeat of upstream creation.
+
+`POST .../jobs/:jobId/heartbeat` `{fence,leaseToken,leaseMs?}` renews a current lease. Local `{result:{localCompleted:true}}` records durable completion metadata without an extra shared candidate; actual media/results may already have been sent through typed commands.
+
+`POST .../jobs/:jobId/complete` `{fence,leaseToken,result:{...}}` appends a result candidate and terminates the attempt atomically. Matching completion replay returns its durable receipt; changed results are refused. `POST .../jobs/:jobId/fail` `{fence,leaseToken,errorCode}` marks failed; `POST .../jobs/:jobId/cancel` cancels, invalidates fence and cannot be revived by late results. Only editing members may mutate jobs. `server` channel execution uses root's trusted adapter bridge; `local` jobs never become a remotely replicated auto-running queue.
+
+Admin metadata endpoints `GET /api/admin/projects`, `GET /api/admin/system-jobs` return `{data,total}`, accepting page/pageSize. Neither returns snapshots, frozen input, results, blobs, executor session IDs, or private channel credentials.
+
+Server-created changes may contain `{kind:"appendResult",type,id,candidateId,value,jobId,inputVersion,attempt}`; clients append without rerunning execution. Externally supplied appendResult is rejected. Snapshot append operations retain all prior candidates; explicit generic field edits/removals still require exact field versions. Members accept either stable userId or email; email resolves exactly to a verified existing account, and unavailable members return one non-enumerating error.
+
+Sharing disable, re-enable and loss of editing membership cancel affected active jobs and invalidate their fences in the same transaction. This releases old target claims without reviving execution.
+
+Credential keys (including cardKey/secretKey/accessKey/authToken/password and spelling variants), sessions, local paths, checkpoints/inputSnapshot/outputSnapshot/driverCheckpoint, task queues and batchRun are rejected recursively on the server, including decoded RFC6901 paths. Business fields are extensible; runtime execution records are never business fields. Server job appendResult stores `resultCandidates[candidateId]={value,jobId,inputVersion,attempt}` with its field version, matching change replay.
+
+Admin member routes are revoke/downgrade only: PUT existing editor→viewer (or an unchanged role) and DELETE remove. New access or viewer→editor requires the owner through normal project APIs, including for superadmin/operator; no administrator can grant themselves private content access. Trusted `SystemJobStore.reconcileCompleted(jobId,principal,result)` reconciles only proven upstream server success in uncertain state using fresh normal project editing ACL, a new internal fence and the durable result transaction; it never resubmits generation.
+
+Media quotas default to 1 GiB per project and 2 GiB per draft owner across retained projects/generations. Repeated links to the same hash count once per scope. Upload checks before writing a blob and again in the final metadata transaction, returning 413 MEDIA_QUOTA_EXCEEDED; registerSystemMediaRoutes quota limits can be configured. Unlinked blobs after failed final commits require a future orphan-retention/GC policy and must not be exposed through public URLs.
+
+`POST .../jobs/:jobId/uncertain` `{fence,leaseToken,errorCode?}` fences the current attempt and retains the active target claim when execution outcome is unknown. The old exact lease may report uncertainty after its clock expiry, but never after another fence/cancel. `fail` codes containing UNCERTAIN or RECONCILIATION use the same state. No local or server attempt can reclaim uncertain execution automatically; a proven server upstream success uses trusted reconciliation. Inline media/base64 payloads in project fields are forbidden; only the private media endpoint accepts bytes and accounts for their quota.
+
+Recovery clarification: `POST .../jobs/:jobId/outcome-failed` `{fence,leaseToken,errorCode:"SUBMISSION_OUTCOME_UNKNOWN"}` ends an unqueryable local attempt with fresh project rights and the original executor session. A running attempt needs its unchanged exact fence/token, including after clock expiry; uncertain is settled only by its original executor. It never claims no charge occurred. The adapter cannot implicitly retry paid submission or render; existing desktop finite budgets or explicit new server job requests decide the next attempt. Server recovery keeps IDs for queries, while a missing ID/no-query path and a definite render failure become failed rather than permanently frozen. Every actual network route checks the trusted submit gate after proxy discovery.

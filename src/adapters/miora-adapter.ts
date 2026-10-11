@@ -196,7 +196,8 @@ export class MioraAdapter implements BrowserAdapter {
     // The desktop workbench attaches its own platform project before submission.
     // If project lookup is unavailable, generation remains usable without it.
     generation.workflowId = await client.getOrCreateWorkflowId(signal).catch(() => undefined);
-    const taskId = await withMioraRetries('submit', () => client.generateVideo(generation, signal), retry);
+    const taskId = await withMioraRetries('submit', () => client.generateVideo(generation, signal, input.beforeSubmit),
+      { ...retry.asRetryOptions(), shouldRetry: input.allowPaidRetries === false ? () => false : undefined });
     // From here the platform owns the render: persist enough to find it again and,
     // should it fail, to submit it again without re-uploading the references.
     input.onProgress?.({
@@ -212,7 +213,9 @@ export class MioraAdapter implements BrowserAdapter {
       generation,
       renderAttempts: 1,
       uploadedFiles: uploaded,
-      creditsBefore: creditsBefore.totalCredits
+      creditsBefore: creditsBefore.totalCredits,
+      beforeSubmit: input.beforeSubmit,
+      allowPaidRetries: input.allowPaidRetries
     }, retry);
 
     return this.describeResult(client, input.text, task, {
@@ -245,7 +248,9 @@ export class MioraAdapter implements BrowserAdapter {
       generation,
       renderAttempts: progress.renderAttempts ?? 1,
       uploadedFiles: uploaded,
-      creditsBefore: progress.creditsBefore
+      creditsBefore: progress.creditsBefore,
+      beforeSubmit: input.beforeSubmit,
+      allowPaidRetries: input.allowPaidRetries
     }, retry);
 
     return {
@@ -266,6 +271,8 @@ export class MioraAdapter implements BrowserAdapter {
       renderAttempts: number;
       uploadedFiles?: UploadedReference[];
       creditsBefore?: number;
+      beforeSubmit?: () => Promise<void>;
+      allowPaidRetries?: boolean;
     },
     retry: RetryContext
   ): Promise<{ task: MioraTask; attempts: number }> {
@@ -296,7 +303,7 @@ export class MioraAdapter implements BrowserAdapter {
         const keepPolling = error instanceof MioraRenderTimeoutError;
         const canRetry = failure.retryable
           && attempt < maxAttempts
-          && (keepPolling || state.generation !== undefined);
+          && (keepPolling || (state.allowPaidRetries !== false && state.generation !== undefined));
         if (!canRetry) throw new ProviderJobError(failure, attempt, 'render', { cause: error });
 
         const delayMs = delays[attempt - 1]!;
@@ -310,7 +317,7 @@ export class MioraAdapter implements BrowserAdapter {
 
         let resubmittedId: string;
         try {
-          resubmittedId = await withMioraRetries('submit', () => client.generateVideo(state.generation!, signal), retry.asRetryOptions());
+          resubmittedId = await withMioraRetries('submit', () => client.generateVideo(state.generation!, signal, state.beforeSubmit), retry.asRetryOptions());
         } catch (submitError) {
           const verdict = submitError instanceof ProviderJobError
             && (!submitError.retryable || submitError.kind === 'content_rejected');

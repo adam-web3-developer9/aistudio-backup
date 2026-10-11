@@ -56,7 +56,7 @@ export class AssetStore {
     const id = `asset_${randomUUID()}`;
     const extension = safeExtension(input.originalName);
     const filePath = path.join(this.directory, `${id}${extension}`);
-    await writeFile(filePath, input.buffer, { flag: 'wx' });
+    await writeFile(filePath, input.buffer, { flag: 'wx', mode: 0o600 });
 
     const asset: AssetRecord = {
       id,
@@ -69,7 +69,7 @@ export class AssetStore {
 
     this.assets.set(id, asset);
     // Best effort: without the sidecar the asset is still recovered from the file itself.
-    await writeFile(this.metaPath(id), JSON.stringify(asset, null, 2), 'utf8')
+    await writeFile(this.metaPath(id), JSON.stringify(asset, null, 2), {encoding: 'utf8', mode: 0o600})
       .catch((error: unknown) => this.options.onError?.(error, `${id}${META_SUFFIX}`));
     return asset;
   }

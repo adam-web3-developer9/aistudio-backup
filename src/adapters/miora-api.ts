@@ -157,6 +157,8 @@ export interface MioraRequestOptions {
   timeoutMs?: number;
   /** The account's miora.design cookies, sent so T-Sec does not 401 the call. */
   cookie?: string;
+  /** Trusted execution fence, checked after route preparation and before each actual fetch. */
+  beforeRequest?: () => Promise<void>;
 }
 
 export interface MioraResponse<T = unknown> {
@@ -181,7 +183,7 @@ function failedBeforeSending(error: unknown): boolean {
 async function requestViaMioraRoutes(
   url: string,
   init: { method: string; headers: Record<string, string>; body?: string },
-  options: { signal?: AbortSignal; timeoutMs?: number; safeToReplay: boolean; path: string; useProxy?: boolean }
+  options: { signal?: AbortSignal; timeoutMs?: number; safeToReplay: boolean; path: string; useProxy?: boolean; beforeRequest?: () => Promise<void> }
 ): Promise<{ status: number; text: string }> {
   // Snapshot routes for this request; concurrent requests never change each other's exit.
   const snapshot = options.useProxy ? await acquireMioraRoutes() : undefined;
@@ -193,12 +195,14 @@ async function requestViaMioraRoutes(
 async function requestViaRouteSnapshot(
   url: string,
   init: { method: string; headers: Record<string, string>; body?: string },
-  options: { signal?: AbortSignal; timeoutMs?: number; safeToReplay: boolean; path: string },
+  options: { signal?: AbortSignal; timeoutMs?: number; safeToReplay: boolean; path: string; beforeRequest?: () => Promise<void> },
   routes: MioraRoute[]
 ): Promise<{ status: number; text: string }> {
   const failures: string[] = [];
   let lastError: unknown;
   for (const route of routes) {
+    options.signal?.throwIfAborted();
+    await options.beforeRequest?.();
     options.signal?.throwIfAborted();
     const controller = new AbortController();
     const onAbort = () => controller.abort(options.signal?.reason);
@@ -260,6 +264,7 @@ export async function mioraRequest<T = unknown>(
         (method === 'POST' && (path === PROGRESS_PATH || path === CDN_SIGN_PATH)),
       useProxy: (method === 'GET' && path === CREDIT_API_PATH) || (method === 'POST' &&
         (path === GENERATE_VIDEO_PATH || path === GENERATE_IMAGE_PATH || path === PROGRESS_PATH)),
+      beforeRequest: options.beforeRequest,
       path
     });
   const text = response.text;

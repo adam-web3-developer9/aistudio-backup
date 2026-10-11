@@ -149,7 +149,7 @@ export class MioraClient {
   }
 
   /** Submit a video generation and return its platform task id. */
-  async generateVideo(input: MioraGenerateVideoInput, signal?: AbortSignal): Promise<string> {
+  async generateVideo(input: MioraGenerateVideoInput, signal?: AbortSignal, beforeSubmit?: () => Promise<void>): Promise<string> {
     const body: Record<string, unknown> = {
       type: 'text_to_video',
       model: input.model,
@@ -167,7 +167,7 @@ export class MioraClient {
 
     const response = await this.request<{
       data?: { taskId?: string; data?: { taskId?: string } };
-    }>(GENERATE_VIDEO_PATH, { method: 'POST', body, signal });
+    }>(GENERATE_VIDEO_PATH, { method: 'POST', body, signal }, beforeSubmit);
 
     const taskId = response.json?.data?.data?.taskId ?? response.json?.data?.taskId;
     if (!taskId) throw toApiError(response, GENERATE_VIDEO_PATH);
@@ -287,9 +287,10 @@ export class MioraClient {
    */
   private async request<T = unknown>(
     path: string,
-    options: Parameters<typeof mioraRequest>[2] = {}
+    options: Parameters<typeof mioraRequest>[2] = {},
+    beforeRequest?: () => Promise<void>
   ): Promise<MioraResponse<T>> {
-    const withCookie = { ...options, cookie: options.cookie ?? this.tokens.cookie };
+    const withCookie = { ...options, cookie: options.cookie ?? this.tokens.cookie, beforeRequest };
     try {
       return await mioraRequest<T>(this.tokens.authToken, path, withCookie);
     } catch (error) {

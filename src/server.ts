@@ -1,7 +1,16 @@
 import { buildApp } from './app.js';
 import { config } from './config.js';
 
-const app = await buildApp();
+const app = process.env.SYSTEM_ENABLED === 'true'
+  ? (await (await import('./system/web-app.js')).buildSystemWebApp({
+      ...(await import('./system/index.js')).systemOptionsFromEnv(),
+      mediaDirectory: process.env.SYSTEM_MEDIA_DIRECTORY ?? `${config.dataDir}/private-media`,
+      adminDirectory: process.env.SYSTEM_ADMIN_DIRECTORY ?? 'apps/admin/dist',
+      credentialKey: process.env.CHANNEL_CREDENTIAL_KEY,
+      channelsEnabled: process.env.SYSTEM_CHANNELS_ENABLED === 'true',
+      trustProxy: process.env.SYSTEM_TRUST_PROXY?.split(',').map(value => value.trim()).filter(Boolean),
+    })).app
+  : await buildApp();
 
 const shutdown = async () => {
   await app.close();
@@ -12,7 +21,7 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 try {
-  await app.listen({ host: config.host, port: config.port });
+  await app.listen({ host: process.env.SYSTEM_ENABLED === 'true' ? process.env.SYSTEM_HOST ?? '127.0.0.1' : config.host, port: process.env.SYSTEM_ENABLED === 'true' ? Number(process.env.SYSTEM_PORT ?? '3001') : config.port });
 } catch (error) {
   app.log.error(error);
   await app.close();

@@ -21,6 +21,7 @@ export class JobStore {
   private readonly jobs = new Map<string, JobRecord>();
   private readonly directory?: string;
   private readonly writes = new Map<string, Promise<void>>();
+  private readonly persistenceErrors = new Map<string, unknown>();
 
   constructor(private readonly options: JobStoreOptions = {}) {
     this.directory = options.dataDir ? path.join(options.dataDir, 'jobs') : undefined;
@@ -46,10 +47,11 @@ export class JobStore {
     }
   }
 
-  create(input: CreateJobInput): JobRecord {
+  create(input: CreateJobInput, durableId?: string): JobRecord {
+    if (durableId && this.jobs.has(durableId)) return this.get(durableId)!;
     const job: JobRecord = {
-      id: `job_${randomUUID()}`,
       ...input,
+      id: durableId ?? `job_${randomUUID()}`,
       status: 'queued',
       createdAt: new Date().toISOString()
     };
@@ -104,13 +106,21 @@ export class JobStore {
     await Promise.allSettled([...this.writes.values()]);
   }
 
+  async flushOrThrow(id: string): Promise<void> {
+    await this.writes.get(id);
+    const error = this.persistenceErrors.get(id);
+    if (error) throw error;
+    if (!this.directory) throw new Error('Durable channel jobs require a data directory');
+  }
+
   private persist(job: JobRecord): void {
     if (!this.directory) return;
     const snapshot = structuredClone(job);
     const previous = this.writes.get(job.id) ?? Promise.resolve();
     const write = previous
       .then(() => this.writeJob(snapshot))
-      .catch((error: unknown) => this.options.onError?.(error, job.id));
+      .then(() => { this.persistenceErrors.delete(job.id); })
+      .catch((error: unknown) => { this.persistenceErrors.set(job.id, error); this.options.onError?.(error, job.id); });
     this.writes.set(job.id, write);
     void write.then(() => {
       if (this.writes.get(job.id) === write) this.writes.delete(job.id);
@@ -121,7 +131,7 @@ export class JobStore {
   private async writeJob(job: JobRecord): Promise<void> {
     const target = this.filePath(job.id);
     const temp = `${target}.tmp`;
-    await writeFile(temp, JSON.stringify(job, null, 2), 'utf8');
+    await writeFile(temp, JSON.stringify(job, null, 2), { encoding: 'utf8', mode: 0o600 });
     await rename(temp, target);
   }
 

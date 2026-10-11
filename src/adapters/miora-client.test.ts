@@ -30,6 +30,23 @@ describe('MioraClient credit errors', () => {
 });
 
 describe('MioraClient token renewal', () => {
+  it('rechecks the paid-submit gate after token renewal before retrying a rejected request', async () => {
+    const mock = new MockAgent(); mock.disableNetConnect(); setGlobalDispatcher(mock);
+    const origin = mock.get('https://miora.design');
+    let submissions = 0; let checks = 0;
+    origin.intercept({ path: '/api/ai/media-generate/video', method: 'POST' })
+      .reply(() => { submissions++; return { statusCode: 401, data: 'expired' }; });
+    origin.intercept({ path: '/api/auth/refresh-token', method: 'POST' })
+      .reply(200, { access_token: 'new-access', refresh_token: 'new-refresh' });
+    const client = new MioraClient({ authToken: 'old-access', refreshToken: 'old-refresh' });
+    try {
+      await expect(client.generateVideo({ model: 'minimax-h3', prompt: 'isolated', durationSeconds: 4,
+        resolution: '768P', aspectRatio: '16:9' }, undefined, async () => {
+        if (++checks > 1) throw new Error('Execution canceled during token renewal');
+      })).rejects.toThrow('Execution canceled');
+      expect(checks).toBe(2); expect(submissions).toBe(1);
+    } finally { await mock.close(); }
+  });
   it('persists the rotated pair before retrying a rejected request', async () => {
     const mock = new MockAgent();
     mock.disableNetConnect();

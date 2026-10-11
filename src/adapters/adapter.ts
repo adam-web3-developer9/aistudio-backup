@@ -38,10 +38,14 @@ export interface AdapterInput {
    * as it exists — that is what makes the job resumable after a restart.
    */
   onProgress?: (progress: JobProgressUpdate) => void;
+  /** Trusted runner gate checked immediately before every paid submission/retry. */
+  beforeSubmit?: () => Promise<void>;
+  /** System-owned jobs require an explicit new attempt instead of implicit paid retries. */
+  allowPaidRetries?: boolean;
 }
 
 /** What a resumed job still knows about itself: no image files are needed to poll. */
-export type ResumeInput = Pick<AdapterInput, 'text' | 'options' | 'onProgress'>;
+export type ResumeInput = Pick<AdapterInput, 'text' | 'options' | 'onProgress' | 'beforeSubmit' | 'allowPaidRetries'>;
 
 export interface BrowserAdapter {
   readonly id: string;

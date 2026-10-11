@@ -1,4 +1,7 @@
 import path from 'node:path';
+import { ManagedSessionStore } from './system-channels/session-store.js';
+import type { ChannelStore } from './system-channels/store.js';
+import { systemLoggerOptions } from './system/security.js';
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import { z } from 'zod';
@@ -74,14 +77,14 @@ const supportedAssetTypes = new Set([
 ]);
 const MIN_RETAINED_HAILUO_CREDITS = 28;
 
-export async function buildApp() {
-  const app = Fastify({ logger: true });
+export async function buildApp(options: { managedChannels?: ChannelStore; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
+  const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
   /** Accounts seen at 0 credits, kept so `/v1/accounts` can report them. */
   const exhaustedAccounts = new Map<string, AccountSnapshot>();
   const assets = new AssetStore(config.dataDir, {
     onError: (error, fileName) => app.log.warn({ err: error, fileName }, 'Skipped unreadable upload')
   });
-  const sessions = new SessionStore(config.dataDir);
+  const sessions = options.managedChannels ? new ManagedSessionStore(config.dataDir, options.managedChannels) : new SessionStore(config.dataDir);
   const jobs = new JobStore({
     dataDir: config.dataDir,
     onError: (error, jobId) => app.log.error({ err: error, jobId }, 'Failed to persist job record')
@@ -596,7 +599,7 @@ export async function buildApp() {
       }
     }
     const wanted = new Set(accounts.map((account) => account.sessionId));
-    const stored = (await sessions.list()).filter((session) => session.adapterId === miora.id);
+    const stored = (await sessions.list()).filter((session) => session.adapterId === miora.id && !options.managedChannels?.row(session.id));
     const storedTokens = new Map(
       stored.map((session) => [session.id, readMioraTokens(session.cookies)?.authToken])
     );
@@ -718,6 +721,7 @@ export async function buildApp() {
 
   /** A retired account whose last job just finished can finally go. */
   async function releaseRetiredSession(sessionId: string): Promise<void> {
+    if (options.managedChannels?.row(sessionId)) return;
     const stillConfigured = configuredTokens.has(sessionId)
       || configuredDreamMakerAccounts.has(sessionId)
       || configuredHiggsfieldAccounts.has(sessionId)
@@ -933,10 +937,10 @@ export async function buildApp() {
     });
   }, config.mioraTokenCheckMs);
   mioraTokenTimer.unref();
-  await browsers.initialize();
+  if (options.warmup !== false) await browsers.initialize();
 
   // Read balances once at boot so a dead account is reported before any job.
-  const initialAccounts = await accountPool.snapshot({ refresh: true }).catch((error) => {
+  const initialAccounts = options.warmup === false ? [] : await accountPool.snapshot({ refresh: true }).catch((error) => {
     app.log.warn({ err: error }, 'Initial account credit check failed');
     return [];
   });
@@ -972,7 +976,9 @@ export async function buildApp() {
   });
 
   app.addHook('onRequest', async (request, reply) => {
-    if (!request.url.startsWith('/v1/') || !config.apiKey) return;
+    if (!request.url.startsWith('/v1/')) return;
+    if (options.managedChannels) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Legacy channel HTTP API is disabled in the system service'));
+    if (!config.apiKey) return;
     if (request.headers['x-api-key'] !== config.apiKey) {
       return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid API key' } });
     }
@@ -1192,6 +1198,7 @@ export async function buildApp() {
     await browsers.close();
     await jobs.flush();
   });
+  app.decorate('channelRuntime', { jobs, runner, assets, accountPool, sessions });
   return app;
 }
 
