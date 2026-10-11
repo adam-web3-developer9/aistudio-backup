@@ -9,7 +9,13 @@ export function assertSystemRequestOrigin(request: FastifyRequest, trustedOrigin
   if (mutation && request.headers.cookie && !origin) throw new SystemError(403, 'ORIGIN_REQUIRED', 'Origin is required for cookie-authenticated mutations');
   if (request.headers['sec-fetch-site'] === 'cross-site' && !origin) throw new SystemError(403, 'UNTRUSTED_ORIGIN', 'Origin is required for cross-site requests');
   if (mutation && !request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
-    throw new SystemError(415, 'JSON_REQUIRED', 'Use application/json for system requests');
+    const match = /^\/api\/system\/projects\/([^/]+)\/media$/.exec(request.url.split('?')[0]!);
+    let mediaId = ''; try { mediaId = match ? decodeURIComponent(match[1]!) : ''; } catch { /* Reject invalid encoding. */ }
+    const metadata = request.headers['x-media-metadata'];
+    const binaryMedia = request.method === 'POST' && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,159}$/.test(mediaId)
+      && request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() === 'application/octet-stream'
+      && typeof metadata === 'string' && Buffer.byteLength(metadata) <= 4096;
+    if (!binaryMedia) throw new SystemError(415, 'JSON_REQUIRED', 'Use JSON or the bounded private-media streaming endpoint');
   }
 }
 

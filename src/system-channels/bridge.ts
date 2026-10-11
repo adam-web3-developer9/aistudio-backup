@@ -1,4 +1,8 @@
 import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { mkdtemp, open, readFile, rm, statfs } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { z } from 'zod';
 import type { SystemRuntime } from '../system/index.js';
 import { SystemError } from '../system/types.js';
@@ -10,7 +14,7 @@ import type { JobRunner } from '../jobs/job-runner.js';
 import type { AccountPool } from '../jobs/account-pool.js';
 import type { AssetStore } from '../stores/asset-store.js';
 import type { SessionStore } from '../stores/session-store.js';
-import { checkMediaQuota, type PrivateBlobStore } from '../system-media/routes.js';
+import { checkMediaQuota, resolveMediaPolicy, type MediaPolicy, type PrivateBlobStore } from '../system-media/routes.js';
 export interface LegacyChannelRuntime {
   jobs: JobStore; runner: JobRunner; accountPool: AccountPool; assets: AssetStore; sessions: SessionStore;
 }
@@ -22,13 +26,14 @@ const parametersSchema = z.object({
 }).strict();
 interface BridgeOptions {
   runtime: SystemRuntime; channels: ChannelStore; jobs: SystemJobStore; legacy?: LegacyChannelRuntime;
-  blobs: PrivateBlobStore; fetchResult?: typeof fetch; pollIntervalMs?: number;
+  blobs: PrivateBlobStore; fetchResult?: typeof fetch; pollIntervalMs?: number; mediaPolicy?: Partial<MediaPolicy>;
 }
 /** Durable system claim delegates to existing channel worker; public results are private blob references. */
 export class ChannelJobBridge {
   private timers = new Map<string, ReturnType<typeof setInterval>>();
   private reconciliation = new Map<string,Promise<void>>();
   private claims = new Map<string, { jobId: string; principal: ProjectPrincipal; lease: Lease }>();
+  private resultTransfers = new Map<string, number>();
   constructor(private options: BridgeOptions) {
     const { runtime, jobs, channels, legacy } = options;
     runtime.db.exec('CREATE TABLE IF NOT EXISTS system_channel_jobs(job_id TEXT PRIMARY KEY,channel_job_id TEXT UNIQUE NOT NULL,account_id TEXT NOT NULL,created_at TEXT NOT NULL)');
@@ -59,31 +64,44 @@ export class ChannelJobBridge {
   }
   private async materialize(row: SystemJobRow, principal: ProjectPrincipal, raw: unknown) {
     const { jobs, runtime, blobs } = this.options;
+    const policy=resolveMediaPolicy(this.options.mediaPolicy);
     jobs.projects.access(row.project_id, principal, true);
     const videoUrl = (raw as { videoUrl?: unknown } | null)?.videoUrl;
     if (typeof videoUrl !== 'string') throw new Error('Result is unavailable');
     const url = new URL(videoUrl);
     if (url.protocol !== 'https:' || !/(?:\.myqcloud\.com|\.miora\.design|\.miora\.ai)$/.test(url.hostname) || url.username || url.password) throw new Error('Result host is not allowed');
-    const response = await (this.options.fetchResult ?? fetch)(url, { redirect: 'error', signal: AbortSignal.timeout(60000) });
-    if (!response.ok || !response.body) throw new Error('Result is unavailable');
-    const reader = response.body.getReader(); const chunks: Buffer[] = []; let size = 0;
+    const active=[...this.resultTransfers.values()].reduce((sum,count)=>sum+count,0),mine=this.resultTransfers.get(principal.id)??0;
+    if(active>=policy.maxConcurrentUploads||mine>=policy.maxConcurrentPerUser||(active+1)*policy.maxFileBytes>policy.maxReservedBytes||(mine+1)*policy.maxFileBytes>policy.maxReservedPerUserBytes)throw new SystemError(429,'RESULT_TRANSFER_BUSY','视频结果传输繁忙，请稍后核对已有结果');
+    this.resultTransfers.set(principal.id,mine+1);
+    let directory:string|undefined,pendingResponse:Response|undefined;
     try {
-      for (;;) { const next = await reader.read(); if (next.done) break; size += next.value.length;
-        if (size > 20 * 1024 * 1024) throw new Error('Result exceeds the private media limit'); chunks.push(Buffer.from(next.value)); }
-    } finally { await reader.cancel().catch(() => {}); }
-    const bytes = Buffer.concat(chunks);
-    if (bytes.length < 12 || bytes.toString('ascii', 4, 8) !== 'ftyp') throw new Error('Result is not a video');
-    const hash = createHash('sha256').update(bytes).digest('hex'); checkMediaQuota(runtime.db,row.project_id,hash,bytes.length); await blobs.put(hash, bytes);
+      const space=await statfs(tmpdir());if(Number(space.bavail)*Number(space.bsize)<(active+1)*policy.maxFileBytes*2+64*1024*1024)throw new SystemError(507,'MEDIA_DISK_FULL','临时磁盘空间不足，生成结果保留上游，稍后核对');
+      const response = await (this.options.fetchResult ?? fetch)(url, { redirect: 'error', signal: AbortSignal.timeout(120000) });
+      pendingResponse=response;
+      if (!response.ok || !response.body) throw new Error('Result is unavailable');
+      const lengthHeader=response.headers.get('content-length'),declared=lengthHeader===null?undefined:Number(lengthHeader);
+      if(declared!==undefined&&(!Number.isSafeInteger(declared)||declared<=0||declared>policy.maxFileBytes)){await response.body.cancel();throw new SystemError(413,'MEDIA_TOO_LARGE',`视频超过单文件 ${Math.floor(policy.maxFileBytes/1024/1024)} MiB 限制，请调整媒体策略或缩小视频`);}
+      directory=await mkdtemp(path.join(tmpdir(),'aistudio-result-'));const file=path.join(directory,'result.tmp');
+      const handle=await open(file,'wx',0o600),reader=response.body.getReader(),digest=createHash('sha256');let size=0,head=Buffer.alloc(0);
+      try {
+        for (;;) {const next=await reader.read();if(next.done)break;size+=next.value.length;if(size>policy.maxFileBytes)throw new SystemError(413,'MEDIA_TOO_LARGE',`视频超过单文件 ${Math.floor(policy.maxFileBytes/1024/1024)} MiB 限制`);const chunk=Buffer.from(next.value);digest.update(chunk);if(head.length<12)head=Buffer.concat([head,chunk.subarray(0,12-head.length)]);await handle.writeFile(chunk);}
+        await handle.sync();
+      } finally {try{await handle.close();}finally{await reader.cancel().catch(()=>{});reader.releaseLock();}}
+      if(size<12||head.toString('ascii',4,8)!=='ftyp'||declared!==undefined&&declared!==size)throw new Error('Result signature or size does not match');
+      const hash=digest.digest('hex');checkMediaQuota(runtime.db,row.project_id,hash,size,policy);
+      if(blobs.putStream)await blobs.putStream(hash,createReadStream(file),{size,mime:'video/mp4',maxBytes:policy.maxFileBytes});
+      else {if(size>20*1024*1024)throw new SystemError(503,'STREAM_STORAGE_REQUIRED','大视频需要流式媒体存储');await blobs.put(hash,await readFile(file));}
     // Async I/O above may overlap member removal, expiry, logout or target deletion.
-    const project = jobs.projects.access(row.project_id, principal, true); jobs.projects.generation(project, row.generation);
-    const target = jobs.projects.snapshotFromRow(project).entities.find(entity => entity.type === row.target_type && entity.id === row.target_id && !entity.deleted);
-    if (!target) throw new Error('Result target was removed');
-    return { channel: 'miora', media: { hash, size: bytes.length, mime: 'video/mp4' } };
+      const project = jobs.projects.access(row.project_id, principal, true); jobs.projects.generation(project, row.generation);
+      const target = jobs.projects.snapshotFromRow(project).entities.find(entity => entity.type === row.target_type && entity.id === row.target_id && !entity.deleted);
+      if (!target) throw new Error('Result target was removed');
+      return { channel: 'miora', media: { hash, size, mime: 'video/mp4' } };
+    } finally {await pendingResponse?.body?.cancel().catch(()=>{});this.resultTransfers.set(principal.id,(this.resultTransfers.get(principal.id)??1)-1);if(this.resultTransfers.get(principal.id)===0)this.resultTransfers.delete(principal.id);if(directory)await rm(directory,{recursive:true,force:true});}
   }
   private commitResult<T>(row:SystemJobRow,principal:ProjectPrincipal,result:{media:{hash:string;size:number;mime:string}},complete:()=>T):T {
     return this.options.runtime.db.transaction(()=>{
       const project=this.options.jobs.projects.access(row.project_id,principal,true);this.options.jobs.projects.generation(project,row.generation);
-      checkMediaQuota(this.options.runtime.db,row.project_id,result.media.hash,result.media.size);
+      checkMediaQuota(this.options.runtime.db,row.project_id,result.media.hash,result.media.size,resolveMediaPolicy(this.options.mediaPolicy));
       this.options.runtime.db.prepare('INSERT OR IGNORE INTO shared_project_media VALUES(?,?,?,?,?,?,?)').run(row.project_id,row.generation,row.target_type,row.target_id,result.media.hash,result.media.size,result.media.mime);
       return complete();
     }).immediate();

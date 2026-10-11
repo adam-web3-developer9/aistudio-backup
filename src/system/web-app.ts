@@ -5,13 +5,13 @@ import { createSystemRuntime, registerSystemRoutes, systemLoggerOptions, type Sy
 import { SystemError } from './types.js';
 import { SystemRequestBudget } from './request-budget.js';
 import { registerProjectRoutes } from '../projects/routes.js';
-import { LocalPrivateBlobStore, registerSystemMediaRoutes } from '../system-media/routes.js';
+import { LocalPrivateBlobStore, registerSystemMediaRoutes, resolveMediaPolicy, type MediaPolicy } from '../system-media/routes.js';
 import { registerSystemJobRoutes } from '../system-jobs/routes.js';
 import { ChannelStore } from '../system-channels/store.js';
 import { registerChannelRoutes } from '../system-channels/routes.js';
 import { ChannelJobBridge, type LegacyChannelRuntime } from '../system-channels/bridge.js';
 
-export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; trustProxy?: boolean | string[] }
+export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; trustProxy?: boolean | string[]; mediaPolicy?: Partial<MediaPolicy>; beforeReady?: (app: FastifyInstance) => void | Promise<void> }
 /** One Fastify service: identity, administration, drafts/media/jobs; legacy video becomes an optional channel. */
 export async function buildSystemWebApp(options:SystemWebOptions) {
   const runtime=await createSystemRuntime(options);let app:FastifyInstance | undefined;
@@ -31,15 +31,18 @@ export async function buildSystemWebApp(options:SystemWebOptions) {
       }
     });
     await registerSystemRoutes(app,{runtime});
-    const projects=registerProjectRoutes(app,{runtime});const blobs=new LocalPrivateBlobStore(options.mediaDirectory);registerSystemMediaRoutes(app,{runtime,projects,blobs});
+    const mediaPolicy=resolveMediaPolicy(options.mediaPolicy);
+    app.get('/api/system/media-policy',async request=>{await runtime.authenticate(request);return {maxFileBytes:mediaPolicy.maxFileBytes,projectBytes:mediaPolicy.projectBytes,ownerBytes:mediaPolicy.ownerBytes};});
+    const projects=registerProjectRoutes(app,{runtime});const blobs=new LocalPrivateBlobStore(options.mediaDirectory);registerSystemMediaRoutes(app,{runtime,projects,blobs,mediaPolicy});
     const jobs=registerSystemJobRoutes(app,{runtime,projects,onServerJob:(id,principal)=>bridge.submit(id,principal)});
     const legacy=options.channelsEnabled?(app as unknown as {channelRuntime:LegacyChannelRuntime}).channelRuntime:undefined;
-    const bridge=new ChannelJobBridge({runtime,channels,jobs,legacy,blobs});
+    const bridge=new ChannelJobBridge({runtime,channels,jobs,legacy,blobs,mediaPolicy});
     app.post('/api/system/projects/:projectId/jobs/:jobId/reconcile',async(request,reply)=>{const params=request.params as {projectId:string;jobId:string};const principal=await runtime.authenticate(request);jobs.access(params.projectId,params.jobId,principal,true);return bridge.reconcile(params.jobId,principal);});
     app.addHook('onClose',async()=>bridge.close());
     registerChannelRoutes(app,{runtime,store:channels,changed:async()=>{if(legacy){const accounts=runtime.db.prepare('SELECT id,enabled,archived_at FROM managed_channel_accounts').all() as {id:string;enabled:number;archived_at:string|null}[];for(const account of accounts){if(account.enabled&&!account.archived_at)legacy.accountPool.unretire(account.id);else legacy.accountPool.retire(account.id);}await legacy.accountPool.sync();}}});
     if(options.adminDirectory)registerAdminFiles(app,options.adminDirectory);
     if(!options.channelsEnabled)app.get('/health',async()=>({status:'ok',service:'system',channelsEnabled:false}));
+    await options.beforeReady?.(app);
     await app.ready();return {app,runtime,projects,jobs,channels,bridge};
   }catch(error){await app?.close();await runtime.close();throw error;}
 }
