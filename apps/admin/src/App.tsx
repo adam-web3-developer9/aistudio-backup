@@ -46,6 +46,13 @@ import {
 } from "./providers";
 const { Title, Text, Paragraph } = Typography;
 type Row = Record<string, any> & { id: string };
+type CredentialFile = {
+  key: number;
+  name: string;
+  credentials?: string;
+  status: "ready" | "invalid" | "importing" | "succeeded" | "failed";
+  error?: string;
+};
 const roleNames: Record<Role, string> = {
   superadmin: "超级管理员",
   operator: "运营管理员",
@@ -327,15 +334,21 @@ function ResourcePage({
   const [form] = Form.useForm();
   const credentialFileInput = useRef<HTMLInputElement>(null);
   const fileReadVersion = useRef(0);
+  const credentialSubmitting = useRef(false);
   const [fileReading, setFileReading] = useState(false);
   const [fileError, setFileError] = useState("");
   const [fileInfo, setFileInfo] = useState("");
+  const [credentialFiles, setCredentialFiles] = useState<CredentialFile[]>([]);
+  const readyFileCount = credentialFiles.filter(
+    (file) => file.status === "ready",
+  ).length;
   const clearFileSelection = () => {
     fileReadVersion.current++;
     if (credentialFileInput.current) credentialFileInput.current.value = "";
     setFileReading(false);
     setFileError("");
     setFileInfo("");
+    setCredentialFiles([]);
   };
   useEffect(
     () => () => {
@@ -344,36 +357,54 @@ function ResourcePage({
     [],
   );
   const loadCredentialFile = async (input: HTMLInputElement) => {
-    const file = input.files?.[0];
+    const files = Array.from(input.files ?? []);
     clearFileSelection();
     form.setFieldValue("credentials", "");
-    if (!file) return;
-    if (!/\.(json|txt)$/i.test(file.name)) {
-      setFileError("请选择 .json 或 .txt 文件。");
-      return;
-    }
-    if (file.size > 512 * 1024) {
-      setFileError("文件不能超过 512 KiB。");
-      return;
-    }
-    if (!file.size) {
-      setFileError("文件为空，请选择包含凭据的文件。");
-      return;
-    }
+    if (!files.length) return;
     const version = fileReadVersion.current;
     setFileReading(true);
     try {
-      const contents = await file.text();
-      if (version !== fileReadVersion.current) return;
-      if (new TextEncoder().encode(contents).length > 512 * 1024) {
-        setFileError("凭据文本不能超过 512 KiB。");
-        return;
+      const loaded: CredentialFile[] = [];
+      for (const file of files) {
+        if (version !== fileReadVersion.current) return;
+        let error = !/\.(json|txt)$/i.test(file.name)
+          ? "请选择 .json 或 .txt 文件。"
+          : file.size > 512 * 1024
+            ? "文件不能超过 512 KiB。"
+            : !file.size
+              ? "文件为空，请选择包含凭据的文件。"
+              : "";
+        let contents = "";
+        if (!error) {
+          try {
+            contents = await file.text();
+            if (new TextEncoder().encode(contents).length > 512 * 1024)
+              error = "凭据文本不能超过 512 KiB。";
+            else if (!contents.trim())
+              error = "文件为空，请选择包含凭据的文件。";
+          } catch {
+            error = "文件读取失败，请重新选择。";
+          }
+        }
+        loaded.push({
+          key: loaded.length,
+          name: file.name,
+          status: error ? "invalid" : "ready",
+          credentials: error ? undefined : contents,
+          error: error || undefined,
+        });
       }
-      form.setFieldValue("credentials", contents);
-      setFileInfo("文件已加载到下方文本框；检查后点击确定才会提交。");
-    } catch {
-      if (version === fileReadVersion.current)
-        setFileError("文件读取失败，请重新选择。");
+      if (version !== fileReadVersion.current) return;
+      if (loaded.length === 1) {
+        const file = loaded[0];
+        if (file.error) setFileError(file.error);
+        else {
+          form.setFieldValue("credentials", file.credentials);
+          setFileInfo("文件已加载到下方文本框；检查后点击确定才会提交。");
+        }
+      } else {
+        setCredentialFiles(loaded);
+      }
     } finally {
       if (version === fileReadVersion.current) setFileReading(false);
     }
@@ -770,7 +801,76 @@ function ResourcePage({
     setDialog(kind);
   };
   const submit = async (values: Row) => {
-    if (fileReading) return;
+    if (fileReading || credentialSubmitting.current) return;
+    if (dialog === "channel" && credentialFiles.length) {
+      if (values.accountId?.trim()) {
+        form.setFields([
+          { name: "accountId", errors: ["批量导入时请留空更新账户 ID。"] },
+        ]);
+        return;
+      }
+      if (!readyFileCount) return;
+      credentialSubmitting.current = true;
+      setPending("submit");
+      setOperationError("");
+      const version = fileReadVersion.current;
+      const files = credentialFiles.map((file) => ({ ...file }));
+      const publish = () => {
+        if (version === fileReadVersion.current)
+          setCredentialFiles(files.map(({ credentials: _credentials, ...file }) => file));
+      };
+      let succeeded = 0;
+      try {
+        for (let index = 0; index < files.length; index++) {
+          const file = files[index];
+          if (file.status !== "ready") continue;
+          if (version !== fileReadVersion.current) break;
+          file.status = "importing";
+          publish();
+          try {
+            await mutation("/api/admin/channels/accounts/miora/import", "POST", {
+              credentials: file.credentials,
+              label: values.label?.trim() || undefined,
+            });
+            file.status = "succeeded";
+            succeeded++;
+          } catch (error) {
+            file.status = "failed";
+            file.error = errorText(error);
+            if ([401, 403].includes((error as any).statusCode)) {
+              for (const remaining of files.slice(index + 1)) {
+                if (remaining.status === "ready") {
+                  remaining.status = "failed";
+                  remaining.error = "管理权限已失效，未提交。";
+                }
+              }
+              if ((error as any).statusCode === 401) onExpired();
+              break;
+            }
+          } finally {
+            file.credentials = undefined;
+            publish();
+          }
+        }
+        if (version === fileReadVersion.current) {
+          const failed = files.filter((file) => file.status !== "succeeded").length;
+          setFileInfo(
+            `导入完成：成功 ${succeeded} 份，失败 ${failed} 份。${failed ? "请重新选择失败文件后导入。" : ""}`,
+          );
+          if (succeeded) message.success(`已导入 ${succeeded} 份凭据`);
+        }
+      } finally {
+        for (const file of files) file.credentials = undefined;
+        publish();
+        if (version === fileReadVersion.current) {
+          form.setFieldValue("credentials", "");
+          setPending("");
+          void query.refetch();
+        }
+        credentialSubmitting.current = false;
+      }
+      return;
+    }
     try {
       if (dialog === "codes") {
         const response = (await run(
@@ -802,11 +902,14 @@ function ResourcePage({
               ? mutation(
                   `/api/admin/channels/accounts/${encodeURIComponent(values.accountId)}`,
                   "PATCH",
-                  { credentials: values.credentials, label: values.label },
+                  {
+                    credentials: values.credentials,
+                    label: values.label?.trim() || undefined,
+                  },
                 )
               : mutation("/api/admin/channels/accounts/miora/import", "POST", {
                   credentials: values.credentials,
-                  label: values.label,
+                  label: values.label?.trim() || undefined,
                 }),
           "渠道凭据已导入",
         );
@@ -964,8 +1067,24 @@ function ResourcePage({
           }
         }}
         onOk={() => form.submit()}
+        width={credentialFiles.length ? 640 : undefined}
+        styles={dialog === "channel" ? {
+          body: { maxHeight: "calc(100vh - 220px)", overflowY: "auto" },
+        } : undefined}
+        okText={
+          credentialFiles.length
+            ? `批量导入${readyFileCount ? `（${readyFileCount}）` : ""}`
+            : "确定"
+        }
+        cancelText={
+          credentialFiles.length && !readyFileCount && !pending ? "关闭" : "取消"
+        }
         confirmLoading={pending === "submit" || fileReading}
-        okButtonProps={{ disabled: fileReading }}
+        okButtonProps={{
+          disabled:
+            fileReading || !!pending ||
+            (credentialFiles.length > 0 && !readyFileCount),
+        }}
         cancelButtonProps={{ disabled: !!pending }}
         destroyOnHidden
       >
@@ -1025,16 +1144,30 @@ function ResourcePage({
                 title="仅提交您有权使用的渠道账户凭据。凭据不会在管理列表中回显。"
                 style={{ marginBottom: 16 }}
               />
-              <Form.Item name="accountId" label="更新账户 ID（新导入留空）">
-                <Input />
+              <Form.Item
+                name="accountId"
+                label="更新账户 ID（新导入留空）"
+                rules={[
+                  {
+                    validator: (_, value) =>
+                      credentialFiles.length && value?.trim()
+                        ? Promise.reject(
+                            new Error("批量导入时请留空更新账户 ID。"),
+                          )
+                        : Promise.resolve(),
+                  },
+                ]}
+              >
+                <Input disabled={!!pending || fileReading} />
               </Form.Item>
               <Form.Item name="label" label="账户标签">
-                <Input maxLength={120} />
+                <Input maxLength={120} disabled={!!pending || fileReading} />
               </Form.Item>
               <Form.Item label="本地凭据文件（可选）">
                 <input
                   ref={credentialFileInput}
                   type="file"
+                  multiple
                   accept=".json,.txt"
                   aria-label="选择本地凭据文件"
                   disabled={!!pending || fileReading}
@@ -1046,7 +1179,7 @@ function ResourcePage({
                   type="secondary"
                   style={{ marginTop: 8, marginBottom: 0 }}
                 >
-                  仅在浏览器读取 .json/.txt，最大 512 KiB，不会自动上传。
+                  支持多选 .json/.txt 文件，每份最大 512 KiB；点击导入后提交。批量导入时账户 ID 留空，标签应用于全部文件。
                 </Paragraph>
               </Form.Item>
               {fileReading && (
@@ -1070,29 +1203,83 @@ function ResourcePage({
                   style={{ marginBottom: 16 }}
                 />
               )}
-              <Form.Item
-                name="credentials"
-                label="Miora 导出 JSON 或 Cookie 文本"
-                rules={[
-                  { required: true, message: "请输入导出的凭据" },
-                  {
-                    validator: (_, value) =>
-                      !value ||
-                      new TextEncoder().encode(value).length <= 512 * 1024
-                        ? Promise.resolve()
-                        : Promise.reject(
-                            new Error("凭据文本不能超过 512 KiB。"),
-                          ),
-                  },
-                ]}
-              >
-                <Input.TextArea
-                  rows={8}
-                  disabled={fileReading || !!pending}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-              </Form.Item>
+              {credentialFiles.length > 0 && (
+                <>
+                  <Paragraph>
+                    已选择 {credentialFiles.length} 个文件
+                    {readyFileCount ? `，待导入 ${readyFileCount} 份` : ""}
+                    <Button
+                      type="link"
+                      disabled={!!pending || fileReading}
+                      onClick={clearFileSelection}
+                    >
+                      清除文件
+                    </Button>
+                  </Paragraph>
+                  <Table<CredentialFile>
+                    size="small"
+                    rowKey="key"
+                    dataSource={credentialFiles}
+                    pagination={false}
+                    scroll={{ y: 240 }}
+                    style={{ marginBottom: 16 }}
+                    columns={[
+                      {
+                        title: "文件",
+                        dataIndex: "name",
+                        ellipsis: true,
+                        width: "45%",
+                      },
+                      {
+                        title: "导入状态",
+                        render: (_, file) => (
+                          <>
+                            <Tag
+                              color={file.status === "succeeded" ? "green" : file.error ? "red" : "blue"}
+                            >
+                              {{
+                                ready: "待导入",
+                                invalid: "文件无效",
+                                importing: "正在导入",
+                                succeeded: "导入成功",
+                                failed: "导入失败",
+                              }[file.status]}
+                            </Tag>
+                            {file.error && (
+                              <Text type="danger">{file.error}</Text>
+                            )}
+                          </>
+                        ),
+                      },
+                    ]}
+                  />
+                </>
+              )}
+              {!credentialFiles.length && (
+                <Form.Item
+                  name="credentials"
+                  label="Miora 导出 JSON 或 Cookie 文本"
+                  rules={[
+                    { required: true, message: "请输入导出的凭据" },
+                    {
+                      validator: (_, value) =>
+                        !value ||
+                        new TextEncoder().encode(value).length <= 512 * 1024
+                          ? Promise.resolve()
+                          : Promise.reject(
+                              new Error("凭据文本不能超过 512 KiB。"),
+                            ),
+                    },
+                  ]}
+                >
+                  <Input.TextArea
+                    rows={8}
+                    disabled={fileReading || !!pending}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </Form.Item>
+              )}
             </>
           )}
         </Form>

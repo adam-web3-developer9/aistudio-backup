@@ -148,6 +148,69 @@ async function fakeApi(page: Page, role: Role, loggedIn = true) {
   });
   return calls;
 }
+
+test("凭据文件多选批量导入超过20份，独立失败与结果清空", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const calls = await fakeApi(page, "superadmin");
+  const imported: string[] = [];
+  await page.route("**/api/admin/channels/accounts/miora/import", async (route) => {
+    const credentials = route.request().postDataJSON().credentials;
+    imported.push(credentials);
+    await route.fulfill({
+      status: credentials === "FAKE-REJECTED" ? 400 : 200,
+      contentType: "application/json",
+      body: JSON.stringify(credentials === "FAKE-REJECTED"
+        ? { code: "INVALID_CREDENTIALS", message: "无效的凭据" }
+        : { id: `channel-${imported.length}` }),
+    });
+  });
+  await page.goto("./");
+  await page.getByRole("menuitem", { name: /渠道账户/ }).click();
+  await page.getByRole("button", { name: "导入 Miora 凭据" }).click();
+  const dialog = page.getByRole("dialog");
+  const files = Array.from({ length: 23 }, (_, index) => ({
+    name: `account-${index + 1}.json`,
+    mimeType: "application/json",
+    buffer: Buffer.from(index === 1 ? "FAKE-REJECTED" : `FAKE-CREDENTIAL-${index + 1}`),
+  }));
+  await page.getByLabel("更新账户 ID（新导入留空）").fill("channel-one");
+  await page.getByLabel("账户标签", { exact: true }).fill("批量账户");
+  await page.getByLabel("选择本地凭据文件").setInputFiles([
+    ...files,
+    { name: "empty.txt", mimeType: "text/plain", buffer: Buffer.alloc(0) },
+    { name: "wrong.csv", mimeType: "text/csv", buffer: Buffer.from("FAKE-WRONG") },
+  ]);
+  await expect(dialog.getByText("已选择 25 个文件，待导入 23 份")).toBeVisible();
+  expect(imported).toHaveLength(0);
+  await dialog.getByRole("button", { name: "批量导入（23）" }).click();
+  await expect(dialog.getByText("批量导入时请留空更新账户 ID。")).toBeVisible();
+  expect(imported).toHaveLength(0);
+  await page.getByLabel("更新账户 ID（新导入留空）").fill("");
+  await dialog.getByRole("button", { name: "批量导入（23）" }).click();
+  await expect(dialog.getByText("导入完成：成功 22 份，失败 3 份。请重新选择失败文件后导入。")).toBeVisible();
+  expect(imported).toEqual(files.map((file) => file.buffer.toString()));
+  await expect(dialog.getByText("导入成功", { exact: true })).toHaveCount(22);
+  await expect(dialog.getByText("导入失败", { exact: true })).toHaveCount(1);
+  await expect(dialog.getByText("文件无效", { exact: true })).toHaveCount(2);
+  await expect(dialog.getByRole("button", { name: "批量导入", exact: true })).toBeDisabled();
+  expect(await dialog.innerText()).not.toContain("FAKE-CREDENTIAL");
+  expect(await page.evaluate(() => Object.values(localStorage).join(""))).not.toContain("FAKE-CREDENTIAL");
+  await page.screenshot({ path: "evidence/batch-credential-import.png", fullPage: true });
+  await dialog.locator(".ant-modal-footer").getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("button", { name: "导入 Miora 凭据" }).click();
+  await expect(page.getByLabel("Miora 导出 JSON 或 Cookie 文本")).toHaveValue("");
+  await expect(page.getByLabel("选择本地凭据文件")).toHaveValue("");
+  await expect(dialog.getByText("account-1.json", { exact: true })).toHaveCount(0);
+  // Single-file import still supports updating a specified account.
+  await page.getByLabel("更新账户 ID（新导入留空）").fill("channel-one");
+  await page.getByLabel("选择本地凭据文件").setInputFiles(files[0]);
+  await expect(page.getByLabel("Miora 导出 JSON 或 Cookie 文本")).toHaveValue("FAKE-CREDENTIAL-1");
+  await expect(dialog.getByRole("button", { name: /确定$/ })).toBeEnabled();
+  await dialog.getByRole("button", { name: /确定$/ }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(calls.find((call) => call.method === "PATCH" && call.path.endsWith("/channel-one"))?.body)
+    .toEqual({ credentials: "FAKE-CREDENTIAL-1" });
+});
 test("登录、账户操作、激活码只显示一次", async ({ page }) => {
   const calls = await fakeApi(page, "operator", false);
   await page.goto("./");
@@ -233,7 +296,7 @@ test("假渠道凭据导入与清空、成员权限修改、API 错误可见", a
   );
   await expect(fileInput).toHaveValue("");
   expect(calls.filter((c) => c.method !== "GET")).toHaveLength(0);
-  await page.getByRole("button", { name: "确定", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: /确定$/ }).click();
   await expect
     .poll(() =>
       calls.some(
