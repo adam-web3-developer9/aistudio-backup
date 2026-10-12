@@ -1,0 +1,3 @@
+# Server scripts are also uploaded directly from Windows over SSH.
+*.sh text eol=lf
+server/deploy/** text eol=lf
