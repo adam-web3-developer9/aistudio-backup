@@ -61,8 +61,14 @@ code releases; the daily existing renewal job handles expiry.
 `systemctl start aistudio-studio-deploy.service` requests an immediate main check.
 Pause updates with `systemctl stop aistudio-studio-deploy.timer`.
 After editing SMTP configuration, restart `aistudio-studio.service` and verify
-SMTP authentication without printing credentials. No successful mail delivery
-is implied by the application health endpoint.
+SMTP authentication without printing credentials or sending a message:
+
+```sh
+cd /www/server/aistudio-studio/current
+/www/server/nodejs/v22.22.3/bin/node --env-file=/etc/aistudio-studio/system.env scripts/verify-system-smtp.mjs
+```
+
+No successful mail delivery is implied by the application health endpoint.
 
 The first administrator must already be registered and email-verified before an
 authorized operator uses the offline bootstrap CLI in `src/system/README.md`.

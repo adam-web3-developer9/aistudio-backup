@@ -87,7 +87,7 @@ mv -Tf "$APP_ROOT/current.next" "$APP_ROOT/current"
 systemctl start aistudio-studio.service
 healthy=false
 for attempt in {1..30}; do
-  if curl --silent --fail --max-time 2 "http://127.0.0.1:$SYSTEM_PORT/health" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'; then
+  if curl --silent --fail --max-time 2 "http://127.0.0.1:$SYSTEM_PORT/health" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"' 2>/dev/null; then
     healthy=true
     break
   fi
