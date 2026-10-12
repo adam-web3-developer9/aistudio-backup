@@ -46,9 +46,10 @@ export const MIORA_RT_COOKIE = 'refreshToken';
  * Other API calls (including COS grants) and Tencent COS uploads stay direct.
  */
 type MioraRoute = { name: string; dispatcher?: Dispatcher };
-function proxyState(proxyUrl?: string, localProxyUrl = 'auto', proxyAddress?: string) {
+function proxyState(proxyUrl?: string, localProxyUrl = 'auto', proxyAddress?: string, requireProxy = false) {
+  if (requireProxy && !proxyUrl) throw new Error('The online Miora gateway requires MIORA_PROXY_URL');
   return {
-    proxyUrl, localProxyUrl,
+    proxyUrl, localProxyUrl, requireProxy,
     primary: proxyUrl ? createMioraProxyAgent(proxyUrl, proxyAddress) : undefined,
     resolveLocal: createSystemProxyResolver(),
     locals: new Map<string, Dispatcher>(),
@@ -69,8 +70,8 @@ function releaseUnusedAgents(state: typeof mioraProxy): void {
   }
 }
 
-export function useMioraProxy(proxyUrl?: string, localProxyUrl = 'auto', proxyAddress?: string): void {
-  const next = proxyState(proxyUrl, localProxyUrl, proxyAddress);
+export function useMioraProxy(proxyUrl?: string, localProxyUrl = 'auto', proxyAddress?: string, requireProxy = false): void {
+  const next = proxyState(proxyUrl, localProxyUrl, proxyAddress, requireProxy);
   mioraProxy.retired = true;
   releaseUnusedAgents(mioraProxy);
   mioraProxy = next;
@@ -81,6 +82,8 @@ async function acquireMioraRoutes(): Promise<{ routes: MioraRoute[]; release: ()
   state.users++;
   const release = () => { state.users--; releaseUnusedAgents(state); };
   try {
+    // A server gateway must keep generation and polling on its configured exit.
+    if (state.requireProxy) return { routes: [{ name: 'Configured proxy', dispatcher: state.primary! }], release };
     const local = state.localProxyUrl.toLowerCase() === 'auto'
       ? await state.resolveLocal() : state.localProxyUrl;
     state.activeLocal = local || undefined;

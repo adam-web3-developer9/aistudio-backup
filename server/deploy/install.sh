@@ -11,6 +11,8 @@ install -d -m 0700 "$APP_ROOT/backups"
 install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "$APP_ROOT/home" "$DATA_ROOT" "$DATA_ROOT/private-media"
 test -f /etc/aistudio-studio/system.env
 chmod 0600 /etc/aistudio-studio/system.env
+# Validation/maintenance never turns on a gateway in an existing installation.
+python3 "$directory/enable-video-gateway.py" --maintain
 # Never replace the machine's Node/npm or other services' package managers.
 npm install --prefix "$APP_ROOT/tools" --no-audit --no-fund pnpm@10.34.7
 if [[ ! -d "$APP_ROOT/repository/.git" ]]; then
@@ -60,3 +62,4 @@ install -m 0644 "$directory/aistudio-studio-deploy.timer" /etc/systemd/system/ai
 systemctl daemon-reload
 systemctl enable aistudio-studio.service
 echo 'Installed. Run aistudio-studio-deploy, then enable --now aistudio-studio-deploy.timer after verification.'
+echo 'To enable Miora after deployment, explicitly run: python3 current/server/deploy/enable-video-gateway.py; then restart aistudio-studio.service.'

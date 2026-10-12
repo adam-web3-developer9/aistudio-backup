@@ -14,6 +14,8 @@ export interface JobRunnerOptions {
   directTimeoutMs: number;
   /** Fired once a job has reached succeeded/failed and its lease is released. */
   onJobSettled?: (job: JobRecord) => void;
+  /** Independent submit guard for explicitly authorized video-gateway work. */
+  beforeSubmitGuard?: (job: JobRecord) => Promise<void> | void;
 }
 
 export interface RecoverySummary {
@@ -35,8 +37,10 @@ export interface RecoverySummary {
 export class JobRunner {
   private executionGuard?: (job: JobRecord) => Promise<void> | void;
   setExecutionGuard(guard: (job: JobRecord) => Promise<void> | void) { this.executionGuard = guard; }
-  private assertSubmitAllowed(job: JobRecord) {
+  private async assertSubmitAllowed(job: JobRecord) {
     if (job.id.startsWith('job_system_') && !this.executionGuard) throw new JobError('EXECUTION_OWNER_REQUIRED', 'System execution owner is unavailable');
+    if (job.id.startsWith('job_gateway_') && !this.options.beforeSubmitGuard) throw new JobError('EXECUTION_OWNER_REQUIRED', 'Video gateway execution is disabled');
+    await this.options.beforeSubmitGuard?.(job);
     return this.executionGuard?.(job);
   }
   constructor(
@@ -123,7 +127,7 @@ export class JobRunner {
         options: job.options,
         onProgress: (progress: JobProgressUpdate) => this.recordProgress(jobId, progress),
         beforeSubmit: async () => { await this.assertSubmitAllowed(this.jobs.get(jobId)!); },
-        allowPaidRetries: !job.id.startsWith('job_system_')
+        allowPaidRetries: !job.id.startsWith('job_system_') && !job.id.startsWith('job_gateway_')
       };
 
       // An adapter that can run over the API always needs an account; a browser
@@ -273,7 +277,7 @@ export class JobRunner {
         options: job.options,
         onProgress: (progress) => this.recordProgress(jobId, progress),
         beforeSubmit: async () => { await this.assertSubmitAllowed(this.jobs.get(jobId)!); },
-        allowPaidRetries: !job.id.startsWith('job_system_')
+        allowPaidRetries: !job.id.startsWith('job_system_') && !job.id.startsWith('job_gateway_')
       });
       if (!pending) {
         throw new JobError('INTERRUPTED', 'Session lacks the credentials needed to resume this job');

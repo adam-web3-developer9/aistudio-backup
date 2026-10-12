@@ -42,6 +42,23 @@ runuser -u "$APP_USER" -- env PATH="$PATH" HOME="$APP_ROOT/home" npm --prefix "$
 runuser -u "$APP_USER" -- env PATH="$PATH" HOME="$APP_ROOT/home" npm --prefix "$release/apps/admin" run build
 test -s "$release/dist/system/server.js"
 test -s "$release/apps/admin/dist/index.html"
+# Maintain only a previously enabled gateway; preserve server-only secrets/config.
+# New deployments must use the explicit migration after this release is active.
+python3 "$release/server/deploy/enable-video-gateway.py" --maintain
+gateway_enabled=$(python3 - /etc/aistudio-studio/system.env <<'PY'
+import pathlib,sys
+values={}
+for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    if not line.strip() or line.lstrip().startswith('#') or '=' not in line:
+        continue
+    key,value=line.split('=',1)
+    values[key.strip()]=value.strip().strip('"\'')
+print('true' if values.get('SYSTEM_VIDEO_GATEWAY_ENABLED')=='true' else 'false')
+PY
+)
+check_health() {
+  python3 -c 'import json,sys; health=json.load(sys.stdin); assert health["status"]=="ok"; assert sys.argv[1]!="true" or health.get("channelsEnabled") is True and health.get("videoGatewayEnabled") is True' "$gateway_enabled"
+}
 
 backup="$APP_ROOT/backups/$(date -u +%Y%m%dT%H%M%SZ)-$commit.sqlite"
 backup_ready=false
@@ -87,7 +104,7 @@ mv -Tf "$APP_ROOT/current.next" "$APP_ROOT/current"
 systemctl start aistudio-studio.service
 healthy=false
 for attempt in {1..30}; do
-  if curl --silent --fail --max-time 2 "http://127.0.0.1:$SYSTEM_PORT/health" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"' 2>/dev/null; then
+  if curl --silent --fail --max-time 2 "http://127.0.0.1:$SYSTEM_PORT/health" | check_health 2>/dev/null; then
     healthy=true
     break
   fi
@@ -95,7 +112,7 @@ for attempt in {1..30}; do
 done
 [[ "$healthy" == true ]]
 curl --silent --fail --max-time 10 "http://127.0.0.1:$SYSTEM_PORT/admin/" -o /dev/null
-curl --silent --fail --max-time 15 "https://$DOMAIN/health" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'
+curl --silent --fail --max-time 15 "https://$DOMAIN/health" | check_health
 printf '%s\n' "$commit" > "$APP_ROOT/deployed-commit.next"
 mv -f "$APP_ROOT/deployed-commit.next" "$APP_ROOT/deployed-commit"
 rm -f "$APP_ROOT/failed-commit"

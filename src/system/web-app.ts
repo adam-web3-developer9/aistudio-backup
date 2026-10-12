@@ -10,14 +10,19 @@ import { registerSystemJobRoutes } from '../system-jobs/routes.js';
 import { ChannelStore } from '../system-channels/store.js';
 import { registerChannelRoutes } from '../system-channels/routes.js';
 import { ChannelJobBridge, type LegacyChannelRuntime } from '../system-channels/bridge.js';
+import { assertVideoGatewayConfiguration, assertVideoGatewayProxyConfiguration } from '../system-channels/video-gateway.js';
+import { config } from '../config.js';
 
-export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; trustProxy?: boolean | string[]; mediaPolicy?: Partial<MediaPolicy>; beforeReady?: (app: FastifyInstance) => void | Promise<void> }
+export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; videoGatewayEnabled?: boolean; trustProxy?: boolean | string[]; mediaPolicy?: Partial<MediaPolicy>; beforeReady?: (app: FastifyInstance) => void | Promise<void> }
 /** One Fastify service: identity, administration, drafts/media/jobs; legacy video becomes an optional channel. */
 export async function buildSystemWebApp(options:SystemWebOptions) {
+  if(options.videoGatewayEnabled&&!options.channelsEnabled)throw new Error('Video gateway requires SYSTEM_CHANNELS_ENABLED=true');
+  assertVideoGatewayConfiguration(options.videoGatewayEnabled===true,config.apiKey);
+  assertVideoGatewayProxyConfiguration(options.videoGatewayEnabled===true,config.mioraProxyUrl);
   const runtime=await createSystemRuntime(options);let app:FastifyInstance | undefined;
   try {
     const channels=new ChannelStore(runtime.db,options.credentialKey);
-    if(options.channelsEnabled){if(!options.credentialKey)throw new Error('Channel worker requires CHANNEL_CREDENTIAL_KEY');const {buildApp}=await import('../app.js');app=await buildApp({managedChannels:channels,trustProxy:options.trustProxy});}
+    if(options.channelsEnabled){if(!options.credentialKey)throw new Error('Channel worker requires CHANNEL_CREDENTIAL_KEY');const {buildApp}=await import('../app.js');app=await buildApp({managedChannels:channels,managedGateway:options.videoGatewayEnabled,trustProxy:options.trustProxy,warmup:false});}
     else app=Fastify({logger:systemLoggerOptions,bodyLimit:2*1024*1024,trustProxy:options.trustProxy??false});
     app.setErrorHandler<Error & {statusCode?:number}>((error,_request,reply)=>{if(error instanceof SystemError)return reply.code(error.statusCode).send({code:error.code,message:error.message});return reply.code(error.statusCode&&error.statusCode<500?error.statusCode:500).send({code:'REQUEST_FAILED',message:'Request failed'});});
     const budget=new SystemRequestBudget();
@@ -41,7 +46,7 @@ export async function buildSystemWebApp(options:SystemWebOptions) {
     app.addHook('onClose',async()=>bridge.close());
     registerChannelRoutes(app,{runtime,store:channels,changed:async()=>{if(legacy){const accounts=runtime.db.prepare('SELECT id,enabled,archived_at FROM managed_channel_accounts').all() as {id:string;enabled:number;archived_at:string|null}[];for(const account of accounts){if(account.enabled&&!account.archived_at)legacy.accountPool.unretire(account.id);else legacy.accountPool.retire(account.id);}await legacy.accountPool.sync();}}});
     if(options.adminDirectory)registerAdminFiles(app,options.adminDirectory);
-    if(!options.channelsEnabled)app.get('/health',async()=>({status:'ok',service:'system',channelsEnabled:false}));
+    if(!options.channelsEnabled)app.get('/health',async()=>({status:'ok',service:'system',channelsEnabled:false,videoGatewayEnabled:false}));
     await options.beforeReady?.(app);
     await app.ready();return {app,runtime,projects,jobs,channels,bridge};
   }catch(error){await app?.close();await runtime.close();throw error;}

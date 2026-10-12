@@ -1,7 +1,10 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { ManagedSessionStore } from './system-channels/session-store.js';
 import type { ChannelStore } from './system-channels/store.js';
 import { systemLoggerOptions } from './system/security.js';
+import { SystemError } from './system/types.js';
+import { assertVideoGatewayConfiguration, assertVideoGatewayProxyConfiguration, assertVideoGatewayRequest, ManagedVideoGatewayRecords, gatewayJobIdPrefix, projectGatewayJob } from './system-channels/video-gateway.js';
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import { z } from 'zod';
@@ -77,7 +80,11 @@ const supportedAssetTypes = new Set([
 ]);
 const MIN_RETAINED_HAILUO_CREDITS = 28;
 
-export async function buildApp(options: { managedChannels?: ChannelStore; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
+export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
+  if (options.managedGateway && !options.managedChannels) throw new Error('Managed video gateway requires managed channels');
+  assertVideoGatewayConfiguration(options.managedGateway === true, config.apiKey);
+  assertVideoGatewayProxyConfiguration(options.managedGateway === true, config.mioraProxyUrl);
+  const gateway = options.managedGateway && options.managedChannels ? new ManagedVideoGatewayRecords(options.managedChannels, config.apiKey!) : undefined;
   const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
   /** Accounts seen at 0 credits, kept so `/v1/accounts` can report them. */
   const exhaustedAccounts = new Map<string, AccountSnapshot>();
@@ -198,7 +205,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
   // Miora needs no browser and no signature either: an account is an authToken
   // (+ a refresh token this service renews from). Reached over its /api/ai REST
   // API; wired for the minimax-h3 model only.
-  useMioraProxy(config.mioraProxyUrl, config.mioraLocalProxyUrl, config.mioraProxyAddress);
+  useMioraProxy(config.mioraProxyUrl, config.mioraLocalProxyUrl, config.mioraProxyAddress, options.managedGateway === true);
   const mioraCredentials = new MioraCredentials({ onExpired: removeExpiredMioraAccount });
   const miora = new MioraAdapter({
     video: {
@@ -888,6 +895,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
   });
 
   const runner = new JobRunner(jobs, assets, sessions, adapters, browsers, accountPool, {
+    beforeSubmitGuard: gateway ? job => gateway.assertExecution(job) : undefined,
     timeoutMs: config.jobTimeoutMs,
     // Wide enough for every render attempt plus the waits between them; the
     // adapter's own per-render poll timeout is what actually bounds a job.
@@ -977,7 +985,14 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
 
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/v1/')) return;
-    if (options.managedChannels) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Legacy channel HTTP API is disabled in the system service'));
+    if (options.managedChannels) {
+      try { assertVideoGatewayRequest(request, !!gateway, config.apiKey); }
+      catch (error) {
+        if (error instanceof SystemError) return reply.code(error.statusCode).send(errorBody(error.code, error.message));
+        throw error;
+      }
+      return;
+    }
     if (!config.apiKey) return;
     if (request.headers['x-api-key'] !== config.apiKey) {
       return reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'Invalid API key' } });
@@ -986,6 +1001,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
 
   app.get('/health', async () => ({
     status: 'ok',
+    ...(options.managedChannels ? { service: 'system', channelsEnabled: true, videoGatewayEnabled: !!gateway } : {}),
     browsers: browsers.stats(),
     adapters: adapters.list()
   }));
@@ -1010,6 +1026,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
       mimeType: file.mimetype,
       buffer
     });
+    gateway?.ownAsset(asset.id);
     return reply.code(201).send(publicAsset(asset));
   });
 
@@ -1117,6 +1134,10 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
     const parsed = createJobSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
 
+    if (gateway && (parsed.data.adapterId !== 'miora-v1' || parsed.data.sessionId !== undefined)) {
+      return reply.code(400).send(errorBody('GATEWAY_INPUT_INVALID', 'The video gateway accepts Miora jobs and selects enabled managed accounts automatically'));
+    }
+
     const adapter = adapters.get(parsed.data.adapterId);
     if (!adapter) {
       return reply.code(400).send(errorBody('ADAPTER_NOT_FOUND', 'Unknown adapter'));
@@ -1126,15 +1147,21 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
       parsed.data.assetId,
       ...(parsed.data.assetIds ?? [])
     ]));
-    const missingAssetId = requestedAssetIds.find((assetId) => !assets.get(assetId));
-    if (missingAssetId) {
+    const missingAssetId = requestedAssetIds.find((assetId) => !assets.get(assetId) || gateway && !gateway.hasAsset(assetId));
+    if (missingAssetId !== undefined) {
       return reply.code(400).send(errorBody('ASSET_NOT_FOUND', `Unknown asset: ${missingAssetId}`));
     }
 
     // Fail fast rather than queueing work no account can pay for.
+    let gatewaySessionId: string | undefined;
     if (adapter.runWithoutBrowser || parsed.data.sessionId) {
       const candidates = (await accountPool.snapshot({ adapterId: parsed.data.adapterId }))
-        .filter((a) => !parsed.data.sessionId || a.sessionId === parsed.data.sessionId);
+        .filter((a) => !parsed.data.sessionId || a.sessionId === parsed.data.sessionId)
+        .filter((a) => {
+          if (!gateway) return true;
+          const account = options.managedChannels!.row(a.sessionId);
+          return !!account?.enabled && !account.archived_at;
+        });
 
       if (!candidates.length) {
         return reply.code(400).send(errorBody(
@@ -1149,13 +1176,20 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
           error: {
             code: 'INSUFFICIENT_CREDITS',
             message: 'Every account is out of credits',
-            accounts: candidates
+            ...(gateway ? {} : { accounts: candidates })
           }
         });
       }
+      if (gateway) gatewaySessionId = candidates.filter(account => !account.exhausted)
+        .sort((left, right) => accountPool.activeJobs(left.sessionId) - accountPool.activeJobs(right.sessionId))[0]!.sessionId;
     }
 
-    const job = jobs.create({ ...parsed.data, assetIds: requestedAssetIds });
+    const job = jobs.create({ ...parsed.data, assetIds: requestedAssetIds,
+      ...(gatewaySessionId ? { sessionId: gatewaySessionId } : {}) }, gateway ? `${gatewayJobIdPrefix}${randomUUID()}` : undefined);
+    if (gateway) {
+      await jobs.flushOrThrow(job.id);
+      gateway.ownJob(job.id);
+    }
     runner.submit(job);
     return reply.code(202).send({
       jobId: job.id,
@@ -1168,13 +1202,13 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send(zodError(params.error));
     const job = jobs.get(params.data.id);
-    if (!job) {
+    if (!job || gateway && !gateway.hasJob(job.id)) {
       return reply.code(404).send(errorBody(
         'JOB_NOT_FOUND',
         `Unknown job (finished jobs are kept for ${config.jobRetentionDays} days)`
       ));
     }
-    return reply.send(job);
+    return reply.send(gateway ? projectGatewayJob(job) : job);
   });
 
   /** Recent jobs, newest first — for finding work whose id was lost. */
@@ -1182,8 +1216,8 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
     const query = listJobsQuerySchema.safeParse(request.query);
     if (!query.success) return reply.code(400).send(zodError(query.error));
     const status = query.data.status as JobStatus | undefined;
-    const all = jobs.list({ status });
-    return reply.send({ total: all.length, jobs: all.slice(0, query.data.limit) });
+    const all = jobs.list({ status }).filter(job => !gateway || gateway.hasJob(job.id));
+    return reply.send({ total: all.length, jobs: all.slice(0, query.data.limit).map(job => gateway ? projectGatewayJob(job) : job) });
   });
 
   app.addHook('onClose', async () => {
@@ -1203,7 +1237,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; trustP
 }
 
 function publicAsset(asset: { id: string; originalName: string; mimeType: string; size: number; createdAt: string }) {
-  return asset;
+  return { id: asset.id, originalName: asset.originalName, mimeType: asset.mimeType, size: asset.size, createdAt: asset.createdAt };
 }
 
 interface SessionSummary {

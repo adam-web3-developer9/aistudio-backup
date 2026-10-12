@@ -24,7 +24,7 @@ export function assertSystemRequestOrigin(request: FastifyRequest, trustedOrigin
 
 /** Do not log auth verification/reset query tokens or incoming credentials. */
 export const systemLoggerOptions = {
-  redact: ['req.headers.cookie', 'req.headers.authorization', 'res.headers.set-cookie'],
+  redact: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-api-key', 'res.headers.set-cookie'],
   serializers: {
     err: (error: {name?: string; code?: unknown}) => ({type: 'Error', message: 'Request failed', stack: '', code: typeof error?.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code) ? error.code : 'INTERNAL_ERROR'}),
     req: (request: { method?: string; url?: string; id?: string }) => ({ id: request.id, method: request.method, url: request.url?.split('?')[0] }),
