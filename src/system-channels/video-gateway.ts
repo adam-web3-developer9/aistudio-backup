@@ -30,8 +30,11 @@ export function assertVideoGatewayProxyConfiguration(enabled: boolean, proxyUrl?
 /** Check the route before authentication so other legacy administration APIs stay absent. */
 export function assertVideoGatewayRequest(request: FastifyRequest, enabled: boolean, apiKey?: string): void {
   const pathname = request.url.split('?')[0]!;
-  const allowed = request.method === 'POST' && (pathname === '/v1/assets' || pathname === '/v1/jobs')
-    || request.method === 'GET' && (pathname === '/v1/jobs' || pathname.startsWith('/v1/jobs/') && gatewayJobId.test(pathname.slice('/v1/jobs/'.length)));
+  const uploadIntentPath = /^\/v1\/upload-intents\/[A-Za-z0-9_-]{1,200}(?:\/complete)?$/.test(pathname);
+  const allowed = request.method === 'POST' && (pathname === '/v1/assets' || pathname === '/v1/jobs'
+      || pathname === '/v1/upload-intents' || uploadIntentPath && pathname.endsWith('/complete'))
+    || request.method === 'GET' && (pathname === '/v1/jobs' || pathname.startsWith('/v1/jobs/') && gatewayJobId.test(pathname.slice('/v1/jobs/'.length))
+      || uploadIntentPath && !pathname.endsWith('/complete'));
   if (!enabled || !allowed) throw new SystemError(404, 'LEGACY_API_DISABLED', 'Legacy channel HTTP API is disabled');
   assertVideoGatewayConfiguration(enabled, apiKey);
   const supplied = request.headers['x-api-key'];

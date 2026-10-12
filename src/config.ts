@@ -254,6 +254,8 @@ export const config = {
   mioraPollTimeoutMs: positiveInteger(process.env.MIORA_POLL_TIMEOUT_MS, 15 * 60_000),
   mioraPollIntervalMs: positiveInteger(process.env.MIORA_POLL_INTERVAL_MS, 5_000),
   mioraRetryDelaysMs: parseRetryDelays(process.env.MIORA_RETRY_DELAYS_MS, undefined, 'MIORA_RETRY_DELAYS_MS'),
+  mioraPublicMediaHosts: (process.env.MIORA_PUBLIC_MEDIA_HOSTS ?? '.volces.com,.volcengine.com,.myqcloud.com')
+    .split(',').map(value => value.trim().toLowerCase()).filter(Boolean),
   /** How often authTokens are checked for one about to lapse. */
   mioraTokenCheckMs: positiveInteger(process.env.MIORA_TOKEN_CHECK_MS, 60 * 60_000),
   creditsCacheTtlMs: positiveInteger(process.env.CREDITS_CACHE_TTL_MS, 60_000),

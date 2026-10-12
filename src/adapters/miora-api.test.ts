@@ -7,11 +7,24 @@ import {
   hasUsableScopes,
   mioraSessionId,
   mioraTokenCookies,
+  prepareCosUpload,
   parseCreditBalance,
   readMioraTokens,
   tokenExpiresAt,
   tokenLifetimeMs
 } from './miora-api.js';
+
+describe('COS upload request', () => {
+  it('signs one exact key and never returns the STS secret', () => {
+    const request = prepareCosUpload({ prefix: 'refs/user', bucket: 'bucket', region: 'ap-shanghai',
+      token: 'temporary-token', secret_id: 'temporary-id', secret_key: 'must-not-leak' },
+    'abc.png', 'image/png', 123, 1_700_000_000);
+    expect(request.key).toBe('refs/user/abc.png');
+    expect(request.headers['content-length']).toBe('123');
+    expect(JSON.stringify(request)).not.toContain('must-not-leak');
+    expect(request.headers.authorization).toContain('q-header-list=content-length;content-type;host;x-cos-security-token');
+  });
+});
 
 /** A syntactically valid JWT with arbitrary claims (signature is not verified). */
 function makeToken(claims: Record<string, unknown>): string {

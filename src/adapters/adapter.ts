@@ -31,6 +31,7 @@ export interface AdapterInput {
     mimeType?: string;
     originalName?: string;
   }>;
+  preparedReferences?: Array<{ key: string; kind: 'image' | 'video' | 'audio' }>;
   options?: JobOptions;
   /**
    * Called as the job advances (submitted at the provider, render percent...).

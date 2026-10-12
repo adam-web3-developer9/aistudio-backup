@@ -91,6 +91,15 @@ describe('createJobSchema DreamMaker options', () => {
   });
 });
 
+describe('createJobSchema Miora upload intent', () => {
+  it('keeps the intent identity and rejects mixed legacy asset fields', () => {
+    const parsed = createJobSchema.safeParse({ adapterId:'miora-v1', uploadIntentId:'upload_test', text:'prompt', options:{ modelId:'minimax-h3' } });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data).toMatchObject({ uploadIntentId:'upload_test' });
+    expect(createJobSchema.safeParse({ adapterId:'miora-v1', uploadIntentId:'upload_test', text:'prompt', assetId:'' }).success).toBe(false);
+  });
+});
+
 describe('createJobSchema Higgsfield options', () => {
   const higgsfieldJob = { adapterId: 'higgsfield-v1', assetId: 'asset_test', text: '镜头缓慢推进' };
 

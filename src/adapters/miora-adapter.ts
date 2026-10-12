@@ -179,8 +179,10 @@ export class MioraAdapter implements BrowserAdapter {
       { imagePath: input.imagePath, mimeType: input.mimeType, originalName: input.originalName },
       ...(input.referenceImages ?? [])
     ];
-    const uploaded: UploadedReference[] = [];
-    for (const reference of references) {
+    const uploaded: UploadedReference[] = (input.preparedReferences ?? []).map(reference => ({
+      key: reference.key, kind: reference.kind
+    }));
+    for (const reference of input.preparedReferences?.length ? [] : references) {
       const buffer = await readFile(reference.imagePath);
       const mimeType = reference.mimeType ?? mimeFromPath(reference.imagePath);
       const key = await withMioraRetries('upload', () => client.uploadImage({
@@ -191,6 +193,7 @@ export class MioraAdapter implements BrowserAdapter {
       }), retry);
       uploaded.push({ key, kind: kindOf(mimeType) });
     }
+    if (input.preparedReferences?.length) input.onProgress?.({ uploadedFiles: uploaded });
 
     const generation = this.generationInput({ ...input, text: preparedPrompt }, uploaded, options);
     // The desktop workbench attaches its own platform project before submission.

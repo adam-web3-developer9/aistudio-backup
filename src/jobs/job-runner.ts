@@ -36,6 +36,7 @@ export interface RecoverySummary {
  */
 export class JobRunner {
   private executionGuard?: (job: JobRecord) => Promise<void> | void;
+  private readonly executing = new Set<string>();
   setExecutionGuard(guard: (job: JobRecord) => Promise<void> | void) { this.executionGuard = guard; }
   private async assertSubmitAllowed(job: JobRecord) {
     if (job.id.startsWith('job_system_') && !this.executionGuard) throw new JobError('EXECUTION_OWNER_REQUIRED', 'System execution owner is unavailable');
@@ -54,7 +55,9 @@ export class JobRunner {
   ) {}
 
   submit(job: JobRecord): void {
-    void this.execute(job.id);
+    if (this.executing.has(job.id)) return;
+    this.executing.add(job.id);
+    void this.execute(job.id).finally(() => this.executing.delete(job.id));
   }
 
   /**
@@ -70,7 +73,7 @@ export class JobRunner {
         this.jobs.update(job.id, { status: 'failed', error: { code: 'INTERRUPTED', message: 'System execution requires reconciliation after restart' }, finishedAt: new Date().toISOString() });
       } else if (job.status === 'queued') {
         summary.requeued.push(job.id);
-        void this.execute(job.id);
+        this.submit(job);
       } else if (job.status === 'running') {
         if (job.progress?.providerJobId && job.sessionId) {
           summary.resumed.push(job.id);
@@ -105,25 +108,27 @@ export class JobRunner {
 
       // No cap here: how many references a provider takes is the provider's
       // business, and each adapter trims to its own limit (Hailuo: 9).
-      const assetIds = Array.from(new Set([job.assetId, ...(job.assetIds ?? [])]));
+      const preparedReferences = job.preparedReferences ?? [];
+      const assetIds = preparedReferences.length ? [] : Array.from(new Set([job.assetId, ...(job.assetIds ?? [])]));
       const jobAssets = assetIds.map((assetId) => this.assets.get(assetId));
       const missingAssetIndex = jobAssets.findIndex((asset) => !asset);
       if (missingAssetIndex >= 0) {
         throw new JobError('ASSET_NOT_FOUND', `Unknown asset: ${assetIds[missingAssetIndex]}`);
       }
       const [asset, ...referenceAssets] = jobAssets;
-      if (!asset) throw new JobError('ASSET_NOT_FOUND', `Unknown asset: ${job.assetId}`);
+      if (!preparedReferences.length && !asset) throw new JobError('ASSET_NOT_FOUND', `Unknown asset: ${job.assetId}`);
 
       const input = {
         text: job.text,
-        imagePath: asset.path,
-        mimeType: asset.mimeType,
-        originalName: asset.originalName,
+        imagePath: asset?.path ?? '',
+        mimeType: asset?.mimeType,
+        originalName: asset?.originalName,
         referenceImages: referenceAssets.map((referenceAsset) => ({
           imagePath: referenceAsset!.path,
           mimeType: referenceAsset!.mimeType,
           originalName: referenceAsset!.originalName
         })),
+        preparedReferences,
         options: job.options,
         onProgress: (progress: JobProgressUpdate) => this.recordProgress(jobId, progress),
         beforeSubmit: async () => { await this.assertSubmitAllowed(this.jobs.get(jobId)!); },

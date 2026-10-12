@@ -15,20 +15,20 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 if ([string]::IsNullOrWhiteSpace($ServerHost)) {
-  throw '服务器地址不能为空。请使用 -ServerHost 或 AISTUDIO_SERVER_HOST。'
+  throw 'Server host is required. Use -ServerHost or AISTUDIO_SERVER_HOST.'
 }
 
 if ([string]::IsNullOrWhiteSpace($User)) {
-  throw 'SSH 用户名不能为空。请使用 -User 或 AISTUDIO_SERVER_USER。'
+  throw 'SSH user is required. Use -User or AISTUDIO_SERVER_USER.'
 }
 
 if ($Port -lt 1 -or $Port -gt 65535) {
-  throw "SSH 端口无效：$Port"
+  throw "Invalid SSH port: $Port"
 }
 
 $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
 if (-not $ssh) {
-  throw '未找到 ssh.exe。请在 Windows“可选功能”中安装 OpenSSH 客户端。'
+  throw 'ssh.exe was not found. Install the Windows OpenSSH Client optional feature.'
 }
 
 $sshArgs = @(
@@ -69,9 +69,9 @@ $target = "$User@$ServerHost"
 
 if ($CloseCachedConnection) {
   if ($DisableConnectionCache) {
-    throw '-CloseCachedConnection 不能与 -DisableConnectionCache 同时使用。'
+    throw '-CloseCachedConnection cannot be used with -DisableConnectionCache.'
   }
-  Write-Host "正在关闭 $target 的SSH缓存连接..." -ForegroundColor Cyan
+  Write-Host "Closing cached SSH connection for $target..." -ForegroundColor Cyan
   & $ssh.Source @sshArgs '-O' 'exit' $target
   exit $LASTEXITCODE
 }
@@ -85,9 +85,9 @@ if (-not [string]::IsNullOrWhiteSpace($CommandFile)) {
   $sshArgs += $Command
 }
 
-Write-Host "正在连接 $target`:$Port ..." -ForegroundColor Cyan
+Write-Host "Connecting to $target`:$Port ..." -ForegroundColor Cyan
 if ([string]::IsNullOrWhiteSpace($KeyPath)) {
-  Write-Host '未指定私钥，将由 SSH 交互式询问密码或使用系统 SSH Agent。' -ForegroundColor DarkGray
+  Write-Host 'No private key was specified; SSH will use the agent or request a password.' -ForegroundColor DarkGray
 }
 
 if (-not [string]::IsNullOrWhiteSpace($CommandFile)) {
@@ -98,5 +98,5 @@ if (-not [string]::IsNullOrWhiteSpace($CommandFile)) {
 $exitCode = $LASTEXITCODE
 
 if ($exitCode -ne 0) {
-  throw "SSH 连接结束，退出码：$exitCode"
+  throw "SSH exited with code $exitCode"
 }

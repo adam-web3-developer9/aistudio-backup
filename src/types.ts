@@ -78,6 +78,9 @@ export interface CreateJobInput {
   assetIds?: string[];
   sessionId?: string;
   options?: JobOptions;
+  /** Miora COS objects prepared by a gateway upload intent. Never accepted raw from callers. */
+  preparedReferences?: Array<{ key: string; kind: 'image' | 'video' | 'audio' }>;
+  uploadIntentId?: string;
 }
 
 /**

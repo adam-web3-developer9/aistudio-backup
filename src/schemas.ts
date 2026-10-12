@@ -107,13 +107,19 @@ export const createJobSchema = z.union([
   }),
   z.object({
     adapterId: z.literal('miora-v1'),
+    uploadIntentId: z.string().min(1).max(200),
+    text: z.string(),
+    options: mioraJobOptionsSchema.optional()
+  }).strict(),
+  z.object({
+    adapterId: z.literal('miora-v1'),
     // No limits: prompt length, asset count and every option go through as sent.
     text: z.string(),
     assetId: z.string(),
     assetIds: z.array(z.string()).optional(),
     sessionId: z.string().optional(),
     options: mioraJobOptionsSchema.optional()
-  }),
+  }).strict(),
   z.object({
     adapterId: z.string().min(1).max(100),
     ...jobFields({ promptChars: 7_000, assetIds: 9 }),

@@ -413,6 +413,18 @@ export interface MioraCosGrant {
   secret_key: string;
 }
 
+export interface MioraCosUploadRequest {
+  key: string;
+  url: string;
+  headers: Record<string, string>;
+  expiresAt: string;
+}
+
+export interface MioraCosHeadRequest {
+  url: string;
+  headers: Record<string, string>;
+}
+
 /**
  * The COS request signature (`q-sign-algorithm=sha1`), ported from the web app.
  * Header names are lower-cased and sorted; only the headers passed here are
@@ -441,6 +453,58 @@ export function cosAuth(input: {
     `&q-sign-time=${input.keyTime}&q-key-time=${input.keyTime}` +
     `&q-header-list=${headerKeys.join(';')}&q-url-param-list=&q-signature=${signature}`
   );
+}
+
+/** One short-lived PUT signed for one exact object, type and byte length. */
+export function prepareCosUpload(
+  grant: MioraCosGrant,
+  fileName: string,
+  contentType: string,
+  contentLength: number,
+  nowSeconds = Math.floor(Date.now() / 1000)
+): MioraCosUploadRequest {
+  const key = `${grant.prefix}/${fileName}`;
+  const host = `${grant.bucket}.cos.${grant.region}.myqcloud.com`;
+  const keyTime = `${nowSeconds};${nowSeconds + 600}`;
+  const signedHeaders: Record<string, string> = {
+    host,
+    'x-cos-security-token': grant.token,
+    'content-type': contentType || 'application/octet-stream',
+    'content-length': String(contentLength)
+  };
+  return {
+    key,
+    url: `https://${host}/${key}`,
+    headers: {
+      'x-cos-security-token': grant.token,
+      'content-type': signedHeaders['content-type']!,
+      'content-length': signedHeaders['content-length']!,
+      authorization: cosAuth({
+        secretId: grant.secret_id,
+        secretKey: grant.secret_key,
+        method: 'put',
+        pathname: `/${key}`,
+        headers: signedHeaders,
+        keyTime
+      })
+    },
+    expiresAt: new Date((nowSeconds + 600) * 1000).toISOString()
+  };
+}
+
+/** A short-lived signed HEAD used to verify a client PUT before accepting it. */
+export function prepareCosHead(grant: MioraCosGrant, key: string, nowSeconds = Math.floor(Date.now() / 1000)): MioraCosHeadRequest {
+  if (!key.startsWith(`${grant.prefix}/`)) throw new Error('COS object is outside the current Miora upload prefix');
+  const host = `${grant.bucket}.cos.${grant.region}.myqcloud.com`;
+  const keyTime = `${nowSeconds};${nowSeconds + 600}`;
+  const signedHeaders: Record<string, string> = { host, 'x-cos-security-token': grant.token };
+  return {
+    url: `https://${host}/${key}`,
+    headers: {
+      'x-cos-security-token': grant.token,
+      authorization: cosAuth({ secretId: grant.secret_id, secretKey: grant.secret_key, method: 'head', pathname: `/${key}`, headers: signedHeaders, keyTime })
+    }
+  };
 }
 
 /**

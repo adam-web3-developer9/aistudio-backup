@@ -101,16 +101,17 @@ export class MioraClient {
     extension?: string;
     signal?: AbortSignal;
   }): Promise<string> {
-    const grantResponse = await this.request<{ data?: MioraCosGrant }>(STS_TOKENS_PATH, {
-      signal: input.signal
-    });
-    const grant = grantResponse.json?.data;
-    if (!grant?.bucket || !grant.secret_id) {
-      throw toApiError(grantResponse, STS_TOKENS_PATH);
-    }
+    const grant = await this.getCosGrant(input.signal);
     const extension = input.extension || extensionForMime(input.mimeType);
     const name = `a${Date.now().toString(36)}${randomBytes(3).toString('hex')}${extension}`;
     return uploadToCos(grant, input.buffer, name, input.mimeType, input.signal);
+  }
+
+  async getCosGrant(signal?: AbortSignal): Promise<MioraCosGrant> {
+    const response = await this.request<{ data?: MioraCosGrant }>(STS_TOKENS_PATH, { signal });
+    const grant = response.json?.data;
+    if (!grant?.bucket || !grant.secret_id) throw toApiError(response, STS_TOKENS_PATH);
+    return grant;
   }
 
   /** Reuse the desktop workbench's per-account project for platform history. */
