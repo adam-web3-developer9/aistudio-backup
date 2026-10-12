@@ -37,7 +37,8 @@ Backups and releases are retained for operator review; monitor available disk.
 
 First deployment requires network access to npm, GitHub and the existing ACME
 provider. Node >=22.20 is required; installation uses a project-specific pnpm
-11.5.1 without replacing the server's global Node or package manager.
+10.34.7 (compatible with the v9 lockfile) without replacing the server's global
+Node or package manager.
 
 ## HTTPS renewal
 

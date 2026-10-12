@@ -12,7 +12,7 @@ install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "$APP_ROOT/home" "$DATA_ROOT" "
 test -f /etc/aistudio-studio/system.env
 chmod 0600 /etc/aistudio-studio/system.env
 # Never replace the machine's Node/npm or other services' package managers.
-npm install --prefix "$APP_ROOT/tools" --no-audit --no-fund pnpm@11.5.1
+npm install --prefix "$APP_ROOT/tools" --no-audit --no-fund pnpm@10.34.7
 if [[ ! -d "$APP_ROOT/repository/.git" ]]; then
   git clone --branch main --single-branch "$REPOSITORY_URL" "$APP_ROOT/repository"
 fi

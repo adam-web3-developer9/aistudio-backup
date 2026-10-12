@@ -1,4 +1,4 @@
-# pnpm 11 moved these settings out of package.json's "pnpm" field.
+# Keep the root package explicit; admin retains its separate npm lockfile.
 packages:
   - '.'
 # tsx runs on esbuild's platform binary, so esbuild may run its install script.
