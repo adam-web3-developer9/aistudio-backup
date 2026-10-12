@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 027
 source /etc/aistudio-studio/deploy.conf
-export PATH="$NODE_BIN:$APP_ROOT/tools/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
+export PATH="$APP_ROOT/tools/node_modules/.bin:$NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"
 exec 9>/run/lock/aistudio-studio-deploy.lock
 flock -n 9 || exit 0
 
@@ -11,6 +11,16 @@ commit=$(git -C "$APP_ROOT/repository" rev-parse origin/main)
 if [[ -f "$APP_ROOT/deployed-commit" ]] && [[ $(cat "$APP_ROOT/deployed-commit") == "$commit" ]] && [[ ${1:-} != --force ]]; then
   exit 0
 fi
+if [[ -f "$APP_ROOT/failed-commit" ]] && [[ $(cat "$APP_ROOT/failed-commit") == "$commit" ]] && [[ ${1:-} != --force ]]; then
+  exit 0
+fi
+record_failure() {
+  trap - ERR INT TERM
+  printf '%s\n' "$commit" > "$APP_ROOT/failed-commit"
+  echo "Deployment failed for $commit; inspect logs and retry with --force." >&2
+  exit 1
+}
+trap record_failure ERR INT TERM
 release="$APP_ROOT/releases/$commit"
 previous=$(readlink -f "$APP_ROOT/current" || true)
 if [[ "$previous" == "$release" ]]; then
@@ -38,24 +48,28 @@ backup_ready=false
 rollback() {
   trap - ERR INT TERM
   set +e
+  restored=true
   systemctl stop aistudio-studio.service || true
   if [[ "$backup_ready" == true ]]; then
-    python3 - "$backup" "$DATA_ROOT/system.sqlite" <<'PY'
-import pathlib,shutil,sys
+    if ! python3 - "$backup" "$DATA_ROOT/system.sqlite" <<'PY'
+import os,pathlib,shutil,sys
 target=pathlib.Path(sys.argv[2])
-shutil.copyfile(sys.argv[1],target)
+pending=target.with_name(target.name+'.restore')
+shutil.copyfile(sys.argv[1],pending)
+os.chmod(pending,0o600)
+os.replace(pending,target)
 for suffix in ('-wal','-shm'):
     pathlib.Path(str(target)+suffix).unlink(missing_ok=True)
 PY
-    chown "$APP_USER:$APP_USER" "$DATA_ROOT/system.sqlite"
+    then restored=false; fi
+    chown "$APP_USER:$APP_USER" "$DATA_ROOT/system.sqlite" || restored=false
   fi
   if [[ -n "$previous" && -d "$previous" ]]; then
-    ln -sfn "$previous" "$APP_ROOT/current.next"
-    mv -Tf "$APP_ROOT/current.next" "$APP_ROOT/current"
-    systemctl start aistudio-studio.service || true
+    ln -sfn "$previous" "$APP_ROOT/current.next" && mv -Tf "$APP_ROOT/current.next" "$APP_ROOT/current" || restored=false
+    if [[ "$restored" == true ]]; then systemctl start aistudio-studio.service || restored=false; fi
   fi
-  echo "Deployment failed; previous release restored: $previous" >&2
-  exit 1
+  echo "Deployment failed; previous=$previous rollback_success=$restored" >&2
+  record_failure
 }
 trap rollback ERR INT TERM
 # Stop writers before snapshotting SQLite, including its committed WAL contents.
@@ -84,6 +98,7 @@ curl --silent --fail --max-time 10 "http://127.0.0.1:$SYSTEM_PORT/admin/" -o /de
 curl --silent --fail --max-time 15 "https://$DOMAIN/health" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'
 printf '%s\n' "$commit" > "$APP_ROOT/deployed-commit.next"
 mv -f "$APP_ROOT/deployed-commit.next" "$APP_ROOT/deployed-commit"
+rm -f "$APP_ROOT/failed-commit"
 trap - ERR INT TERM
 # The next poll uses the deployment logic from the successful main release.
 install -m 0755 "$release/server/deploy/deploy.sh" /usr/local/sbin/aistudio-studio-deploy

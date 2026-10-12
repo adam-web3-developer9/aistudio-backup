@@ -32,6 +32,10 @@ commit is built in a separate release directory with locked backend and frontend
 dependencies. The previous application continues running during the build.
 Before activation the service stops and SQLite receives a consistent backup;
 failed health checks restore both the previous release and its database backup.
+Failed commits are recorded and skipped by later polls, preventing a broken
+commit from causing repeated rebuilds or restarts. After correcting a transient
+failure, retry with `/usr/local/sbin/aistudio-studio-deploy --force`; a new main
+commit is attempted automatically.
 Auth configuration, private media and SQLite live outside release directories.
 Backups and releases are retained for operator review; monitor available disk.
 
