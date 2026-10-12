@@ -9,6 +9,11 @@ import type { SessionRecord } from '../types.js';
 export interface ChannelAccountRow { id: string; label: string; email: string | null; enabled: number; archived_at: string | null; updated_at: string; expires_at: string | null; encrypted: string }
 type Row = ChannelAccountRow;
 interface CreditRow { credits: number | null; checked_at: string | null; status: 'unknown' | 'ok' | 'error'; error_code: string | null }
+export interface ChannelStatistics {
+  total:number; enabled:number; disabled:number; archived:number;
+  usable:number|null; usableCredits:number|null; unchecked:number; failed:number;
+  lowCredit:number|null; minimumCredits:number|null; minimumVideoCount:number|null; lastCheckedAt:string|null;
+}
 export class ChannelStore {
   private key?: Buffer;
   constructor(public db: Database.Database, key?: string) {
@@ -22,7 +27,34 @@ export class ChannelStore {
   private decrypt(row: Row): MioraTokens { try { const data = Buffer.from(row.encrypted, 'base64'); const decipher = createDecipheriv('aes-256-gcm', this.requireKey(), data.subarray(0,12)); decipher.setAAD(Buffer.from(row.id)); decipher.setAuthTag(data.subarray(12,28)); return JSON.parse(Buffer.concat([decipher.update(data.subarray(28)), decipher.final()]).toString()) as MioraTokens; } catch { throw new SystemError(503, 'CHANNEL_VAULT_UNAVAILABLE', 'Channel credentials are unavailable'); } }
   row(id: string) { return this.db.prepare('SELECT * FROM managed_channel_accounts WHERE id=?').get(id) as Row | undefined; }
   public(row: Row) { const emailMasked = row.email ? row.email.replace(/^(.).+(@.*)$/, '$1***$2') : null; const credit=this.db.prepare('SELECT * FROM managed_channel_credits WHERE account_id=?').get(row.id) as CreditRow|undefined; return { id: row.id, provider: 'miora', label: row.label, emailMasked, enabled: !!row.enabled, archivedAt: row.archived_at, updatedAt: row.updated_at, credentialExpiresAt: row.expires_at, validationStatus: 'unknown', localCredentialStatus: row.expires_at && row.expires_at < new Date().toISOString() ? 'expired' : 'imported', credits:credit?.credits??null,creditsCheckedAt:credit?.checked_at??null,creditStatus:credit?.status??'unknown',lastErrorCode:credit?.error_code??null,cleanupReason:(this.db.prepare('SELECT reason FROM managed_channel_cleanup WHERE account_id=?').get(row.id) as {reason:string}|undefined)?.reason??null }; }
-  list(page=1,pageSize=50,q='') { const match=`instr(lower(id || ' ' || label || ' ' || coalesce(email,'')),lower(?))>0`; const rows=this.db.prepare(`SELECT * FROM managed_channel_accounts WHERE ${match} ORDER BY updated_at DESC LIMIT ? OFFSET ?`).all(q,pageSize,(page-1)*pageSize) as Row[]; return {data:rows.map(row=>this.public(row)),total:(this.db.prepare(`SELECT count(*) AS n FROM managed_channel_accounts WHERE ${match}`).get(q) as {n:number}).n}; }
+  list(page=1,pageSize=50,q='',minimumCredits?:number|null) {
+    const match=`instr(lower(a.id || ' ' || a.label || ' ' || coalesce(a.email,'')),lower(?))>0`;
+    const funded=`a.enabled=1 AND a.archived_at IS NULL AND c.status='ok' AND c.credits>0`;
+    const rows=this.db.prepare(`SELECT a.* FROM managed_channel_accounts a LEFT JOIN managed_channel_credits c ON c.account_id=a.id WHERE ${match}
+      ORDER BY CASE WHEN ${funded} THEN 0 WHEN a.enabled=1 AND a.archived_at IS NULL THEN 1 WHEN a.archived_at IS NULL THEN 2 ELSE 3 END,
+      CASE WHEN ${funded} THEN c.credits END DESC,a.updated_at DESC,a.id ASC LIMIT ? OFFSET ?`).all(q,pageSize,(page-1)*pageSize) as Row[];
+    const total=(this.db.prepare(`SELECT count(*) AS n FROM managed_channel_accounts a WHERE ${match}`).get(q) as {n:number}).n;
+    return {data:rows.map(row=>this.public(row)),total,statistics:this.statistics(minimumCredits)};
+  }
+  statistics(minimumCredits?:number|null):ChannelStatistics {
+    const minimum=typeof minimumCredits==='number'&&Number.isFinite(minimumCredits)&&minimumCredits>0?minimumCredits:null;
+    const usable=`a.enabled=1 AND a.archived_at IS NULL AND c.status='ok' AND c.credits>=@minimum`;
+    // Round only binary division noise before truncating each account's estimate.
+    // Credits cannot be transferred between accounts, so never divide their sum.
+    const aggregate=this.db.prepare(`SELECT count(*) AS total,
+      count(CASE WHEN a.enabled=1 AND a.archived_at IS NULL THEN 1 END) AS enabled,
+      count(CASE WHEN a.enabled=0 AND a.archived_at IS NULL THEN 1 END) AS disabled,
+      count(CASE WHEN a.archived_at IS NOT NULL THEN 1 END) AS archived,
+      CASE WHEN @minimum IS NULL THEN NULL ELSE count(CASE WHEN ${usable} THEN 1 END) END AS usable,
+      CASE WHEN @minimum IS NULL THEN NULL ELSE round(coalesce(sum(CASE WHEN ${usable} THEN c.credits END),0),2) END AS usableCredits,
+      count(CASE WHEN a.archived_at IS NULL AND coalesce(c.status,'unknown')='unknown' THEN 1 END) AS unchecked,
+      count(CASE WHEN a.archived_at IS NULL AND c.status='error' THEN 1 END) AS failed,
+      CASE WHEN @minimum IS NULL THEN NULL ELSE count(CASE WHEN a.archived_at IS NULL AND c.status='ok' AND c.credits<@minimum THEN 1 END) END AS lowCredit,
+      CASE WHEN @minimum IS NULL THEN NULL ELSE coalesce(sum(CASE WHEN ${usable} THEN CAST(round(c.credits/@minimum,10) AS INTEGER) END),0) END AS minimumVideoCount,
+      max(c.checked_at) AS lastCheckedAt
+      FROM managed_channel_accounts a LEFT JOIN managed_channel_credits c ON c.account_id=a.id`).get({minimum}) as Omit<ChannelStatistics,'minimumCredits'>;
+    return {...aggregate,minimumCredits:minimum};
+  }
   ids() { return (this.db.prepare('SELECT id FROM managed_channel_accounts WHERE archived_at IS NULL ORDER BY updated_at').all() as {id:string}[]).map(row=>row.id); }
   credentials(id:string) { const row=this.row(id); if(!row)throw new SystemError(404,'ACCOUNT_UNAVAILABLE','Channel account is unavailable');return {row,tokens:this.decrypt(row)}; }
   recordCredits(id:string,encrypted:string,result:{credits:number;checkedAt:string}|{errorCode:string}):boolean {

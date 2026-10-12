@@ -45,6 +45,7 @@ import {
   refreshChannelCredits,
   cleanupChannelAccounts,
   type ChannelBatchAction,
+  type ChannelStatistics,
   type AdminIdentity,
   type Role,
 } from "./providers";
@@ -124,6 +125,69 @@ function ChannelCredits({ account }: { account: Row }) {
       ) : (
         <Text type="secondary">未查询</Text>
       )}
+    </div>
+  );
+}
+function ChannelAccountSummary({
+  statistics,
+  fetching,
+  failed,
+}: {
+  statistics?: ChannelStatistics;
+  fetching: boolean;
+  failed: boolean;
+}) {
+  const loading = fetching && !statistics;
+  const minimum = statistics?.minimumCredits;
+  const usable = statistics?.usable;
+  const unresolved = statistics ? statistics.unchecked + statistics.failed : 0;
+  const status = fetching ? "正在更新全局统计…"
+    : failed ? "全局统计读取失败，请刷新后重试。"
+    : !statistics ? "全局统计暂不可用，请刷新后重试。"
+    : usable === null ? "当前模型最低额度待配置，暂无法估算可用账户和视频数量。"
+    : usable === 0 && unresolved > 0
+      ? "尚有账户未查询或积分读取失败，请先刷新积分核对可用账户。"
+    : usable === 0
+      ? "当前没有积分足够且已启用的可用账户，请补充积分足够的 Miora 账户，或启用已有足额账户。"
+    : `已确认 ${usable} 个可用账户可接收任务。${unresolved > 0 ? "仍有账户未查询或读取失败，可刷新积分继续核对。" : ""}`;
+  const statusType = failed || (!fetching && statistics && (usable === 0 || usable === null)) ? "warning" : "info";
+  return (
+    <div className="channel-summary">
+      <div className="summary-grid channel-summary-grid">
+        <Card size="small">
+          <Statistic title="总账号" value={statistics?.total ?? "—"} suffix="个" loading={loading} />
+          <Text type="secondary">包含已归档账户</Text>
+        </Card>
+        <Card size="small">
+          <Statistic title="可用账号" value={usable ?? "—"} suffix="个" loading={loading} />
+          <Text type="secondary">已启用、额度足够且核对成功</Text>
+        </Card>
+        <Card size="small">
+          <Statistic title="可用积分" value={statistics?.usableCredits ?? "—"} precision={2} loading={loading} />
+          <Text type="secondary">仅汇总达到最低生成额度的可用账户</Text>
+        </Card>
+        <Card size="small">
+          <Statistic title="估算最短视频数" value={statistics?.minimumVideoCount ?? "—"} suffix="条" loading={loading} />
+          <Text type="secondary">4 秒估算，更长视频会减少可生成数量</Text>
+        </Card>
+      </div>
+      <div className="channel-statistics-detail">
+        <Space wrap size={[8, 8]}>
+          <Tag color="green">启用 {statistics?.enabled ?? "—"}</Tag>
+          <Tag>停用 {statistics?.disabled ?? "—"}</Tag>
+          <Tag>归档 {statistics?.archived ?? "—"}</Tag>
+          <Tag>未查询 {statistics?.unchecked ?? "—"}</Tag>
+          <Tag color={statistics?.failed ? "orange" : "default"}>读取失败 {statistics?.failed ?? "—"}</Tag>
+          <Tag>额度不足 {statistics?.lowCredit ?? "—"}</Tag>
+        </Space>
+        <Text type="secondary">最近成功核对：{date(statistics?.lastCheckedAt)}</Text>
+        <Text type="secondary">
+          全量统计，不受搜索或分页影响。{minimum != null
+            ? `当前模型 4 秒最低额度 ${minimum.toLocaleString("zh-CN")} 积分，按每个账户分别估算视频数。`
+            : "当前模型最低额度待配置。"}
+        </Text>
+      </div>
+      <Alert type={statusType} showIcon title={status} />
     </div>
   );
 }
@@ -357,6 +421,9 @@ function ResourcePage({
     filters: [{ field: "q", operator: "contains", value: q }],
     queryOptions: { retry: false },
   });
+  const channelStatistics = section === "channels"
+    ? (query.data as { statistics?: ChannelStatistics } | undefined)?.statistics
+    : undefined;
   const [pending, setPending] = useState(""),
     [operationError, setOperationError] = useState(""),
     [dialog, setDialog] = useState(""),
@@ -1023,6 +1090,9 @@ function ResourcePage({
   };
   return (
     <>
+      {section === "channels" ? (
+        <ChannelAccountSummary statistics={channelStatistics} fetching={query.isFetching} failed={query.isError} />
+      ) : (
       <div className="summary-grid">
         <Card size="small">
           <Statistic title="匹配记录" value={result.total ?? "—"} suffix="条" />
@@ -1049,6 +1119,7 @@ function ResourcePage({
           </Text>
         </Card>
       </div>
+      )}
       {section === "channels" && (
         <Alert
           type="info"
@@ -1060,6 +1131,9 @@ function ResourcePage({
       <Card className="resource-card">
         <div className="table-toolbar">
           <Space wrap>
+            {section === "channels" && (
+              <Tag>匹配 {query.data ? result.total : "—"} 个账户</Tag>
+            )}
             {!["projects", "system-jobs"].includes(section) && (
               <Input.Search
                 aria-label="搜索记录"
@@ -1163,7 +1237,7 @@ function ResourcePage({
               </Popconfirm>
             </Space>
             <Text type="secondary" className="channel-management-note">
-              批量状态操作仅处理当前页选中的适用账户；刷新全部积分与全部清理会检查所有未归档账户。
+              默认启用且有积分的账户优先，积分从高到低排列。批量状态操作仅处理当前页选中的适用账户；刷新全部积分与全部清理会检查所有未归档账户。
             </Text>
           </div>
         )}

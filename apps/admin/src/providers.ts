@@ -49,6 +49,20 @@ export function mutation<T>(path: string, method: string, body?: unknown) {
   });
 }
 export type ChannelBatchAction = "enable" | "disable" | "archive" | "restore";
+export interface ChannelStatistics {
+  total: number;
+  enabled: number;
+  disabled: number;
+  archived: number;
+  usable: number | null;
+  usableCredits: number | null;
+  unchecked: number;
+  failed: number;
+  lowCredit: number | null;
+  minimumCredits: number | null;
+  minimumVideoCount: number | null;
+  lastCheckedAt: string | null;
+}
 export interface ChannelBatchResult {
   updated: number;
   accounts: Record<string, unknown>[];

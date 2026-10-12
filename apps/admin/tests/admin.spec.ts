@@ -211,6 +211,47 @@ test("凭据文件多选批量导入超过20份，独立失败与结果清空", 
   expect(calls.find((call) => call.method === "PATCH" && call.path.endsWith("/channel-one"))?.body)
     .toEqual({ credentials: "FAKE-CREDENTIAL-1" });
 });
+test("渠道全局统计不随搜索或分页改变", async ({ page }) => {
+  await page.setViewportSize({ width: 1720, height: 1080 });
+  await fakeApi(page, "superadmin");
+  const statistics = {
+    total: 27, enabled: 10, disabled: 4, archived: 13,
+    usable: 8, usableCredits: 2000.25, unchecked: 1, failed: 1, lowCredit: 0,
+    minimumCredits: 26.48, minimumVideoCount: 73,
+    lastCheckedAt: "2026-10-12T12:30:00Z",
+  };
+  const queries: URLSearchParams[] = [];
+  await page.route("**/api/admin/channels/accounts?*", async route => {
+    const query = new URL(route.request().url()).searchParams;
+    queries.push(query);
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      data: [{ id: "managed-miora-" + "1".repeat(24), label: "统计测试账号", provider: "miora", enabled: true, credits: 100, creditStatus: "ok" }],
+      total: query.get("q") ? 1 : 27, statistics,
+    }) });
+  });
+  await page.goto("./");
+  await page.getByRole("menuitem", { name: /渠道账户/ }).click();
+  await expect(page.getByText("总账号", { exact: true })).toBeVisible();
+  await expect(page.getByText("可用账号", { exact: true })).toBeVisible();
+  await expect(page.getByText("可用积分", { exact: true })).toBeVisible();
+  await expect(page.getByText("2,000.25", { exact: true })).toBeVisible();
+  await page.getByRole("listitem", { name: "2", exact: true }).click();
+  await expect.poll(() => queries.some(query => query.get("page") === "2")).toBe(true);
+  await expect(page.getByText("2,000.25", { exact: true })).toBeVisible();
+  await page.getByRole("searchbox", { name: "搜索记录" }).fill("统计测试");
+  await page.getByRole("searchbox", { name: "搜索记录" }).press("Enter");
+  await expect(page.getByText("匹配 1 个账户", { exact: true })).toBeVisible();
+  await expect(page.getByText("2,000.25", { exact: true })).toBeVisible();
+  await expect(page.locator(".channel-summary-grid .ant-card").first().getByText("27", { exact: true })).toBeVisible();
+  await page.screenshot({ path: "../../tmp/admin-channel-statistics.png", fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByText("总账号", { exact: true })).toBeVisible();
+  await expect(page.getByText("可用账号", { exact: true })).toBeVisible();
+  await expect(page.getByText("可用积分", { exact: true })).toBeVisible();
+  await expect(page.getByText("估算最短视频数", { exact: true })).toBeVisible();
+  await page.screenshot({ path: "../../tmp/admin-channel-statistics-mobile.png", fullPage: true });
+});
+
 test("渠道批量管理、真实积分状态和可恢复清理", async ({ page }) => {
   await page.setViewportSize({ width: 1720, height: 1080 });
   await fakeApi(page, "superadmin");
