@@ -41,6 +41,10 @@ import {
   authProvider,
   getAdmin,
   mutation,
+  batchChannelAccounts,
+  refreshChannelCredits,
+  cleanupChannelAccounts,
+  type ChannelBatchAction,
   type AdminIdentity,
   type Role,
 } from "./providers";
@@ -95,6 +99,34 @@ const tag = (value: unknown) => (
     {String(value ?? "—")}
   </Tag>
 );
+const channelBatchNames: Record<ChannelBatchAction, string> = {
+  enable: "启用",
+  disable: "停用",
+  archive: "归档",
+  restore: "恢复",
+};
+const channelCleanupReasons: Record<string, string> = {
+  "insufficient-credits": "不足最低生成额度",
+  "credentials-expired": "凭据失效，无法续期",
+  manual: "管理员手动归档",
+};
+function ChannelCredits({ account }: { account: Row }) {
+  const known = typeof account.credits === "number" && Number.isFinite(account.credits);
+  return (
+    <div className="channel-credits">
+      {account.creditStatus === "error" ? (
+        <>
+          <Text type="danger">读取失败</Text>
+          {known && <Text type="secondary">上次成功：{account.credits.toLocaleString("zh-CN")} 积分</Text>}
+        </>
+      ) : known ? (
+        <Text strong>{account.credits.toLocaleString("zh-CN")}</Text>
+      ) : (
+        <Text type="secondary">未查询</Text>
+      )}
+    </div>
+  );
+}
 export function AdminApp() {
   const [identity, setIdentity] = useState<AdminIdentity | null>(null),
     [checking, setChecking] = useState(true),
@@ -339,6 +371,8 @@ function ResourcePage({
   const [fileError, setFileError] = useState("");
   const [fileInfo, setFileInfo] = useState("");
   const [credentialFiles, setCredentialFiles] = useState<CredentialFile[]>([]);
+  const [selectedChannelIds, setSelectedChannelIds] = useState<string[]>([]);
+  const [channelResult, setChannelResult] = useState<{ text: string; warning: boolean } | null>(null);
   const readyFileCount = credentialFiles.filter(
     (file) => file.status === "ready",
   ).length;
@@ -412,6 +446,58 @@ function ResourcePage({
   const { message } = App.useApp();
   const writable = identity.role !== "readonly",
     superadmin = identity.role === "superadmin";
+  useEffect(() => {
+    setSelectedChannelIds([]);
+    setChannelResult(null);
+  }, [section]);
+  const selectedChannels = result.data.filter(row => selectedChannelIds.includes(row.id));
+  const selectedFor = (operation: ChannelBatchAction) => selectedChannels
+    .filter(row => operation === "restore" ? !!row.archivedAt : !row.archivedAt)
+    .map(row => row.id);
+  const channelOperation = async <T,>(
+    key: string,
+    task: () => Promise<T>,
+    describe: (response: T) => { text: string; warning: boolean },
+    clearSelection = false,
+  ) => {
+    if (!superadmin || pending) return;
+    setPending(key);
+    setOperationError("");
+    setChannelResult(null);
+    try {
+      const summary = describe(await task());
+      setChannelResult(summary);
+      if (summary.warning) message.warning(summary.text);
+      else message.success(summary.text);
+      if (clearSelection) setSelectedChannelIds([]);
+      await query.refetch();
+    } catch (error) {
+      setOperationError(errorText(error));
+      if ((error as any).statusCode === 401) onExpired();
+    } finally {
+      setPending("");
+    }
+  };
+  const refreshCredits = (ids?: string[], key = "channel-credits-all") => {
+    void channelOperation(key, () => refreshChannelCredits(ids), response => ({
+      text: `积分刷新完成：检查 ${response.checked} 个，成功 ${response.succeeded} 个，失败 ${response.failed} 个。`,
+      warning: response.failed > 0,
+    }));
+  };
+  const cleanChannels = (ids?: string[]) => {
+    void channelOperation("channel-cleanup", () => cleanupChannelAccounts(ids), response => ({
+      text: `清理完成：检查 ${response.checked} 个，归档 ${response.archived} 个，保留 ${response.retained} 个，读取失败 ${response.failed} 个。`,
+      warning: response.failed > 0,
+    }), true);
+  };
+  const batchChannels = (operation: ChannelBatchAction) => {
+    const ids = selectedFor(operation);
+    if (!ids.length) return;
+    void channelOperation(`channel-batch-${operation}`, () => batchChannelAccounts(ids, operation), response => ({
+      text: `已${channelBatchNames[operation]} ${response.updated} 个账户。`,
+      warning: false,
+    }), true);
+  };
   useEffect(() => {
     if (query.error?.statusCode === 401) onExpired();
   }, [query.error]);
@@ -710,18 +796,21 @@ function ResourcePage({
       { title: "渠道", render: (_, r) => r.provider || r.channel || "miora" },
       {
         title: "状态",
-        render: (_, r) =>
-          tag(r.archivedAt ? "archived" : r.enabled ? "active" : "disabled"),
+        render: (_, r) => (
+          <div className="channel-account-state">
+            <Tag color={r.archivedAt ? "default" : r.enabled ? "green" : "orange"}>
+              {r.archivedAt ? "已归档" : r.enabled ? "已启用" : "已停用"}
+            </Tag>
+            {r.archivedAt && (
+              <Text type="secondary">
+                {channelCleanupReasons[r.cleanupReason] || "历史归档，原因未记录"}
+              </Text>
+            )}
+          </div>
+        ),
       },
-      {
-        title: "远端会话",
-        render: (_, r) =>
-          r.remoteValidationPerformed ? (
-            tag(r.validationStatus || "unknown")
-          ) : (
-            <Tag>远端会话未验证</Tag>
-          ),
-      },
+      { title: "积分", width: 170, render: (_, r) => <ChannelCredits account={r} /> },
+      { title: "积分核对时间", dataIndex: "creditsCheckedAt", render: date },
       {
         title: "本地凭据检查",
         render: (_, r) =>
@@ -742,6 +831,14 @@ function ResourcePage({
         title: "操作",
         render: (_, r) => (
           <Space wrap>
+            <Button
+              size="small"
+              disabled={!superadmin || !!pending || !!r.archivedAt}
+              loading={pending === `channel-credits-${r.id}`}
+              onClick={() => refreshCredits([r.id], `channel-credits-${r.id}`)}
+            >
+              刷新积分
+            </Button>
             <Button size="small" onClick={() => setChannelJobs(r)}>
               关联任务
             </Button>
@@ -855,7 +952,7 @@ function ResourcePage({
         if (version === fileReadVersion.current) {
           const failed = files.filter((file) => file.status !== "succeeded").length;
           setFileInfo(
-            `导入完成：成功 ${succeeded} 份，失败 ${failed} 份。${failed ? "请重新选择失败文件后导入。" : ""}`,
+            `导入完成：成功 ${succeeded} 份，失败 ${failed} 份。新账户已自动启用，已有账户保留原状态。${failed ? "请重新选择失败文件后导入。" : ""}`,
           );
           if (succeeded) message.success(`已导入 ${succeeded} 份凭据`);
         }
@@ -956,7 +1053,7 @@ function ResourcePage({
         <Alert
           type="info"
           showIcon
-          title="渠道凭据仅由超级管理员导入，用于服务端执行已授权任务；列表仅展示脱敏状态。格式或解密检查不代表渠道会话有效，远端会话未验证。导入后输入会清空。"
+          title="新导入的 Miora 账户自动启用，已有账户保留原状态。积分由服务器通过已配置代理查询；读取失败会保留上次成功的积分，不会按零处理。凭据仅由超级管理员导入，导入后输入会清空。"
           className="readonly-banner"
         />
       )}
@@ -972,12 +1069,14 @@ function ResourcePage({
                 onSearch={(value) => {
                   setQ(value);
                   setPage(1);
+                  setSelectedChannelIds([]);
                 }}
               />
             )}
             <Button
               icon={<ReloadOutlined />}
               loading={query.isFetching}
+              disabled={!!pending}
               onClick={() => void query.refetch()}
             >
               刷新
@@ -1001,7 +1100,7 @@ function ResourcePage({
             {section === "channels" && (
               <Button
                 type="primary"
-                disabled={!superadmin}
+                disabled={!superadmin || !!pending}
                 onClick={() => open("channel")}
               >
                 导入 Miora 凭据
@@ -1009,6 +1108,75 @@ function ResourcePage({
             )}
           </Space>
         </div>
+        {section === "channels" && (
+          <div className="channel-management">
+            <div className="channel-batch-bar">
+              <Space wrap>
+                <Text strong>已选 {selectedChannelIds.length} 个</Text>
+                <Text type="secondary">可全选当前页</Text>
+                {(["enable", "disable", "archive", "restore"] as ChannelBatchAction[]).map(operation => (
+                  <Popconfirm
+                    key={operation}
+                    title={`${channelBatchNames[operation]}选中的 ${selectedFor(operation).length} 个${operation === "restore" ? "已归档" : "未归档"}账户？`}
+                    description={operation === "restore" ? "恢复后为停用状态，可再批量启用。" : operation === "archive" ? "归档后停止接收新任务，账户可恢复。" : undefined}
+                    onConfirm={() => batchChannels(operation)}
+                  >
+                    <Button
+                      danger={operation === "archive"}
+                      disabled={!superadmin || !!pending || !selectedFor(operation).length}
+                      loading={pending === `channel-batch-${operation}`}
+                    >
+                      批量{channelBatchNames[operation]}
+                    </Button>
+                  </Popconfirm>
+                ))}
+              </Space>
+            </div>
+            <Space wrap>
+              <Button
+                disabled={!superadmin || !!pending || !selectedChannels.some(row => !row.archivedAt)}
+                loading={pending === "channel-credits-selected"}
+                onClick={() => refreshCredits(selectedChannels.filter(row => !row.archivedAt).map(row => row.id), "channel-credits-selected")}
+              >
+                刷新选中积分
+              </Button>
+              <Button
+                icon={<ReloadOutlined />}
+                disabled={!superadmin || !!pending}
+                loading={pending === "channel-credits-all"}
+                onClick={() => refreshCredits()}
+              >
+                刷新全部积分
+              </Button>
+              <Popconfirm
+                title={selectedChannelIds.length ? `清理选中的 ${selectedChannelIds.length} 个账户？` : "检查并清理全部未归档账户？"}
+                description="归档不足当前模型最低生成额度，或已确认凭据失效的账户。网络或积分读取失败时保留账户，归档后可恢复。"
+                onConfirm={() => cleanChannels(selectedChannelIds.length ? selectedChannelIds : undefined)}
+              >
+                <Button
+                  danger
+                  disabled={!superadmin || !!pending}
+                  loading={pending === "channel-cleanup"}
+                >
+                  {selectedChannelIds.length ? "清理选中账户" : "清理无效账户"}
+                </Button>
+              </Popconfirm>
+            </Space>
+            <Text type="secondary" className="channel-management-note">
+              批量状态操作仅处理当前页选中的适用账户；刷新全部积分与全部清理会检查所有未归档账户。
+            </Text>
+          </div>
+        )}
+        {section === "channels" && channelResult && (
+          <Alert
+            type={channelResult.warning ? "warning" : "success"}
+            showIcon
+            closable
+            onClose={() => setChannelResult(null)}
+            title={channelResult.text}
+            style={{ marginBottom: 16 }}
+          />
+        )}
         {operationError && (
           <Alert
             type="error"
@@ -1034,7 +1202,13 @@ function ResourcePage({
             columns={columns[section]}
             dataSource={result.data}
             loading={query.isFetching}
-            scroll={{ x: 1000 }}
+            rowSelection={section === "channels" ? {
+              selectedRowKeys: selectedChannelIds,
+              onChange: keys => setSelectedChannelIds(keys.map(String)),
+              getCheckboxProps: () => ({ disabled: !superadmin || !!pending }),
+              columnWidth: 64,
+            } : undefined}
+            scroll={{ x: section === "channels" ? 1600 : 1000 }}
             pagination={{
               current: page,
               pageSize: size,
@@ -1044,6 +1218,7 @@ function ResourcePage({
               onChange: (n, s) => {
                 setPage(n);
                 setSize(s);
+                setSelectedChannelIds([]);
               },
             }}
             locale={{ emptyText: <Empty description="暂无匹配记录" /> }}

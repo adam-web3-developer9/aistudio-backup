@@ -187,7 +187,7 @@ test("凭据文件多选批量导入超过20份，独立失败与结果清空", 
   expect(imported).toHaveLength(0);
   await page.getByLabel("更新账户 ID（新导入留空）").fill("");
   await dialog.getByRole("button", { name: "批量导入（23）" }).click();
-  await expect(dialog.getByText("导入完成：成功 22 份，失败 3 份。请重新选择失败文件后导入。")).toBeVisible();
+  await expect(dialog.getByText("导入完成：成功 22 份，失败 3 份。新账户已自动启用，已有账户保留原状态。请重新选择失败文件后导入。")).toBeVisible();
   expect(imported).toEqual(files.map((file) => file.buffer.toString()));
   await expect(dialog.getByText("导入成功", { exact: true })).toHaveCount(22);
   await expect(dialog.getByText("导入失败", { exact: true })).toHaveCount(1);
@@ -211,6 +211,62 @@ test("凭据文件多选批量导入超过20份，独立失败与结果清空", 
   expect(calls.find((call) => call.method === "PATCH" && call.path.endsWith("/channel-one"))?.body)
     .toEqual({ credentials: "FAKE-CREDENTIAL-1" });
 });
+test("渠道批量管理、真实积分状态和可恢复清理", async ({ page }) => {
+  await page.setViewportSize({ width: 1720, height: 1080 });
+  await fakeApi(page, "superadmin");
+  const ids = ["1", "2", "3"].map(value => `managed-miora-${value.repeat(24)}`);
+  const rows: any[] = [
+    { id: ids[0], label: "一号 Miora", provider: "miora", enabled: true, credits: 100, creditStatus: "ok", creditsCheckedAt: "2026-10-12T12:00:00Z", localCredentialStatus: "imported" },
+    { id: ids[1], label: "二号 Miora", provider: "miora", enabled: true, credits: null, creditStatus: "unknown", localCredentialStatus: "imported" },
+    { id: ids[2], label: "三号 Miora", provider: "miora", enabled: true, credits: 31.5, creditStatus: "error", lastErrorCode: "CREDIT_READ_FAILED", creditsCheckedAt: "2026-10-12T11:00:00Z", localCredentialStatus: "imported" },
+  ];
+  const operations: { path: string; body: any }[] = [];
+  await page.route("**/api/admin/channels/accounts**", async route => {
+    const request = route.request(), path = new URL(request.url()).pathname;
+    const body = request.postDataJSON();
+    let result: unknown = { data: rows, total: rows.length };
+    if (request.method() !== "GET") {
+      operations.push({ path, body });
+      if (path.endsWith("/batch")) {
+        for (const row of rows) if (body.ids.includes(row.id)) row.enabled = body.action === "enable";
+        result = { updated: body.ids.length, accounts: rows.filter(row => body.ids.includes(row.id)) };
+      } else if (path.endsWith("/credits/refresh")) {
+        rows[1].credits = 15.52; rows[1].creditStatus = "ok";
+        result = { checked: 3, succeeded: 2, failed: 1 };
+      } else if (path.endsWith("/cleanup")) {
+        rows[1].enabled = false; rows[1].archivedAt = "2026-10-12T12:01:00Z";
+        rows[1].cleanupReason = "insufficient-credits";
+        result = { checked: 3, archived: 1, retained: 2, failed: 1 };
+      }
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(result) });
+  });
+  await page.goto("./");
+  await page.getByRole("menuitem", { name: /渠道账户/ }).click();
+  await expect(page.getByText("未查询", { exact: true })).toBeVisible();
+  await expect(page.getByText("读取失败", { exact: true })).toBeVisible();
+  await expect(page.getByText("上次成功：31.5 积分", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "批量停用", exact: true })).toBeDisabled();
+  await page.getByRole("row").filter({ hasText: "一号 Miora" }).getByRole("checkbox").check();
+  await expect(page.getByText("已选 1 个", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "批量停用", exact: true }).click();
+  await page.getByRole("button", { name: "确定", exact: true }).click();
+  await expect(page.getByRole("row").filter({ hasText: "一号 Miora" }).getByText("已停用", { exact: true })).toBeVisible();
+  expect(operations[0]).toEqual({ path: "/api/admin/channels/accounts/batch", body: { ids: [ids[0]], action: "disable" } });
+  await expect(page.getByText("已选 0 个", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /刷新全部积分$/ }).click();
+  await expect(page.getByRole("row").filter({ hasText: "二号 Miora" }).getByText("15.52", { exact: true })).toBeVisible();
+  expect(operations[1]).toEqual({ path: "/api/admin/channels/accounts/credits/refresh", body: {} });
+  await page.getByRole("button", { name: "清理无效账户", exact: true }).click();
+  await page.getByRole("button", { name: "确定", exact: true }).click();
+  const archivedRow = page.getByRole("row").filter({ hasText: "二号 Miora" });
+  await expect(archivedRow.getByText("已归档", { exact: true })).toBeVisible();
+  await expect(archivedRow.getByText("不足最低生成额度", { exact: true })).toBeVisible();
+  await expect(page.getByText(/检查 3 个，归档 1 个，保留 2 个，读取失败 1 个/).first()).toBeVisible();
+  expect(operations).toHaveLength(3);
+  await page.screenshot({ path: "../../tmp/admin-channel-management.png", fullPage: true });
+});
+
 test("登录、账户操作、激活码只显示一次", async ({ page }) => {
   const calls = await fakeApi(page, "operator", false);
   await page.goto("./");
@@ -271,7 +327,7 @@ test("假渠道凭据导入与清空、成员权限修改、API 错误可见", a
   const calls = await fakeApi(page, "superadmin");
   await page.goto("./");
   await page.getByRole("menuitem", { name: /渠道账户/ }).click();
-  await expect(page.getByText("远端会话未验证", { exact: true })).toBeVisible();
+  await expect(page.getByText("未查询", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "导入 Miora 凭据" }).click();
   const fileInput = page.getByLabel("选择本地凭据文件");
   await fileInput.setInputFiles({

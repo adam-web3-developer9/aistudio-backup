@@ -143,6 +143,34 @@ body {
 .small-id {
   font-size: 10px;
 }
+.channel-management {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 18px;
+  margin-bottom: 20px;
+  border: 1px solid #e6eaf2;
+  border-radius: 8px;
+  background: #f8fafd;
+}
+.channel-batch-bar {
+  padding-bottom: 12px;
+  border-bottom: 1px solid #e6eaf2;
+}
+.channel-management-note {
+  font-size: 12px;
+}
+.channel-credits,
+.channel-account-state {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.channel-credits > .ant-typography-secondary,
+.channel-account-state > .ant-typography-secondary {
+  font-size: 12px;
+}
 .readonly-banner {
   margin-bottom: 20px;
 }

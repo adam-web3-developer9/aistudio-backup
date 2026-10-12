@@ -8,11 +8,16 @@ import { config } from '../dist/config.js';
 import { MioraAdapter } from '../dist/adapters/miora-adapter.js';
 import { BrowserPool } from '../dist/browser/browser-pool.js';
 import { useMioraProxy } from '../dist/adapters/miora-api.js';
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 
 test('managed Miora gateway matches desktop upload/submit/query with no provider calls', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'managed-video-gateway-test-'));
   const originalConfig = { ...config };
   const originalFetch = globalThis.fetch;
+  const originalDispatcher = getGlobalDispatcher();
+  const offline = new MockAgent();
+  offline.disableNetConnect();
+  setGlobalDispatcher(offline);
   const originalCredits = MioraAdapter.prototype.getCreditsFromCookies;
   const originalRun = MioraAdapter.prototype.runWithoutBrowser;
   const originalWarmup = BrowserPool.prototype.initialize;
@@ -25,6 +30,7 @@ test('managed Miora gateway matches desktop upload/submit/query with no provider
     mailer: { sendVerification: async () => {}, sendPasswordReset: async () => {} },
     testMode: true, credentialKey: Buffer.alloc(32, 91).toString('base64'),
     channelsEnabled: true, videoGatewayEnabled: true, mediaDirectory: path.join(directory, 'private'),
+    managedAccountCreditReader: async () => ({ totalCredits: 1000, breakdown: [] }),
   };
   try {
     Object.assign(config, {
@@ -104,6 +110,8 @@ test('managed Miora gateway matches desktop upload/submit/query with no provider
   } finally {
     await current?.app.close();
     globalThis.fetch = originalFetch;
+    setGlobalDispatcher(originalDispatcher);
+    await offline.close();
     MioraAdapter.prototype.getCreditsFromCookies = originalCredits;
     MioraAdapter.prototype.runWithoutBrowser = originalRun;
     BrowserPool.prototype.initialize = originalWarmup;

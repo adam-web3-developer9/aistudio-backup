@@ -2,6 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ManagedSessionStore } from './system-channels/session-store.js';
 import type { ChannelStore } from './system-channels/store.js';
+import { ManagedAccountOperations, type ManagedArchiveReason, type ManagedAccountCreditReader } from './system-channels/account-operations.js';
 import { systemLoggerOptions } from './system/security.js';
 import { SystemError } from './system/types.js';
 import { assertVideoGatewayConfiguration, assertVideoGatewayProxyConfiguration, assertVideoGatewayRequest, ManagedVideoGatewayRecords, gatewayJobIdPrefix, projectGatewayJob } from './system-channels/video-gateway.js';
@@ -80,7 +81,7 @@ const supportedAssetTypes = new Set([
 ]);
 const MIN_RETAINED_HAILUO_CREDITS = 28;
 
-export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
+export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; managedAccountCreditReader?:ManagedAccountCreditReader; managedAccountArchived?:(id:string,reason:ManagedArchiveReason)=>void; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
   if (options.managedGateway && !options.managedChannels) throw new Error('Managed video gateway requires managed channels');
   assertVideoGatewayConfiguration(options.managedGateway === true, config.apiKey);
   assertVideoGatewayProxyConfiguration(options.managedGateway === true, config.mioraProxyUrl);
@@ -826,6 +827,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     });
   }
 
+  let managedAccountOperations:ManagedAccountOperations|undefined;
   const accountPool = new AccountPool(sessions, adapters, {
     creditsTtlMs: config.creditsCacheTtlMs,
     creditsRetryDelaysMs: config.hailuoRetryDelaysMs,
@@ -837,6 +839,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
       if (!snapshot.creditsCheckedAt || snapshot.lastError || snapshot.credits === undefined
         || !Number.isFinite(snapshot.credits) || snapshot.credits < 0) return;
       if (snapshot.adapterId === miora.id) {
+        if(options.managedChannels?.row(snapshot.sessionId))return managedAccountOperations?.confirmedBalance(snapshot.sessionId,cookies,snapshot.credits,snapshot.creditsCheckedAt);
         const account = configuredMioraAccounts.get(snapshot.sessionId);
         const expected = readMioraTokens(cookies);
         if (!account || !expected || minimumMioraCredits === undefined || snapshot.credits >= minimumMioraCredits) return;
@@ -894,6 +897,17 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     }
   });
 
+  if(options.managedChannels){
+    const managedChannels=options.managedChannels;
+    managedAccountOperations=new ManagedAccountOperations(managedChannels,{
+      minimumCredits:minimumMioraCredits,proxyUrl:config.mioraProxyUrl,proxyAddress:config.mioraProxyAddress,
+      readCredits:options.managedAccountCreditReader,
+      busy:id=>accountPool.activeJobs(id)>0||jobs.list().some(job=>job.sessionId===id&&(job.status==='queued'||job.status==='running')),
+      onArchive:options.managedAccountArchived,
+      changed:async()=>{const rows=managedChannels.db.prepare('SELECT id,enabled,archived_at FROM managed_channel_accounts').all() as {id:string;enabled:number;archived_at:string|null}[];for(const row of rows){if(row.enabled&&!row.archived_at)accountPool.unretire(row.id);else accountPool.retire(row.id);}await accountPool.sync();}
+    });
+  }
+
   const runner = new JobRunner(jobs, assets, sessions, adapters, browsers, accountPool, {
     beforeSubmitGuard: gateway ? job => gateway.assertExecution(job) : undefined,
     timeoutMs: config.jobTimeoutMs,
@@ -945,6 +959,10 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     });
   }, config.mioraTokenCheckMs);
   mioraTokenTimer.unref();
+  const checkManagedAccounts=()=>{if(config.mioraProxyUrl)managedAccountOperations?.schedule(options.managedChannels!.ids().filter(id=>!!options.managedChannels!.row(id)?.enabled));};
+  const managedAccountTimer=managedAccountOperations?setInterval(checkManagedAccounts,60_000):undefined;
+  managedAccountTimer?.unref();
+  if(managedAccountOperations)app.addHook('onReady',async()=>{checkManagedAccounts();});
   if (options.warmup !== false) await browsers.initialize();
 
   // Read balances once at boot so a dead account is reported before any job.
@@ -1228,11 +1246,13 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     mioraImportWatcher.stop();
     clearInterval(dreamMakerTokenTimer);
     clearInterval(mioraTokenTimer);
+    if(managedAccountTimer)clearInterval(managedAccountTimer);
+    await managedAccountOperations?.close();
     clearInterval(pruneTimer);
     await browsers.close();
     await jobs.flush();
   });
-  app.decorate('channelRuntime', { jobs, runner, assets, accountPool, sessions });
+  app.decorate('channelRuntime', { jobs, runner, assets, accountPool, sessions, accountOperations:managedAccountOperations });
   return app;
 }
 

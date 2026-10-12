@@ -48,6 +48,38 @@ export function mutation<T>(path: string, method: string, body?: unknown) {
     body: JSON.stringify(body ?? {}),
   });
 }
+export type ChannelBatchAction = "enable" | "disable" | "archive" | "restore";
+export interface ChannelBatchResult {
+  updated: number;
+  accounts: Record<string, unknown>[];
+}
+export interface ChannelCreditsResult {
+  checked: number;
+  succeeded: number;
+  failed: number;
+}
+export interface ChannelCleanupResult {
+  checked: number;
+  archived: number;
+  retained: number;
+  failed: number;
+}
+export function batchChannelAccounts(ids: string[], action: ChannelBatchAction) {
+  return mutation<ChannelBatchResult>("/api/admin/channels/accounts/batch", "POST", {
+    ids,
+    action,
+  });
+}
+export function refreshChannelCredits(ids?: string[]) {
+  return mutation<ChannelCreditsResult>("/api/admin/channels/accounts/credits/refresh", "POST", {
+    ...(ids ? { ids } : {}),
+  });
+}
+export function cleanupChannelAccounts(ids?: string[]) {
+  return mutation<ChannelCleanupResult>("/api/admin/channels/accounts/cleanup", "POST", {
+    ...(ids ? { ids } : {}),
+  });
+}
 export async function getAdmin(): Promise<AdminIdentity> {
   const identity = await request<AdminIdentity>("/api/admin/me");
   if (!["superadmin", "operator", "readonly"].includes(identity.role))
