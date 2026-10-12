@@ -7,7 +7,10 @@ export function assertSystemRequestOrigin(request: FastifyRequest, trustedOrigin
   if (origin && !trustedOrigins.includes(origin)) throw new SystemError(403, 'UNTRUSTED_ORIGIN', 'Origin is not allowed');
   const mutation = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
   if (mutation && request.headers.cookie && !origin) throw new SystemError(403, 'ORIGIN_REQUIRED', 'Origin is required for cookie-authenticated mutations');
-  if (request.headers['sec-fetch-site'] === 'cross-site' && !origin) throw new SystemError(403, 'UNTRUSTED_ORIGIN', 'Origin is required for cross-site requests');
+  // Email links are top-level GET navigations and browsers normally omit Origin.
+  const documentNavigation = request.method === 'GET' && request.headers['sec-fetch-mode'] === 'navigate'
+    && request.headers['sec-fetch-dest'] === 'document';
+  if (request.headers['sec-fetch-site'] === 'cross-site' && !origin && !documentNavigation) throw new SystemError(403, 'UNTRUSTED_ORIGIN', 'Origin is required for cross-site requests');
   if (mutation && !request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
     const match = /^\/api\/system\/projects\/([^/]+)\/media$/.exec(request.url.split('?')[0]!);
     let mediaId = ''; try { mediaId = match ? decodeURIComponent(match[1]!) : ''; } catch { /* Reject invalid encoding. */ }

@@ -9,6 +9,7 @@ import { createSmtpMailer, type SystemMailer, type VerificationMail } from './ma
 import { SystemStore } from './store.js';
 import { assertAdmin, SystemError, type AdminPermission, type SystemPrincipal } from './types.js';
 import { assertSystemRequestOrigin } from './security.js';
+import { normalizeVerificationCallback } from './verification-link.js';
 
 export interface SystemRuntimeOptions {
   databasePath: string;
@@ -78,7 +79,7 @@ export async function createSystemRuntime(options: SystemRuntimeOptions): Promis
       enabled: true,
       requireEmailVerification: true,
       autoSignIn: false,
-      minPasswordLength: 12,
+      minPasswordLength: 8,
       maxPasswordLength: 128,
       revokeSessionsOnPasswordReset: true,
       sendResetPassword: async ({ user, url }: { user: { email: string; name: string }; url: string }) => {
@@ -91,7 +92,9 @@ export async function createSystemRuntime(options: SystemRuntimeOptions): Promis
       autoSignInAfterVerification: false,
       expiresIn: 3600,
       sendVerificationEmail: async ({ user, url }: { user: { email: string; name: string }; url: string }) => {
-        await deliverMail('verification', { to: user.email, name: user.name, url });
+        const verification = new URL(url);
+        normalizeVerificationCallback(verification, baseUrl.origin);
+        await deliverMail('verification', { to: user.email, name: user.name, url: verification.href });
       },
     },
     session: { expiresIn: 7 * 86400, updateAge: 86400, cookieCache: { enabled: false } },

@@ -12,7 +12,7 @@ Tests inject `MemorySystemMailer` and never send real messages.
 ## Authentication and browser security
 
 - `/api/auth/*` follows Better Auth's official Fastify Fetch bridge. Email signup
-  requires verification; verification does not auto-login. Passwords are 12–128
+  requires verification; verification does not auto-login. Passwords are 8–128
   characters; reset revokes existing sessions.
 - Authentication JSON responses are recursively projected to remove session
   tokens, IP addresses and user agents. Session credentials remain only in the
@@ -30,7 +30,12 @@ Tests inject `MemorySystemMailer` and never send real messages.
 - `runtime.assertRequestOrigin(request)` must protect all related `/api/*`
   plugins. It checks exact trusted origins, rejects missing Origin on cookie
   writes, and requires JSON mutations. Clients send `{}` for empty mutations,
-  including DELETE. `systemLoggerOptions` removes verification/reset query tokens
+  including DELETE. Cross-site GET document navigations without Origin are allowed
+  for emailed verification/reset links; cross-site fetches remain rejected.
+  Better Auth still validates link tokens and callback origins.
+  Default verification callbacks (including old links pointing to `/`) land on
+  `/account/verified`, which shows a success or failure result.
+  `systemLoggerOptions` removes verification/reset query tokens
   and credentials from request logs. Keep `/admin` and `/api/*` on one origin.
 - `runtime.authenticate(request)` throws 401/403 or returns a flat
   `SystemPrincipal` with `sessionId,sharingEligible,adminRole` for trusted server

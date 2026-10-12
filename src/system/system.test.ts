@@ -9,6 +9,7 @@ import type { FastifyInstance } from 'fastify';
 const origin = 'http://127.0.0.1:3001';
 const secret = 'isolated-system-test-only-secret-which-is-long-enough';
 const password = 'a-strong-local-test-password';
+const emailNavigationHeaders = { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };
 type User = { id: string; email: string; cookie: string };
 
 describe('system identity, activation and administrator authorization', () => {
@@ -72,11 +73,57 @@ describe('system identity, activation and administrator authorization', () => {
     expect(runtime.store.getIdentityByEmail(email)?.emailVerified).toBe(false);
   });
 
+  it('accepts eight-character registration passwords and rejects shorter ones', async () => {
+    const email = 'eight-character-password@example.invalid';
+    const shorter = await request('POST', '/api/auth/sign-up/email', undefined, { email, name: 'Password boundary', password: '1234567' });
+    expect(shorter.statusCode).toBe(400);
+    expect(runtime.store.getIdentityByEmail(email)).toBeNull();
+    const signup = await request('POST', '/api/auth/sign-up/email', undefined, { email, name: 'Password boundary', password: '12345678' });
+    expect(signup.statusCode).toBe(200);
+    const verification = new URL(mailer.messages.find(message => message.to === email)!.url);
+    expect((await app.inject({ method: 'GET', url: verification.pathname + verification.search, headers: emailNavigationHeaders })).statusCode).toBe(302);
+    expect(await login(email, '12345678')).toContain('session_token');
+  });
+
   it('returns safe unactivated identity and no channel credentials, credits, or session token', async () => {
     const response = await request('GET', '/api/system/me', user);
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ id: user.id, role: null, everActivated: false, validUntil: null, cloudEligible: false, sharingEnabled: false, localExpiryPolicy: 'pending' });
     for (const key of ['cookies', 'credits', 'token', 'session', 'sessionId', 'sharingEligible', 'adminRole']) expect(response.json()).not.toHaveProperty(key);
+  });
+
+  it('verifies an email opened from webmail without Origin while enforcing tokens and callback origins', async () => {
+    const email = 'email-navigation@example.invalid';
+    const signup = await request('POST', '/api/auth/sign-up/email', undefined, { email, name: 'Email navigation', password });
+    expect(signup.statusCode).toBe(200);
+    const verification = new URL(mailer.messages.find(message => message.to === email)!.url);
+    expect(verification.searchParams.get('callbackURL')).toBe(`${origin}/account/verified`);
+    // Previously sent signup messages used the root path, which Nginx sends to /admin/.
+    verification.searchParams.set('callbackURL', '/');
+    const headers = { ...emailNavigationHeaders, cookie: user.cookie };
+    const forgedCallback = new URL(verification);
+    forgedCallback.searchParams.set('callbackURL', 'https://evil.invalid/account/verified');
+    const denied = await app.inject({ method: 'GET', url: forgedCallback.pathname + forgedCallback.search, headers });
+    expect(denied.statusCode).toBe(403);
+    expect(runtime.store.getIdentityByEmail(email)?.emailVerified).toBe(false);
+    const invalidToken = new URL(verification);
+    invalidToken.searchParams.set('token', 'invalid-token');
+    const invalid = await app.inject({ method: 'GET', url: invalidToken.pathname + invalidToken.search, headers });
+    expect(invalid.statusCode).toBe(302);
+    expect(new URL(invalid.headers.location as string).searchParams.has('error')).toBe(true);
+    const failedTarget = new URL(invalid.headers.location as string, origin);
+    const failurePage = await app.inject({ method: 'GET', url: failedTarget.pathname + failedTarget.search, headers });
+    expect(failurePage.body).toContain('邮箱验证未完成');
+    expect(runtime.store.getIdentityByEmail(email)?.emailVerified).toBe(false);
+    const verified = await app.inject({ method: 'GET', url: verification.pathname + verification.search, headers });
+    expect(verified.statusCode).toBe(302);
+    expect(verified.headers.location).toBe(`${origin}/account/verified`);
+    expect(runtime.store.getIdentityByEmail(email)?.emailVerified).toBe(true);
+    expect(verified.cookies.some(cookie => cookie.name.endsWith('session_token'))).toBe(false);
+    const successPage = await app.inject({ method: 'GET', url: '/account/verified', headers });
+    expect(successPage.statusCode).toBe(200);
+    expect(successPage.body).toContain('邮箱验证成功');
+    expect((await request('GET', '/api/system/me', user)).json().id).toBe(user.id);
   });
 
   it('projects real session HTTP responses while retaining cookie login and the native internal auth API', async () => {
@@ -159,6 +206,20 @@ describe('system identity, activation and administrator authorization', () => {
     expect(form.statusCode).toBe(415);
     const options = await app.inject({ method: 'OPTIONS', url, headers: { origin: 'https://evil.invalid' } });
     expect(options.statusCode).toBe(403);
+    const navigationWithOrigin = await app.inject({ method: 'GET', url: '/account/verified', headers: { ...emailNavigationHeaders, origin: 'https://evil.invalid' } });
+    expect(navigationWithOrigin.statusCode).toBe(403);
+    for (const headers of [
+      { 'sec-fetch-site': 'cross-site' },
+      { ...emailNavigationHeaders, 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' },
+      { ...emailNavigationHeaders, 'sec-fetch-dest': 'iframe' },
+    ]) {
+      const crossSiteRead = await app.inject({ method: 'GET', url: '/api/system/me', headers: { ...headers, cookie: user.cookie } });
+      expect(crossSiteRead.statusCode).toBe(403);
+      expect(crossSiteRead.json().code).toBe('UNTRUSTED_ORIGIN');
+    }
+    const crossSiteWrite = await app.inject({ method: 'POST', url, headers: emailNavigationHeaders, payload: {} });
+    expect(crossSiteWrite.statusCode).toBe(403);
+    expect(crossSiteWrite.json().code).toBe('UNTRUSTED_ORIGIN');
   });
 
   it('returns Refine data+total, defaults validity to 365 days, and persists only a digest', async () => {
@@ -254,25 +315,29 @@ describe('system identity, activation and administrator authorization', () => {
   });
 
   it('offers working verification/reset landing pages and a fake reset mail flow', async () => {
-    const page = await request('GET', '/account/reset-password');
+    const page = await app.inject({ method: 'GET', url: '/account/reset-password', headers: emailNavigationHeaders });
     expect(page.statusCode).toBe(200);
     expect(page.headers['content-security-policy']).toContain("default-src 'none'");
     expect(page.headers['referrer-policy']).toBe('no-referrer');
+    expect(page.body).toContain('minlength="8"');
     expect((await request('GET', '/account/verified')).statusCode).toBe(200);
     const reset = await request('POST', '/api/auth/request-password-reset', undefined, { email: user.email, redirectTo: `${origin}/account/reset-password` });
     expect(reset.statusCode).toBe(200);
     const message = mailer.passwordResets.find(message => message.to === user.email)!;
     expect(message.url).toContain('/api/auth/reset-password/');
     const url = new URL(message.url);
-    const redirect = await request('GET', url.pathname + url.search);
+    const redirect = await app.inject({ method: 'GET', url: url.pathname + url.search, headers: emailNavigationHeaders });
     expect(redirect.statusCode).toBe(302);
     const target = new URL(redirect.headers.location as string);
     const token = target.searchParams.get('token');
     expect(token).toBeTruthy();
-    const changed = await request('POST', '/api/auth/reset-password', undefined, { token, newPassword: 'a-different-strong-test-password' });
+    expect((await app.inject({ method: 'GET', url: target.pathname + target.search, headers: emailNavigationHeaders })).statusCode).toBe(200);
+    const shorter = await request('POST', '/api/auth/reset-password', undefined, { token, newPassword: '1234567' });
+    expect(shorter.statusCode).toBe(400);
+    const changed = await request('POST', '/api/auth/reset-password', undefined, { token, newPassword: '87654321' });
     expect(changed.statusCode, changed.body).toBe(200);
     expect((await request('GET', '/api/system/me', user)).statusCode).toBe(401);
-    user.cookie = await login(user.email, 'a-different-strong-test-password');
+    user.cookie = await login(user.email, '87654321');
     expect((await request('POST', '/api/auth/reset-password', undefined, { token, newPassword: password })).statusCode).toBe(400);
   });
 

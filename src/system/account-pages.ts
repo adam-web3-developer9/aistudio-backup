@@ -35,6 +35,11 @@ function protectPage(reply: FastifyReply, script?: string) {
 }
 
 export function registerAccountPages(app: FastifyInstance): void {
-  app.get('/account/verified', async (_request, reply) => protectPage(reply).send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>邮箱验证</title></head><body><main><h1>邮箱验证</h1><p>若验证成功，请返回 AI Studio 客户端登录。若链接提示失败或已过期，请在客户端重新发送验证邮件。</p></main></body></html>`));
-  app.get('/account/reset-password', async (_request, reply) => protectPage(reply, resetScript).send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>重置密码</title></head><body><main><h1>重置密码</h1><p id="status" role="status">请设置至少12字符的新密码，重置后返回客户端登录。</p><form id="form"><p><label>新密码 <input id="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label></p><p><label>确认密码 <input id="confirm" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label></p><button id="submit" type="submit">重置密码</button> <button id="copy" type="button">复制重置凭据到客户端</button></form></main><script>${resetScript}</script></body></html>`));
+  app.get('/account/verified', async (request, reply) => {
+    const failed = typeof (request.query as { error?: unknown }).error === 'string';
+    const title = failed ? '邮箱验证未完成' : '邮箱验证已完成';
+    const message = failed ? '验证链接无效或已过期，请返回 AI Studio 客户端重新发送验证邮件。' : '邮箱验证成功，请返回 AI Studio 客户端登录。';
+    return protectPage(reply).send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body><main><h1>${title}</h1><p>${message}</p></main></body></html>`);
+  });
+  app.get('/account/reset-password', async (_request, reply) => protectPage(reply, resetScript).send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>重置密码</title></head><body><main><h1>重置密码</h1><p id="status" role="status">请设置至少8字符的新密码，重置后返回客户端登录。</p><form id="form"><p><label>新密码 <input id="password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required></label></p><p><label>确认密码 <input id="confirm" type="password" minlength="8" maxlength="128" autocomplete="new-password" required></label></p><button id="submit" type="submit">重置密码</button> <button id="copy" type="button">复制重置凭据到客户端</button></form></main><script>${resetScript}</script></body></html>`));
 }

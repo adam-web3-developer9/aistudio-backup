@@ -5,6 +5,7 @@ import type { SystemRuntime } from './runtime.js';
 import { adminRoles, SystemError, type SystemPrincipal } from './types.js';
 import { registerAccountPages } from './account-pages.js';
 import { projectAuthHttpResponse } from './auth-response.js';
+import { normalizeVerificationCallback } from './verification-link.js';
 
 const listSchema = z.object({ page: z.coerce.number().int().min(1).max(1_000_000).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20), q: z.string().max(200).optional(),
@@ -57,6 +58,7 @@ export async function registerSystemRoutes(app: FastifyInstance, options: Regist
     routes.route({ method: ['GET', 'POST'], url: '/api/auth/*', async handler(request, reply) {
       // Use the configured origin; never trust an incoming Host header for verification URLs.
       const url = new URL(request.url, runtime.baseUrl);
+      if (request.method === 'GET') normalizeVerificationCallback(url, runtime.baseUrl);
       const headers = fromNodeHeaders(request.headers);
       headers.set('x-system-client-ip', request.ip);
       const response = await runtime.auth.handler(new Request(url, { method: request.method, headers,
