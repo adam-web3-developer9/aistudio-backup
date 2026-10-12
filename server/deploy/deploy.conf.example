@@ -1,0 +1,8 @@
+APP_ROOT=/www/server/aistudio-studio
+DATA_ROOT=/var/lib/aistudio-studio
+APP_USER=aistudio-studio
+NODE_BIN=/www/server/nodejs/v22.22.3/bin
+SYSTEM_PORT=3001
+DOMAIN=studio.crypto-compass-web.online
+# This repository is public; HTTPS fetch needs no stored GitHub credential.
+REPOSITORY_URL=https://github.com/adam-web3-developer9/aistudio-backup.git

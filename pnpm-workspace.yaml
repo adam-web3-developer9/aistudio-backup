@@ -1,4 +1,6 @@
 # pnpm 11 moved these settings out of package.json's "pnpm" field.
+packages:
+  - '.'
 # tsx runs on esbuild's platform binary, so esbuild may run its install script.
 allowBuilds:
   better-sqlite3: true

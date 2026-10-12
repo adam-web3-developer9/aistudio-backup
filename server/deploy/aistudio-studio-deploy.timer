@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch main for AI Studio deployment every minute
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=aistudio-studio-deploy.service
+
+[Install]
+WantedBy=timers.target
