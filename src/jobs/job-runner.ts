@@ -16,6 +16,8 @@ export interface JobRunnerOptions {
   onJobSettled?: (job: JobRecord) => void;
   /** Independent submit guard for explicitly authorized video-gateway work. */
   beforeSubmitGuard?: (job: JobRecord) => Promise<void> | void;
+  /** Transfers any durable pre-dispatch reservation after AccountPool owns it. */
+  onAccountLeaseAcquired?: (job: JobRecord) => Promise<void> | void;
 }
 
 export interface RecoverySummary {
@@ -152,8 +154,13 @@ export class JobRunner {
               jobOptions: job.options
             });
             this.jobs.update(jobId, { sessionId: lease.sessionId });
+            try { await this.options.onAccountLeaseAcquired?.(this.jobs.get(jobId)!); }
+            catch { /* The expiring durable reservation may safely remain conservative. */ }
           }
         } catch (error) {
+          if (error instanceof InsufficientCreditsError && job.id.startsWith('job_gateway_') && job.sessionId) {
+            throw new JobError('ACCOUNT_INSUFFICIENT_CREDITS', error.message);
+          }
           // Exclusions can leave no candidates after every provider-side credit
           // rejection. Preserve the useful upstream error instead of reporting
           // that the configured account pool disappeared.
@@ -211,7 +218,10 @@ export class JobRunner {
           const insufficientCredits = adapter.isInsufficientCreditsError?.(error) === true;
           if (!insufficientCredits) throw error;
           if (!lease || job.sessionId !== undefined) {
-            throw new JobError('INSUFFICIENT_CREDITS', error instanceof Error ? error.message : String(error));
+            throw new JobError(
+              job.id.startsWith('job_gateway_') ? 'ACCOUNT_INSUFFICIENT_CREDITS' : 'INSUFFICIENT_CREDITS',
+              error instanceof Error ? error.message : String(error)
+            );
           }
 
           lastProviderCreditsError = error instanceof Error ? error : new Error(String(error));
@@ -267,6 +277,10 @@ export class JobRunner {
         sessionId: job.sessionId,
         requiredCredits: 0
       }).catch(() => undefined);
+      if (lease) {
+        try { await this.options.onAccountLeaseAcquired?.(job); }
+        catch { /* The expiring durable reservation may safely remain conservative. */ }
+      }
 
       const session = await this.sessions.get(job.sessionId);
       if (!session) {

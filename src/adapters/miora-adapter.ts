@@ -50,6 +50,18 @@ export function mioraMinimumVideoCredits(model: string): number | undefined {
   return price === undefined ? undefined : Math.round(price * 4 * 100) / 100;
 }
 
+/** Desktop-compatible dispatch estimate, rounded up to whole provider credits. */
+export function mioraEstimatedVideoCredits(
+  options: JobOptions | undefined,
+  defaults: Pick<MioraVideoDefaults, 'model' | 'durationSeconds'>
+): number | undefined {
+  const model = options?.modelId ?? defaults.model;
+  const duration = options?.durationSeconds ?? defaults.durationSeconds;
+  const perSecond = MIORA_PRICE_PER_SECOND[model];
+  if (perSecond === undefined || !duration || duration <= 0) return undefined;
+  return Math.ceil(perSecond * duration);
+}
+
 export interface MioraVideoDefaults {
   /** The catalog `modelId`. Only minimax-h3 is wired in for now. */
   model: string;
@@ -117,11 +129,8 @@ export class MioraAdapter implements BrowserAdapter {
    * all landing on one; never a verdict (`costEstimateIsBinding` is false).
    */
   estimateJobCost(_balance: CreditBalance, options?: JobOptions): number | undefined {
-    const model = options?.modelId ?? this.options?.video.model;
-    const duration = options?.durationSeconds ?? this.options?.video.durationSeconds;
-    const perSecond = model ? MIORA_PRICE_PER_SECOND[model] : undefined;
-    if (perSecond === undefined || !duration || duration <= 0) return undefined;
-    return Math.ceil(perSecond * duration);
+    if (!this.options?.video) return undefined;
+    return mioraEstimatedVideoCredits(options, this.options.video);
   }
 
   isInsufficientCreditsError(error: unknown): boolean {

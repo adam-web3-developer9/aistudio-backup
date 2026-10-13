@@ -22,6 +22,8 @@ export interface AccountSnapshot {
   /** Maximum provider-side jobs allowed for this account. */
   capacity: number;
   credits?: number;
+  /** Credits still dispatchable after reservations for currently running jobs. */
+  availableCredits?: number;
   creditsCheckedAt?: string;
   /** Last known balance was below what the pending job needs. */
   depleted: boolean;
@@ -231,13 +233,18 @@ export class AccountPool {
    * Current state of every account. `refresh` forces a live balance check
    * (that is what surfaces a 0-credit account before any job is submitted).
    */
-  async snapshot(options: { refresh?: boolean; adapterId?: string } = {}): Promise<AccountSnapshot[]> {
+  async snapshot(options: { refresh?: boolean; loadCredits?: boolean; adapterId?: string } = {}): Promise<AccountSnapshot[]> {
     await this.sync();
     const states = [...this.states.values()]
       .filter((state) => !options.adapterId || state.session.adapterId === options.adapterId);
 
     if (options.refresh) {
       await Promise.all(states.map((state) => this.readCredits(state, { force: true })));
+      await this.publishBalances();
+    } else if (options.loadCredits) {
+      // Dispatch paths need a balance, but should respect the normal TTL rather
+      // than turning every video into a live query of every provider account.
+      await Promise.all(states.map((state) => this.readCredits(state)));
       await this.publishBalances();
     }
     return states.map((state) => this.toSnapshot(state));
@@ -500,6 +507,7 @@ export class AccountPool {
       activeJobs: state.activeLeases,
       capacity: state.capacity,
       credits: state.balance?.totalCredits,
+      availableCredits: state.dispatchCredits ?? state.balance?.totalCredits,
       creditsCheckedAt: state.creditsCheckedAt === undefined
         ? undefined
         : new Date(state.creditsCheckedAt).toISOString(),

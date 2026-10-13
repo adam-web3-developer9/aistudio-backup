@@ -18,7 +18,7 @@ function lease(sessionId: string, credits: number, release = vi.fn()): AccountLe
   return { sessionId, credits, cookies: [], release };
 }
 
-function setup(options: { pinned?: boolean } = {}) {
+function setup(options: { pinned?: boolean; gateway?: boolean } = {}) {
   const jobs = new JobStore();
   const job = jobs.create({
     adapterId: 'hailuo-v1',
@@ -26,7 +26,7 @@ function setup(options: { pinned?: boolean } = {}) {
     assetId: 'asset-1',
     ...(options.pinned && { sessionId: 'low' }),
     options: { durationSeconds: 4, resolution: '768' }
-  });
+  }, options.gateway ? 'job_gateway_credit_test' : undefined);
   const assets = {
     get: vi.fn().mockReturnValue({
       id: 'asset-1',
@@ -72,7 +72,8 @@ function setup(options: { pinned?: boolean } = {}) {
   const browsers = { use: vi.fn() } as unknown as BrowserPool;
   const runner = new JobRunner(jobs, assets, sessions, adapters, browsers, accounts, {
     timeoutMs: 1_000,
-    directTimeoutMs: 1_000
+    directTimeoutMs: 1_000,
+    ...(options.gateway && { beforeSubmitGuard: vi.fn() })
   });
 
   return { jobs, job, runner, acquire, runWithoutBrowser, lowRelease, highRelease };
@@ -102,6 +103,17 @@ describe('JobRunner credit failover', () => {
     expect(ctx.acquire).toHaveBeenCalledOnce();
     expect(ctx.runWithoutBrowser).toHaveBeenCalledOnce();
     expect(ctx.jobs.get(ctx.job.id)?.error?.code).toBe('INSUFFICIENT_CREDITS');
+  });
+
+  it('marks a gateway upload-intent account rejection as account-scoped', async () => {
+    const ctx = setup({ pinned:true, gateway:true });
+
+    ctx.runner.submit(ctx.job);
+    await vi.waitFor(() => expect(ctx.jobs.get(ctx.job.id)?.status).toBe('failed'));
+
+    expect(ctx.acquire).toHaveBeenCalledOnce();
+    expect(ctx.runWithoutBrowser).toHaveBeenCalledOnce();
+    expect(ctx.jobs.get(ctx.job.id)?.error?.code).toBe('ACCOUNT_INSUFFICIENT_CREDITS');
   });
 });
 

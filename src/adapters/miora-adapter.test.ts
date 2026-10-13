@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MioraAdapter, mioraMinimumVideoCredits } from './miora-adapter.js';
+import { MioraAdapter, mioraEstimatedVideoCredits, mioraMinimumVideoCredits } from './miora-adapter.js';
 import type { MioraClient, MioraTask } from './miora-client.js';
 
 const adapter = new MioraAdapter();
@@ -24,6 +24,11 @@ describe('Miora cost estimate', () => {
   it('prices a job per second so a batch reserves what it will spend', () => {
     expect(priced.estimateJobCost(balance)).toBe(100);
     expect(priced.estimateJobCost(balance, { durationSeconds: 6 })).toBe(40);
+  });
+
+  it('can conservatively reserve fifteen seconds for old upload-intent clients', () => {
+    expect(mioraEstimatedVideoCredits(undefined, { model:'minimax-h3', durationSeconds:15 })).toBe(100);
+    expect(mioraEstimatedVideoCredits({ durationSeconds:13 }, { model:'minimax-h3', durationSeconds:15 })).toBe(87);
   });
 
   it('leaves models it has no price for unpriced', () => {

@@ -91,6 +91,7 @@ const errorMessages: Readonly<Record<string, string>> = {
   RENDER_TIMEOUT: 'The provider video task timed out',
   CONTENT_REJECTED: 'The provider rejected the prompt or reference media',
   INSUFFICIENT_CREDITS: 'The provider account has insufficient credits',
+  ACCOUNT_INSUFFICIENT_CREDITS: 'The selected provider account has insufficient credits',
   ACCOUNT_BALANCE_UNAVAILABLE: 'The provider account balance could not be confirmed',
   AUTH_FAILED: 'The provider account authentication is unavailable',
   PROVIDER_BUSY: 'The provider is busy',
@@ -129,6 +130,8 @@ export function projectGatewayJob(job: JobRecord) {
       message: statusMessages[job.status],
     } } : {}),
     ...(job.error ? { error: { code, message: errorMessages[code] ?? 'Video generation failed',
+      ...(code === 'ACCOUNT_INSUFFICIENT_CREDITS' ? { scope: 'account' } : {}),
+      ...(code === 'INSUFFICIENT_CREDITS' ? { scope: 'pool' } : {}),
       ...(typeof job.error.retryable === 'boolean' ? { retryable: job.error.retryable } : {}) } } : {}),
   };
 }

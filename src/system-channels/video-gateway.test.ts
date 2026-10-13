@@ -82,6 +82,10 @@ test('job projection returns only video result and safe progress and error field
   for (const privateValue of [key, 'private prompt', 'private-option', 'asset-private', 'managed-miora-test', 'C:\\private']) expect(encoded).not.toContain(privateValue);
   expect(projected.result).toEqual({ videoUrl });
   expect(projectGatewayJob(job({ error: { code: 'PRIVATE_CREDENTIAL_VALUE', message: key } })).error).toEqual({ code: 'VIDEO_GENERATION_FAILED', message: 'Video generation failed' });
+  expect(projectGatewayJob(job({ error: { code: 'ACCOUNT_INSUFFICIENT_CREDITS', message: 'private' } })).error)
+    .toMatchObject({ code:'ACCOUNT_INSUFFICIENT_CREDITS', scope:'account' });
+  expect(projectGatewayJob(job({ error: { code: 'INSUFFICIENT_CREDITS', message: 'private' } })).error)
+    .toMatchObject({ code:'INSUFFICIENT_CREDITS', scope:'pool' });
   expect(() => projectGatewayJob(job({ id: 'job_system_private' }))).toThrow('unavailable');
   for (const videoUrl of ['C:\\private\\video.mp4', '/api/system/private', 'file:///video.mp4', 'https://user:secret@video.miora.design/result.mp4']) expect(projectGatewayJob(job({ result: { videoUrl } }))).not.toHaveProperty('result');
 });
