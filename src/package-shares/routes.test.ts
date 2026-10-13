@@ -225,3 +225,27 @@ test('lost manifest publish receipts recover by actor before snapshot repair whi
     expect(f.network).not.toHaveBeenCalled();
   } finally { await f.close(); }
 });
+
+test('twenty-thousand media facts register through bounded idempotent windows and commit once', async () => {
+  const f = await fixture();
+  try {
+    const { shareId } = (await f.call('POST', '', 'owner', createInput)).json();
+    const media = Array.from({ length: 20_000 }, (_, index) => ({ sha256: index.toString(16).padStart(64, '0'), size: index, mime: 'image/png', kind: 'image' }));
+    const insert = f.db.prepare('INSERT INTO package_share_media VALUES(?,?,?,?,?,?,?,?)');
+    f.db.transaction(() => media.forEach(item => insert.run(shareId, item.sha256, item.size, item.mime, item.kind, `https://media.invalid/${item.sha256}`, 'owner', new Date().toISOString())))();
+    const staged = await f.call('POST', `/${shareId}/versions/stages`, 'owner', { kind: 'manifest', requestId: 'large-windowed', draftId: createInput.draftId,
+      title: 'large manifest', scope: { kind: 'all', episodeIds: [], sourceEpisodeCount: 0 }, baseVersionId: null,
+      snapshot: { sha256: 'f'.repeat(64), size: 123, url: 'https://snapshot.invalid/large.json' }, mediaCount: media.length });
+    expect(staged.statusCode).toBe(200); const stageId = staged.json().stageId;
+    for (let offset = 0; offset < media.length; offset += 50) {
+      const payload = { offset, items: media.slice(offset, offset + 50) };
+      const registered = await f.call('POST', `/${shareId}/versions/stages/${stageId}/media`, 'owner', payload);
+      expect(registered.statusCode).toBe(200);
+      if (offset === 0) expect((await f.call('POST', `/${shareId}/versions/stages/${stageId}/media`, 'owner', payload)).json().received).toBe(50);
+    }
+    const committed = await f.call('POST', `/${shareId}/versions/stages/${stageId}/commit`, 'owner', {});
+    expect(committed.statusCode).toBe(200); expect(committed.json().version).toMatchObject({ kind: 'manifest', sequence: 1 });
+    expect(f.db.prepare('SELECT COUNT(*) AS n FROM package_share_manifest_versions').get()).toEqual({ n: 1 });
+    expect(f.db.prepare('SELECT COUNT(*) AS n FROM package_share_manifest_stages').get()).toEqual({ n: 0 });
+  } finally { await f.close(); }
+});

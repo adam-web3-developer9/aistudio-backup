@@ -22,11 +22,13 @@ const versionBody = z.object({ requestId, draftId: id, title: z.string().min(1),
 const mediaIdentity = z.object({ sha256: z.string().regex(/^[a-f0-9]{64}$/), size: z.int().nonnegative() }).strict();
 const mediaFact = mediaIdentity.extend({ mime: z.string().min(1), kind: z.string().min(1) });
 const publicUrl = z.string().refine(isSafePackageUrl, 'Invalid public package URL');
-const manifestBody = z.object({ kind: z.literal('manifest'), requestId, draftId: id, title: z.string().min(1), scope: scopeSchema,
-  baseVersionId: id.nullable().optional(), snapshot: mediaIdentity.extend({ size: z.int().positive(), url: publicUrl }), media: z.array(mediaFact)
-}).strict().superRefine((manifest, ctx) => {
+const manifestBase = { kind: z.literal('manifest'), requestId, draftId: id, title: z.string().min(1), scope: scopeSchema,
+  baseVersionId: id.nullable().optional(), snapshot: mediaIdentity.extend({ size: z.int().positive(), url: publicUrl }) };
+const manifestBody = z.object({ ...manifestBase, media: z.array(mediaFact) }).strict().superRefine((manifest, ctx) => {
   if (new Set(manifest.media.map(item => `${item.sha256}:${item.size}`)).size !== manifest.media.length) ctx.addIssue({ code: 'custom', message: 'Duplicate media identities' });
 });
+const manifestStageBody = z.object({ ...manifestBase, mediaCount: z.int().nonnegative().max(1_000_000) }).strict();
+const stageParams = z.object({ shareId: id, stageId: id });
 const paramsOf = (request: FastifyRequest) => z.object({ shareId: id, versionId: id.optional(), userId: id.optional(), claimId: id.optional() }).parse(request.params);
 
 export function registerPackageShareRoutes(app: FastifyInstance, options: { runtime: SystemRuntime; enabled?: boolean; clock?: () => number }) {
@@ -126,6 +128,22 @@ export function registerPackageShareRoutes(app: FastifyInstance, options: { runt
     const input = z.union([manifestBody, versionBody]).parse(request.body);
     const version = input.kind === 'manifest' ? store.publishManifest(shareId, principal, { ...input, baseVersionId: input.baseVersionId ?? null })
       : store.publish(shareId, principal, { ...input, baseVersionId: input.baseVersionId ?? null });
+    runtime.store.audit({ actorId: principal.id, action: 'package.version.publish', targetType: 'packageShare', targetId: shareId, metadata: { versionId: version.versionId, sequence: version.sequence } });
+    return { version };
+  });
+  route('POST', '/:shareId/versions/stages', async request => {
+    const principal = await actor(request); const { shareId } = paramsOf(request);
+    const input = manifestStageBody.parse(request.body);
+    return store.stageManifest(shareId, principal, { ...input, baseVersionId: input.baseVersionId ?? null });
+  });
+  route('POST', '/:shareId/versions/stages/:stageId/media', async request => {
+    const principal = await actor(request); const { shareId, stageId } = stageParams.parse(request.params);
+    const input = z.object({ offset: z.int().nonnegative(), items: z.array(mediaFact).min(1).max(500) }).strict().parse(request.body);
+    return store.appendManifestMedia(shareId, stageId, principal, input.offset, input.items);
+  });
+  route('POST', '/:shareId/versions/stages/:stageId/commit', async request => {
+    const principal = await actor(request); const { shareId, stageId } = stageParams.parse(request.params);
+    const version = store.commitManifestStage(shareId, stageId, principal);
     runtime.store.audit({ actorId: principal.id, action: 'package.version.publish', targetType: 'packageShare', targetId: shareId, metadata: { versionId: version.versionId, sequence: version.sequence } });
     return { version };
   });

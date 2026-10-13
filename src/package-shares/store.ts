@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { SystemPrincipal } from '../system/types.js';
 import { SystemError } from '../system/types.js';
-import type { PackageShare, PackageVersion, PackageScope, PackageVersionInput, PackageManifestInput, PackageMediaFact, PackageMediaClaim } from './types.js';
+import type { PackageShare, PackageVersion, PackageScope, PackageVersionInput, PackageManifestInput, PackageManifestStageInput, PackageMediaFact, PackageMediaClaim } from './types.js';
 
 type ShareRow = PackageShare & { requestId: string };
 type VersionRow = Omit<PackageVersion, 'sourceDraftId' | 'scope' | 'downloadAvailable' | 'kind'> & { scopeJson: string; url?: string; requestId?: string; snapshotUrl?: string; mediaJson?: string };
@@ -32,6 +32,11 @@ export class PackageShareStore {
       CREATE TABLE IF NOT EXISTS package_share_media_claims(claimId TEXT PRIMARY KEY,shareId TEXT NOT NULL,sha256 TEXT NOT NULL,
       size INTEGER NOT NULL,actorId TEXT NOT NULL,requestId TEXT NOT NULL,repair INTEGER NOT NULL,status TEXT NOT NULL,
       leaseUntil TEXT NOT NULL,UNIQUE(shareId,actorId,requestId));
+      CREATE TABLE IF NOT EXISTS package_share_manifest_stages(stageId TEXT PRIMARY KEY,shareId TEXT NOT NULL,actorId TEXT NOT NULL,
+      requestId TEXT NOT NULL,metadataJson TEXT NOT NULL,mediaCount INTEGER NOT NULL,updatedAt TEXT NOT NULL,
+      UNIQUE(shareId,actorId,requestId));
+      CREATE TABLE IF NOT EXISTS package_share_manifest_stage_media(stageId TEXT NOT NULL,position INTEGER NOT NULL,
+      sha256 TEXT NOT NULL,size INTEGER NOT NULL,mime TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(stageId,position));
       CREATE UNIQUE INDEX IF NOT EXISTS package_media_active_claim ON package_share_media_claims(shareId,sha256,size) WHERE status='active';
       CREATE INDEX IF NOT EXISTS package_share_member_user ON package_share_members(userId,shareId);`);
   }
@@ -252,6 +257,63 @@ export class PackageShareStore {
       this.db.prepare('UPDATE package_shares SET updatedAt=? WHERE shareId=?').run(this.now(), shareId);
       return this.publicVersion(this.version(shareId, versionId));
     }).immediate();
+  }
+  stageManifest(shareId: string, principal: SystemPrincipal, input: PackageManifestStageInput) {
+    return this.db.transaction(() => {
+      const share = this.access(shareId, principal);
+      if (input.draftId !== share.draftId) throw new SystemError(409, 'PACKAGE_SHARE_SOURCE_MISMATCH', '版本来源与共享包绑定的草稿身份不一致');
+      if (input.baseVersionId) this.version(shareId, input.baseVersionId);
+      const existingVersion = this.receipt(shareId, principal, input.requestId);
+      if (existingVersion) return { committed: true, version: existingVersion };
+      const metadataJson = JSON.stringify({ ...input, mediaCount: undefined });
+      const previous = this.db.prepare('SELECT * FROM package_share_manifest_stages WHERE shareId=? AND actorId=? AND requestId=?').get(shareId, principal.id, input.requestId) as { stageId: string; metadataJson: string; mediaCount: number } | undefined;
+      if (previous) {
+        if (previous.metadataJson !== metadataJson || previous.mediaCount !== input.mediaCount) throw new SystemError(409, 'PACKAGE_VERSION_REQUEST_MISMATCH', '发布请求号已用于其他分窗清单');
+        const received = (this.db.prepare('SELECT COUNT(*) AS n FROM package_share_manifest_stage_media WHERE stageId=?').get(previous.stageId) as { n: number }).n;
+        return { committed: false, stageId: previous.stageId, received, mediaCount: previous.mediaCount };
+      }
+      const stageId = `pms_${randomUUID()}`;
+      this.db.prepare('INSERT INTO package_share_manifest_stages VALUES(?,?,?,?,?,?,?)').run(stageId, shareId, principal.id, input.requestId, metadataJson, input.mediaCount, this.now());
+      return { committed: false, stageId, received: 0, mediaCount: input.mediaCount };
+    }).immediate();
+  }
+  appendManifestMedia(shareId: string, stageId: string, principal: SystemPrincipal, offset: number, items: PackageMediaFact[]) {
+    return this.db.transaction(() => {
+      this.access(shareId, principal);
+      const stage = this.db.prepare('SELECT * FROM package_share_manifest_stages WHERE stageId=? AND shareId=?').get(stageId, shareId) as { actorId: string; mediaCount: number } | undefined;
+      if (!stage || stage.actorId !== principal.id) throw new SystemError(404, 'PACKAGE_MANIFEST_STAGE_UNAVAILABLE', '分窗清单不存在或不属于当前成员');
+      if (offset + items.length > stage.mediaCount) throw new SystemError(400, 'PACKAGE_MANIFEST_WINDOW_INVALID', '分窗清单超出声明的媒体数量');
+      const current = (this.db.prepare('SELECT COUNT(*) AS n FROM package_share_manifest_stage_media WHERE stageId=?').get(stageId) as { n: number }).n;
+      if (offset < current) {
+        const saved = this.db.prepare('SELECT sha256,size,mime,kind FROM package_share_manifest_stage_media WHERE stageId=? AND position>=? AND position<? ORDER BY position').all(stageId, offset, offset + items.length);
+        if (saved.length !== items.length || JSON.stringify(saved) !== JSON.stringify(items)) throw new SystemError(409, 'PACKAGE_MANIFEST_WINDOW_MISMATCH', '分窗位置已登记为其他媒体');
+        return { stageId, received: current, mediaCount: stage.mediaCount };
+      }
+      if (offset !== current) throw new SystemError(409, 'PACKAGE_MANIFEST_WINDOW_GAP', '分窗清单必须从服务器已确认位置继续');
+      const insert = this.db.prepare('INSERT INTO package_share_manifest_stage_media VALUES(?,?,?,?,?,?)');
+      items.forEach((item, index) => insert.run(stageId, offset + index, item.sha256, item.size, item.mime, item.kind));
+      this.db.prepare('UPDATE package_share_manifest_stages SET updatedAt=? WHERE stageId=?').run(this.now(), stageId);
+      return { stageId, received: offset + items.length, mediaCount: stage.mediaCount };
+    }).immediate();
+  }
+  commitManifestStage(shareId: string, stageId: string, principal: SystemPrincipal) {
+    this.access(shareId, principal);
+    const stage = this.db.prepare('SELECT * FROM package_share_manifest_stages WHERE stageId=? AND shareId=?').get(stageId, shareId) as { actorId: string; requestId: string; metadataJson: string; mediaCount: number } | undefined;
+    if (!stage || stage.actorId !== principal.id) {
+      const requestId = stage?.requestId;
+      const version = requestId ? this.receipt(shareId, principal, requestId) : null;
+      if (version) return version;
+      throw new SystemError(404, 'PACKAGE_MANIFEST_STAGE_UNAVAILABLE', '分窗清单不存在或不属于当前成员');
+    }
+    const media = this.db.prepare('SELECT sha256,size,mime,kind FROM package_share_manifest_stage_media WHERE stageId=? ORDER BY position').all(stageId) as PackageMediaFact[];
+    if (media.length !== stage.mediaCount) throw new SystemError(409, 'PACKAGE_MANIFEST_INCOMPLETE', '分窗清单尚未登记完整，未提交版本');
+    if (new Set(media.map(item => `${item.sha256}:${item.size}`)).size !== media.length) throw new SystemError(409, 'PACKAGE_MANIFEST_DUPLICATE_MEDIA', '完整版本含重复媒体身份');
+    const version = this.publishManifest(shareId, principal, { ...JSON.parse(stage.metadataJson), media });
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM package_share_manifest_stage_media WHERE stageId=?').run(stageId);
+      this.db.prepare('DELETE FROM package_share_manifest_stages WHERE stageId=?').run(stageId);
+    }).immediate();
+    return version;
   }
   manifestDownload(shareId: string, versionId: string, principal: SystemPrincipal) {
     this.access(shareId, principal);
