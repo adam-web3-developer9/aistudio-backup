@@ -1158,12 +1158,12 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
       let offset = 0;
       for (;;) {
       const page = uploadIntents!.pendingImportPage(id, offset, 100);
-      if (!page.length) break;
+      if (!page.length || mioraTransfers.signal.aborted) break;
       offset = page[page.length - 1]!.idx + 1;
       const pending = page.filter(item => item.source_url);
       let cursor = 0;
       await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
-        while (cursor < pending.length) {
+        while (cursor < pending.length && !mioraTransfers.signal.aborted) {
           const item = pending[cursor++]!;
           await withMioraDiagnostics(mioraDiagnosticSink, { itemIndex:item.idx }, async () => {
           try {
@@ -1171,7 +1171,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
               identity:`${item.sha256}:${item.size}:${item.mime_type}:${item.kind}`,
               run:() => transferPublicMediaToMioraCos({ client, sourceUrl:item.source_url!, allowedHosts:config.mioraPublicMediaHosts,
                 fileName:uploadFileName({sha256:item.sha256,size:item.size,mimeType:item.mime_type,kind:item.kind}),
-                mimeType:item.mime_type,size:item.size,sha256:item.sha256 }) });
+                mimeType:item.mime_type,size:item.size,sha256:item.sha256,signal:mioraTransfers.signal }) });
             uploadIntents!.importReady(id, item.idx, key);
           } catch (error) {
             const failure = describeMioraTransferFailure(error);
@@ -1182,7 +1182,18 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
         }
       }));
       }
-    }).catch(error => app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed'))
+    }).catch(error => {
+      app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed');
+      const failure = error instanceof SystemError && error.code === 'UPLOAD_INTENT_ACCOUNT_UNAVAILABLE'
+        ? {code:error.code,stage:'cos_grant' as const,retryable:false} : describeMioraTransferFailure(error);
+      try {
+        for (;;) {
+          const pending=uploadIntents!.pendingImportPage(id,0,100);
+          if(!pending.length)break;
+          for(const item of pending)uploadIntents!.importFailed(id,item.idx,failure);
+        }
+      } catch(stateError) {app.log.warn({err:stateError,uploadIntentId:id},'Upload intent preparation failure could not be recorded');}
+    })
       .finally(() => importRuns.delete(id));
     importRuns.set(id, run);
   }
@@ -1600,6 +1611,8 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
 
   app.addHook('onClose', async () => {
     try {
+    mioraTransfers.close();
+    await Promise.allSettled(importRuns.values());
     tokenWatcher.stop();
     dreamMakerWatcher.stop();
     higgsfieldWatcher.stop();

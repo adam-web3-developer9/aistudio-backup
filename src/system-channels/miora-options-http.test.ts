@@ -14,6 +14,7 @@ import { MioraAdapter } from '../adapters/miora-adapter.js';
 import { ChannelStore } from './store.js';
 import { MioraUploadIntentStore } from './miora-upload-intents.js';
 import { fetch as providerFetch } from 'undici';
+import { ManagedSessionStore } from './session-store.js';
 vi.mock('undici', async importOriginal => ({...await importOriginal<typeof import('undici')>(),fetch:vi.fn(async()=>{throw new Error('Provider calls forbidden');})}));
 
 test('real HTTP accepts large Miora options, preserves idempotency and active inline leases before a disabled runner', async () => {
@@ -73,6 +74,12 @@ test('real HTTP accepts large Miora options, preserves idempotency and active in
       req.once('error',reject);req.flushHeaders(); // The server answers without reading the absent large body.
     });
     expect(denied).toBe(401);
+    const unavailable=store.create('http-missing-credential-key',account,[{...asset,index:0,cosKey:'',publicUrl:'https://source.invalid/reference.png',status:'importing'}]);
+    const missing=vi.spyOn(ManagedSessionStore.prototype,'get').mockResolvedValue(undefined);
+    const prepare=await fetch(`${base}/v1/upload-intents/${unavailable}/status`,{headers:{'x-api-key':key}}); await prepare.text();
+    await vi.waitFor(()=>expect(store.describePage(unavailable,0,1).items[0]).toMatchObject({status:'failed',error:{
+      reason:'UPLOAD_INTENT_ACCOUNT_UNAVAILABLE',stage:'cos_grant',retryable:false}}));
+    missing.mockRestore();
     expect(providerFetch).not.toHaveBeenCalled();
   } finally {await app?.close();vi.restoreAllMocks();Object.assign(config,original);db.close();await rm(directory,{recursive:true,force:true});}
 },15_000);
