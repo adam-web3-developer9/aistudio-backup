@@ -88,6 +88,12 @@ describe('Miora upload intents', () => {
       .get(created.id) as { error:string };
     expect(stored.error).not.toContain('media.invalid');
     expect(stored.error).not.toContain('secret');
+    store.importFailed(created.id, 0, { code:'COS_PUT_HTTP', stage:'cos_put', retryable:false, httpStatus:403,
+      cosCode:'SignatureDoesNotMatch', cosRequestId:'cos-123' });
+    expect(store.describe(created.id).items[0]?.error).toEqual({
+      code:'UPLOAD_IMPORT_FAILED', reason:'COS_PUT_HTTP', stage:'cos_put', retryable:false, httpStatus:403,
+      cosCode:'SignatureDoesNotMatch', cosRequestId:'cos-123'
+    });
     expect(store.resume(created.id, [publicAsset, { ...asset, sha256:'b'.repeat(64) }]).map(item => item.idx)).toEqual([0]);
     expect(store.plan(created.id).items.map(item => item.status)).toEqual(['importing', 'upload_required']);
   });

@@ -11,6 +11,8 @@ export interface MioraTransferFailure {
   retryable: boolean;
   httpStatus?: number;
   networkCode?: string;
+  cosCode?: string;
+  cosRequestId?: string;
 }
 
 export class MioraTransferError extends Error {
@@ -27,6 +29,25 @@ const RETRYABLE_NETWORK_CODES = new Set([
   'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
   'UND_ERR_SOCKET', 'UND_ERR_RESPONSE_STATUS_CODE'
 ]);
+
+/** COS error XML is untrusted: keep only bounded, non-secret identifiers. */
+async function cosFailureIdentifiers(response: Awaited<ReturnType<typeof fetch>>): Promise<Pick<MioraTransferFailure, 'cosCode' | 'cosRequestId'>> {
+  if (!response.body) return {};
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for await (const chunk of response.body) {
+      const bytes = Buffer.from(chunk);
+      chunks.push(bytes.subarray(0, Math.max(0, 8192 - size)));
+      size += bytes.length;
+      if (size >= 8192) break;
+    }
+  } catch { return {}; }
+  const xml = Buffer.concat(chunks).toString('utf8');
+  const cosCode = /<Code>([A-Za-z][A-Za-z0-9]{0,79})<\/Code>/.exec(xml)?.[1];
+  const cosRequestId = /<RequestId>([A-Za-z0-9_-]{1,128})<\/RequestId>/.exec(xml)?.[1];
+  return { ...(cosCode ? { cosCode } : {}), ...(cosRequestId ? { cosRequestId } : {}) };
+}
 
 function allowedHost(host: string, allow: readonly string[]): boolean {
   return allow.some(entry => host === entry || entry.startsWith('.') && host.endsWith(entry));
@@ -160,7 +181,8 @@ export async function transferPublicMediaToMioraCos(input: {
       throw transientFailure('cos_put', error);
     }
     if (uploaded.status !== 200) throw failureError({ code:'COS_PUT_HTTP', stage:'cos_put',
-      retryable:RETRYABLE_HTTP(uploaded.status), httpStatus:uploaded.status });
+      retryable:RETRYABLE_HTTP(uploaded.status), httpStatus:uploaded.status,
+      ...await cosFailureIdentifiers(uploaded) });
     return upload.key;
   }, delays);
 }

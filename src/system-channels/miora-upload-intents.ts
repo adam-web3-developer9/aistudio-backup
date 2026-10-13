@@ -34,6 +34,8 @@ interface MioraTransferFailure {
   retryable: boolean;
   httpStatus?: number;
   networkCode?: string;
+  cosCode?: string;
+  cosRequestId?: string;
 }
 
 interface IntentRow { id:string; key_hash:string; idempotency_key:string; account_id:string; expires_at:string; consumed_job_id:string|null; created_at:string; reserved_credits:number|null; reservation_until:string|null; options_json:string|null }
@@ -256,7 +258,9 @@ export class MioraUploadIntentStore {
     this.db.prepare('UPDATE video_gateway_upload_items SET status=?,error=? WHERE intent_id=? AND idx=?')
       .run('failed', JSON.stringify({ code:'UPLOAD_IMPORT_FAILED', reason:failure.code, stage:failure.stage,
         retryable:failure.retryable, ...(failure.httpStatus !== undefined ? { httpStatus:failure.httpStatus } : {}),
-        ...(failure.networkCode ? { networkCode:failure.networkCode } : {}) } satisfies UploadImportFailure), id, index);
+        ...(failure.networkCode ? { networkCode:failure.networkCode } : {}),
+        ...(failure.cosCode ? { cosCode:failure.cosCode } : {}),
+        ...(failure.cosRequestId ? { cosRequestId:failure.cosRequestId } : {}) } satisfies UploadImportFailure), id, index);
   }
 
   consume(id: string, jobId: string): { accountId:string; jobId:string; references:Array<{key:string;kind:UploadItemKind}> } {
@@ -305,7 +309,10 @@ export class MioraUploadIntentStore {
         && typeof parsed.retryable === 'boolean') return {
           code:'UPLOAD_IMPORT_FAILED', reason:parsed.reason, stage:parsed.stage!, retryable:parsed.retryable,
           ...(Number.isInteger(parsed.httpStatus) ? { httpStatus:parsed.httpStatus } : {}),
-          ...(typeof parsed.networkCode === 'string' ? { networkCode:parsed.networkCode } : {})
+          ...(typeof parsed.networkCode === 'string' ? { networkCode:parsed.networkCode } : {}),
+          ...(typeof parsed.cosCode === 'string' && /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(parsed.cosCode) ? { cosCode:parsed.cosCode } : {}),
+          ...(typeof parsed.cosRequestId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(parsed.cosRequestId)
+            ? { cosRequestId:parsed.cosRequestId } : {})
         };
     } catch { /* Legacy rows contain only UPLOAD_IMPORT_FAILED. */ }
     return { code:'UPLOAD_IMPORT_FAILED', reason:'INTERNAL_ERROR', stage:'internal', retryable:false };

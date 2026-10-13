@@ -93,6 +93,26 @@ test('Miora transfer failure is typed and contains no source URL', async () => {
   } finally { vi.restoreAllMocks(); }
 });
 
+test('Miora COS rejection retains only safe XML identifiers', async () => {
+  const bytes = Buffer.from('x');
+  const client = { getCosGrant: vi.fn(async () => ({ prefix:'safe-prefix', bucket:'bucket', region:'ap-test',
+    token:'secret-token', secret_id:'secret-id', secret_key:'secret-key' })) } as unknown as MioraClient;
+  vi.mocked(fetch).mockImplementation(async address => String(address).startsWith('https://source.invalid/')
+    ? { ok:true, status:200, headers:new Headers({ 'content-length':'1' }),
+      body:(async function* () { yield bytes; })() } as unknown as Awaited<ReturnType<typeof fetch>>
+    : { status:403, body:(async function* () {
+      yield Buffer.from('<Error><Code>SignatureDoesNotMatch</Code><Message>secret-token</Message><RequestId>cos-123</RequestId></Error>');
+    })() } as unknown as Awaited<ReturnType<typeof fetch>>);
+  try {
+    await expect(transferPublicMediaToMioraCos({ client, sourceUrl:'https://source.invalid/x',
+      allowedHosts:['source.invalid'], fileName:'x.png', mimeType:'image/png', size:1,
+      sha256:createHash('sha256').update(bytes).digest('hex'), retryDelaysMs:[] })).rejects.toMatchObject({
+      failure:{ code:'COS_PUT_HTTP', stage:'cos_put', retryable:false, httpStatus:403,
+        cosCode:'SignatureDoesNotMatch', cosRequestId:'cos-123' }
+    });
+  } finally { vi.restoreAllMocks(); }
+});
+
 test('Miora cloud transfer retries a transient COS grant without downloading the source first', async () => {
   const bytes = Buffer.from('x');
   const getCosGrant = vi.fn()
