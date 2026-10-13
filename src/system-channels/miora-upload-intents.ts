@@ -262,6 +262,11 @@ export class MioraUploadIntentStore {
       ...(row.error ? { error:this.publicFailure(row.error) } : {}) })) };
   }
 
+  renewActive(id:string):void {
+    const intent = this.owned(id);
+    if (!intent.consumed_job_id) this.renew(id);
+  }
+
   renewStaged(id:string):void {
     const intent = this.owned(id);
     if (intent.declared_count !== null && !intent.consumed_job_id) this.renew(id);
