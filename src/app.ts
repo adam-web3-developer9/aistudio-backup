@@ -67,12 +67,12 @@ const listJobsQuerySchema = z.object({
 const uploadIntentSchema = z.object({
   idempotencyKey: z.string().min(16).max(200),
   assets: z.array(z.object({
-    sha256: z.string().regex(/^[0-9a-f]{64}$/), size: z.int().positive().max(100 * 1024 * 1024),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/), size: z.int().positive(),
     mimeType: z.string().min(3).max(100), kind: z.enum(['image', 'video', 'audio']),
     fileName: z.string().min(1).max(200).optional(), publicUrl: z.string().url().max(4096).optional()
-  })).min(1).max(15)
+  })).min(1)
 });
-const completeUploadIntentSchema = z.object({ indexes: z.array(z.int().nonnegative()).min(1).max(15) });
+const completeUploadIntentSchema = z.object({ indexes: z.array(z.int().nonnegative()).min(1) });
 /**
  * What `/v1/assets` accepts.
  *
