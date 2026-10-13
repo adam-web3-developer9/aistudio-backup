@@ -10,12 +10,15 @@ import { z } from 'zod';
 import { authenticate, idSchema, entityTypeSchema, ProjectError, sendError, type ProjectRuntime } from '../projects/protocol.js';
 import { projectId } from '../projects/routes.js';
 import type { ProjectStore } from '../projects/store.js';
+import { assertMediaMemory, decodeLegacyMedia, MediaAdmission, mediaIdleWatchdog, readLegacyMediaJson } from './resources.js';
 
 const MiB = 1024 * 1024;
-export const legacyMediaMaxBytes = 20 * MiB;
-export const hardMediaMaxBytes = 1024 * MiB;
+// Public sizes use safe JS/SQLite integers. This is representability, not a storage quota.
+export const legacyMediaMaxBytes = Number.MAX_SAFE_INTEGER;
+export const hardMediaMaxBytes = Number.MAX_SAFE_INTEGER;
 export interface MediaQuota { projectBytes?: number; ownerBytes?: number }
 export interface MediaPolicy {
+  /** Deprecated capacity fields retained in the public shape; no business quota is enforced. */
   maxFileBytes: number;
   projectBytes: number;
   ownerBytes: number;
@@ -25,19 +28,19 @@ export interface MediaPolicy {
   maxReservedPerUserBytes: number;
   uploadTimeoutMs: number;
 }
-export const defaultMediaQuota = { projectBytes: 1024 * MiB, ownerBytes: 2048 * MiB };
+export const defaultMediaQuota = { projectBytes: Number.MAX_SAFE_INTEGER, ownerBytes: Number.MAX_SAFE_INTEGER };
 export function resolveMediaPolicy(input: Partial<Record<keyof MediaPolicy, number | string>> = {}): MediaPolicy {
-  const defaults: MediaPolicy = { maxFileBytes: 256 * MiB, ...defaultMediaQuota, maxConcurrentUploads: 4, maxConcurrentPerUser: 2, maxReservedBytes: 2048 * MiB, maxReservedPerUserBytes: 1024 * MiB, uploadTimeoutMs: 15 * 60 * 1000 };
+  const defaults: MediaPolicy = { maxFileBytes: Number.MAX_SAFE_INTEGER, ...defaultMediaQuota, maxConcurrentUploads: 4, maxConcurrentPerUser: 2, maxReservedBytes: Number.MAX_SAFE_INTEGER, maxReservedPerUserBytes: Number.MAX_SAFE_INTEGER, uploadTimeoutMs: 15 * 60 * 1000 };
   const policy = { ...defaults };
+  const deprecated = new Set<keyof MediaPolicy>(['maxFileBytes', 'projectBytes', 'ownerBytes', 'maxReservedBytes', 'maxReservedPerUserBytes']);
   for (const key of Object.keys(defaults) as (keyof MediaPolicy)[]) {
+    if (deprecated.has(key)) continue;
     if (input[key] !== undefined) {
       const value = Number(input[key]);
       if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`Media policy ${key} must be a positive safe integer`);
       policy[key] = value;
     }
   }
-  if (policy.maxFileBytes > hardMediaMaxBytes) throw new Error('Media maxFileBytes cannot exceed the hard limit of 1 GiB');
-  if (policy.uploadTimeoutMs > 30 * 60 * 1000) throw new Error('Media uploadTimeoutMs cannot exceed 30 minutes');
   return policy;
 }
 export interface BlobStreamOptions { size: number; mime: string; maxBytes?: number; signal?: AbortSignal; timeoutMs?: number }
@@ -61,14 +64,12 @@ export function validMediaSignature(mime: string, bytes: Buffer): boolean {
   return false;
 }
 function validateHash(hash: string): void { if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectError(400, 'INVALID_HASH', '媒体 SHA-256 标识无效'); }
-function limitMessage(limit: number) { return `单个共享文件最多 ${limit >= MiB ? `${Number((limit / MiB).toFixed(2))} MiB` : `${limit} 字节`}，请压缩或拆分后重试`; }
-function checkFileSize(size: number, maximum: number): void {
+function checkFileSize(size: number): void {
   if (!Number.isSafeInteger(size) || size <= 0) throw new ProjectError(400, 'INVALID_MEDIA_SIZE', '媒体大小无效');
-  if (size > maximum || size > hardMediaMaxBytes) throw new ProjectError(413, 'MEDIA_TOO_LARGE', limitMessage(Math.min(maximum, hardMediaMaxBytes)), { maxFileBytes: Math.min(maximum, hardMediaMaxBytes) });
 }
 function interrupted() { return new ProjectError(400, 'MEDIA_UPLOAD_INTERRUPTED', '媒体传输已中断，请重试'); }
 function abortReason(signal?: AbortSignal) { return signal?.reason instanceof ProjectError ? signal.reason : interrupted(); }
-function uploadTimeout() { return new ProjectError(408, 'MEDIA_UPLOAD_TIMEOUT', '媒体上传超时，请检查网络后重试'); }
+function uploadTimeout() { return new ProjectError(408, 'MEDIA_UPLOAD_TIMEOUT', '媒体上传无进展，请检查网络后重试'); }
 function isHttpInput(source: unknown): source is IncomingMessage { return source instanceof IncomingMessage || (source instanceof Readable && 'headers' in source && 'method' in source && 'httpVersion' in source); }
 function storageError(error: unknown): never {
   if (error instanceof ProjectError) throw error;
@@ -101,19 +102,21 @@ async function safeFileInfo(file: string) {
     return info;
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
 }
-async function consumeMedia(source: AsyncIterable<Uint8Array>, expected: { hash: string; size: number; mime: string; maximum: number; signal?: AbortSignal }, write: (chunk: Buffer) => Promise<void>): Promise<void> {
-  checkFileSize(expected.size, expected.maximum);
+async function consumeMedia(source: AsyncIterable<Uint8Array>, expected: { hash: string; size: number; mime: string; signal?: AbortSignal; timeoutMs?: number }, write: (chunk: Buffer) => Promise<void>): Promise<void> {
+  checkFileSize(expected.size);
   if (!mimeTypes.includes(expected.mime as typeof mimeTypes[number])) throw new ProjectError(415, 'UNSUPPORTED_MEDIA_TYPE', '不支持此媒体类型');
   const digest = createHash('sha256');
   const prefix = Buffer.alloc(16);
   let prefixLength = 0; let size = 0; let signatureChecked = false;
   const signatureLength = expected.mime === 'image/jpeg' || expected.mime === 'audio/mpeg' ? 3 : expected.mime === 'video/webm' ? 4 : expected.mime === 'application/pdf' ? 5 : expected.mime === 'image/gif' ? 6 : expected.mime === 'image/png' ? 8 : 12;
+  const idle = mediaIdleWatchdog(expected.timeoutMs ?? 15 * 60 * 1000, uploadTimeout, expected.signal);
+  const signal = idle.signal;
   let rejectAbort: (error: unknown) => void = () => {};
   const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
   // Race each read, including custom iterators, so a silent sender cannot retain an upload slot forever.
-  const abort = () => { const error = abortReason(expected.signal); rejectAbort(error); if (source instanceof Readable) source.destroy(error); };
-  if (expected.signal?.aborted) throw abortReason(expected.signal);
-  expected.signal?.addEventListener('abort', abort, { once: true });
+  const abort = () => { const error = abortReason(signal); rejectAbort(error); if (source instanceof Readable) source.destroy(error); };
+  if (signal.aborted) { idle.close(); throw abortReason(signal); }
+  signal.addEventListener('abort', abort, { once: true });
   const iterator = source[Symbol.asyncIterator]();
   let finished = false;
   try {
@@ -121,11 +124,11 @@ async function consumeMedia(source: AsyncIterable<Uint8Array>, expected: { hash:
       const next = await Promise.race([iterator.next(), aborted]);
       if (next.done) { finished = true; break; }
       const bytes = next.value;
-      if (expected.signal?.aborted) throw abortReason(expected.signal);
+      if (signal.aborted) throw abortReason(signal);
       if (!(bytes instanceof Uint8Array)) throw new ProjectError(400, 'INVALID_MEDIA', '媒体流格式无效');
       const chunk = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       size += chunk.length;
-      if (size > expected.maximum || size > hardMediaMaxBytes) throw new ProjectError(413, 'MEDIA_TOO_LARGE', limitMessage(Math.min(expected.maximum, hardMediaMaxBytes)), { maxFileBytes: Math.min(expected.maximum, hardMediaMaxBytes) });
+      if (!Number.isSafeInteger(size)) throw new ProjectError(400, 'INVALID_MEDIA_SIZE', '媒体长度超出协议可表示范围');
       if (size > expected.size) throw new ProjectError(400, 'MEDIA_SIZE_MISMATCH', '实际媒体大小超过声明大小');
       const copied = Math.min(chunk.length, prefix.length - prefixLength);
       if (copied > 0) { chunk.copy(prefix, prefixLength, 0, copied); prefixLength += copied; }
@@ -134,13 +137,15 @@ async function consumeMedia(source: AsyncIterable<Uint8Array>, expected: { hash:
         signatureChecked = true;
       }
       digest.update(chunk);
+      idle.progress();
       await write(chunk);
+      idle.progress();
     }
-    if (expected.signal?.aborted) throw abortReason(expected.signal);
+    if (signal.aborted) throw abortReason(signal);
     if (size !== expected.size) throw new ProjectError(400, 'MEDIA_SIZE_MISMATCH', '实际媒体大小与声明大小不符');
     if (!signatureChecked) throw new ProjectError(400, 'MEDIA_TYPE_MISMATCH', '媒体内容与声明类型不符');
     if (digest.digest('hex') !== expected.hash) throw new ProjectError(400, 'MEDIA_HASH_MISMATCH', '媒体内容校验失败');
-  } finally { expected.signal?.removeEventListener('abort', abort); if (!finished) { if (source instanceof Readable) source.destroy(); try { void iterator.return?.().catch(() => {}); } catch {} } }
+  } finally { idle.close(); signal.removeEventListener('abort', abort); if (!finished) { if (source instanceof Readable) source.destroy(); try { void iterator.return?.().catch(() => {}); } catch {} } }
 }
 export class LocalPrivateBlobStore implements PrivateBlobStore {
   private readonly directory: string;
@@ -149,9 +154,8 @@ export class LocalPrivateBlobStore implements PrivateBlobStore {
   protected openTemporaryFile(file: string): Promise<FileHandle> { return open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600); }
   protected async checkAvailableSpace(directory: string, size: number): Promise<void> {
     const info = await statfs(directory, { bigint: true });
-    const reserved = [...activeUploads.values()].reduce((sum, upload) => sum + upload.size, 0);
-    // Reserve declared concurrent bytes conservatively and leave 64 MiB for SQLite/other process work.
-    if (info.bavail * info.bsize < BigInt(Math.max(size, reserved)) + BigInt(64 * MiB)) throw new ProjectError(507, 'MEDIA_STORAGE_FULL', '媒体存储空间不足，请稍后重试');
+    // Actual filesystem capacity, with headroom for SQLite. Concurrent ENOSPC remains explicit.
+    if (info.bavail * info.bsize < BigInt(size) + BigInt(64 * MiB)) throw new ProjectError(507, 'MEDIA_STORAGE_FULL', '媒体存储空间不足，请稍后重试');
   }
   async put(hash: string, bytes: Buffer): Promise<void> {
     const mime = mimeTypes.find(type => validMediaSignature(type, bytes.subarray(0, 16)));
@@ -167,42 +171,39 @@ export class LocalPrivateBlobStore implements PrivateBlobStore {
     }
   }
   private async writeStream(hash: string, source: AsyncIterable<Uint8Array>, options: BlobStreamOptions): Promise<void> {
-    validateHash(hash); const maximum = Math.min(options.maxBytes ?? 256 * MiB, hardMediaMaxBytes); checkFileSize(options.size, maximum);
+    validateHash(hash); checkFileSize(options.size);
     const file = this.file(hash); const temporary = `${file}.${randomUUID()}.tmp`;
-    const timeoutMs = Math.min(options.timeoutMs ?? 15 * 60 * 1000, 30 * 60 * 1000);
+    const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('Invalid media upload timeout');
-    const timeout = new AbortController();
-    const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
-    const timer = setTimeout(() => timeout.abort(uploadTimeout()), timeoutMs); timer.unref();
+    const signal = options.signal;
     let handle: FileHandle | undefined;
     try {
       await safeDirectory(path.dirname(file), true); await safeFileInfo(file);
       await this.checkAvailableSpace(path.dirname(file), options.size);
-      if (signal.aborted) throw abortReason(signal);
+      if (signal?.aborted) throw abortReason(signal);
       handle = await this.openTemporaryFile(temporary);
-      await consumeMedia(source, { hash, size: options.size, mime: options.mime, maximum, signal }, async chunk => {
+      await consumeMedia(source, { hash, size: options.size, mime: options.mime, signal, timeoutMs }, async chunk => {
         let offset = 0;
         while (offset < chunk.length) {
-          if (signal.aborted) throw abortReason(signal);
+          if (signal?.aborted) throw abortReason(signal);
           const written = await handle!.write(chunk, offset, chunk.length - offset, null);
           if (written.bytesWritten <= 0) throw new Error('Media write made no progress');
           offset += written.bytesWritten;
         }
       });
       await handle.sync(); await handle.close(); handle = undefined;
-      if (signal.aborted) throw abortReason(signal);
+      if (signal?.aborted) throw abortReason(signal);
       await safeDirectory(path.dirname(file), false); await safeFileInfo(file);
       await rename(temporary, file);
       const directory = await open(path.dirname(file), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       try { await directory.sync(); } finally { await directory.close(); }
     } catch (error) { return storageError(error); }
     finally {
-      clearTimeout(timer);
       await handle?.close().catch(() => {}); await unlink(temporary).catch(() => {});
     }
   }
   async verifiedRead(hash: string, expectedSize: number): Promise<Readable | null> {
-    const file = this.file(hash); checkFileSize(expectedSize, hardMediaMaxBytes);
+    const file = this.file(hash); checkFileSize(expectedSize);
     let handle: FileHandle | undefined;
     try {
       if (!await safeDirectory(path.dirname(file), false)) return null;
@@ -227,51 +228,22 @@ export class LocalPrivateBlobStore implements PrivateBlobStore {
     const file = this.file(hash);
     if (!await safeDirectory(path.dirname(file), false)) return null;
     const info = await safeFileInfo(file); if (!info) return null;
-    checkFileSize(info.size, legacyMediaMaxBytes);
+    assertMediaMemory(info.size);
     const stream = await this.verifiedRead(hash, info.size); if (!stream) return null;
     const chunks: Buffer[] = []; let size = 0;
-    for await (const chunk of stream) { size += (chunk as Buffer).length; if (size > legacyMediaMaxBytes) { stream.destroy(); throw new ProjectError(413, 'MEDIA_TOO_LARGE', '请使用大文件流式读取接口'); } chunks.push(chunk as Buffer); }
+    for await (const chunk of stream) { size += (chunk as Buffer).length; if (size > info.size) { stream.destroy(); throw new ProjectError(404, 'MEDIA_UNAVAILABLE', '媒体大小已变化'); } try { assertMediaMemory(info.size); } catch (error) { stream.destroy(); throw error; } chunks.push(chunk as Buffer); }
     return Buffer.concat(chunks, size);
   }
 }
-/** Counts retained unique hashes, including disabled projects and previous share generations. */
-export function checkMediaQuota(db: Database.Database, projectId: string, hash: string, size: number, quota: MediaQuota = {}): void {
-  const projectLimit = quota.projectBytes ?? defaultMediaQuota.projectBytes;
-  const ownerLimit = quota.ownerBytes ?? defaultMediaQuota.ownerBytes;
-  if (!Number.isSafeInteger(projectLimit) || projectLimit <= 0 || !Number.isSafeInteger(ownerLimit) || ownerLimit <= 0) throw new Error('Media quota limits must be positive safe integers');
-  const project = db.prepare('SELECT owner_id FROM shared_projects WHERE id=?').get(projectId) as { owner_id: string } | undefined;
+/** Legacy quota arguments no longer impose product capacity; identity/representability checks remain. */
+export function checkMediaQuota(db: Database.Database, projectId: string, hash: string, size: number, _quota: MediaQuota = {}): void {
+  validateHash(hash); checkFileSize(size);
+  const project = db.prepare('SELECT 1 FROM shared_projects WHERE id=?').get(projectId);
   if (!project) throw new ProjectError(404,'PROJECT_UNAVAILABLE','Shared project unavailable');
-  const projectUsage = (db.prepare('SELECT COALESCE(SUM(size),0) AS bytes FROM (SELECT hash,MAX(size) AS size FROM shared_project_media WHERE project_id=? GROUP BY hash)').get(projectId) as { bytes: number }).bytes;
-  const ownerUsage = (db.prepare('SELECT COALESCE(SUM(size),0) AS bytes FROM (SELECT m.hash,MAX(m.size) AS size FROM shared_project_media m JOIN shared_projects p ON m.project_id=p.id WHERE p.owner_id=? GROUP BY m.hash)').get(project.owner_id) as { bytes: number }).bytes;
-  const projectHasHash = Boolean(db.prepare('SELECT 1 FROM shared_project_media WHERE project_id=? AND hash=? LIMIT 1').get(projectId,hash));
-  const ownerHasHash = Boolean(db.prepare('SELECT 1 FROM shared_project_media m JOIN shared_projects p ON m.project_id=p.id WHERE p.owner_id=? AND m.hash=? LIMIT 1').get(project.owner_id,hash));
-  if (projectUsage + (projectHasHash ? 0 : size) > projectLimit || ownerUsage + (ownerHasHash ? 0 : size) > ownerLimit) throw new ProjectError(413,'MEDIA_QUOTA_EXCEEDED','共享媒体配额不足，请释放配额或联系管理员');
 }
-interface Reservation { id: string; db: Database.Database; userId: string; ownerId: string; projectId: string; hash: string; size: number }
-const activeUploads = new Map<string, Reservation>();
-function assertReservedQuota(db: Database.Database, projectId: string, ownerId: string, policy: MediaPolicy): void {
-  const projectUsage = (db.prepare('SELECT COALESCE(SUM(size),0) AS bytes FROM (SELECT hash,MAX(size) AS size FROM shared_project_media WHERE project_id=? GROUP BY hash)').get(projectId) as { bytes: number }).bytes;
-  const ownerUsage = (db.prepare('SELECT COALESCE(SUM(size),0) AS bytes FROM (SELECT m.hash,MAX(m.size) AS size FROM shared_project_media m JOIN shared_projects p ON m.project_id=p.id WHERE p.owner_id=? GROUP BY m.hash)').get(ownerId) as { bytes: number }).bytes;
-  const projectPending = new Map<string, number>(); const ownerPending = new Map<string, number>();
-  for (const entry of activeUploads.values()) {
-    if (entry.db !== db || entry.ownerId !== ownerId) continue;
-    if (entry.projectId === projectId && !db.prepare('SELECT 1 FROM shared_project_media WHERE project_id=? AND hash=? LIMIT 1').get(projectId, entry.hash)) projectPending.set(entry.hash, Math.max(projectPending.get(entry.hash) ?? 0, entry.size));
-    if (!db.prepare('SELECT 1 FROM shared_project_media m JOIN shared_projects p ON m.project_id=p.id WHERE p.owner_id=? AND m.hash=? LIMIT 1').get(ownerId, entry.hash)) ownerPending.set(entry.hash, Math.max(ownerPending.get(entry.hash) ?? 0, entry.size));
-  }
-  if (projectUsage + [...projectPending.values()].reduce((sum, bytes) => sum + bytes, 0) > policy.projectBytes || ownerUsage + [...ownerPending.values()].reduce((sum, bytes) => sum + bytes, 0) > policy.ownerBytes) throw new ProjectError(413, 'MEDIA_QUOTA_EXCEEDED', '并发上传超过共享媒体配额，请稍后重试');
-}
-function reserveUpload(entry: Omit<Reservation, 'id'>, policy: MediaPolicy): () => void {
-  const own = [...activeUploads.values()].filter(upload => upload.userId === entry.userId);
-  const totalBytes = [...activeUploads.values()].reduce((sum, upload) => sum + upload.size, 0);
-  const ownBytes = own.reduce((sum, upload) => sum + upload.size, 0);
-  if (activeUploads.size >= policy.maxConcurrentUploads || own.length >= policy.maxConcurrentPerUser || totalBytes + entry.size > policy.maxReservedBytes || ownBytes + entry.size > policy.maxReservedPerUserBytes) throw new ProjectError(429, 'MEDIA_UPLOAD_BUSY', '并发媒体上传已达上限，请稍后重试');
-  const id = randomUUID(); activeUploads.set(id, { ...entry, id });
-  try { assertReservedQuota(entry.db, entry.projectId, entry.ownerId, policy); }
-  catch (error) { activeUploads.delete(id); throw error; }
-  return () => { activeUploads.delete(id); };
-}
+const uploadAdmission = new MediaAdmission();
 const metadataSchema = z.object({ generation: z.number().int().positive(), entity: z.object({ type: entityTypeSchema, id: idSchema }).strict(), hash: z.string().regex(/^[a-f0-9]{64}$/), size: z.number().int().positive(), mime: z.enum(mimeTypes) }).strict();
-const uploadSchema = z.object({ generation: z.number().int().positive(), assetId: idSchema.optional(), entity: z.object({ type: entityTypeSchema, id: idSchema }).strict().optional(), hash: z.string().regex(/^[a-f0-9]{64}$/), size: z.number().int().positive(), mime: z.enum(mimeTypes), data: z.string().min(1).max(28 * MiB) }).strict().refine(value => Boolean(value.assetId) !== Boolean(value.entity), 'Provide either assetId or entity');
+const uploadSchema = z.object({ generation: z.number().int().positive(), assetId: idSchema.optional(), entity: z.object({ type: entityTypeSchema, id: idSchema }).strict().optional(), hash: z.string().regex(/^[a-f0-9]{64}$/), size: z.number().int().positive(), mime: z.enum(mimeTypes), data: z.string().min(1) }).strict().refine(value => Boolean(value.assetId) !== Boolean(value.entity), 'Provide either assetId or entity');
 function parseMetadata(header: string | string[] | undefined) {
   if (typeof header !== 'string' || Buffer.byteLength(header) > 4096) throw new ProjectError(400, 'INVALID_MEDIA_METADATA', '媒体元数据请求头无效');
   let decoded: unknown;
@@ -287,47 +259,50 @@ export function registerSystemMediaRoutes(app: FastifyInstance, options: { runti
   app.register(async scoped => {
     if (scoped.hasContentTypeParser('application/octet-stream')) scoped.removeContentTypeParser('application/octet-stream');
     scoped.addContentTypeParser('application/octet-stream', (_request, payload, done) => { done(null, payload); });
-    scoped.post('/api/system/projects/:projectId/media', { bodyLimit: 29 * MiB, onRequest: async request => { runtime.assertRequestOrigin?.(request); } }, async (request, reply) => {
+    if (scoped.hasContentTypeParser('application/json')) scoped.removeContentTypeParser('application/json');
+    scoped.addContentTypeParser('application/json', (_request, payload, done) => {
+      void readLegacyMediaJson(payload, policy.uploadTimeoutMs).then(value => done(null, value), error => done(error));
+    });
+    scoped.post('/api/system/projects/:projectId/media', { bodyLimit: Number.MAX_SAFE_INTEGER, onRequest: async request => { runtime.assertRequestOrigin?.(request); const principal = await authenticate(runtime, request); projects.access(projectId(request), principal, true); } }, async (request, reply) => {
       let release: (() => void) | undefined;
-      let timer: ReturnType<typeof setTimeout> | undefined;
       const abort = new AbortController();
-      const onAbort = () => abort.abort();
+      const onAbort = () => abort.abort(interrupted());
+      const onClose = () => { if (!reply.raw.writableEnded) onAbort(); };
       request.raw.once('aborted', onAbort);
+      reply.raw.once('close', onClose);
       try {
         const principal = await authenticate(runtime, request); const id = projectId(request);
-        const row = projects.access(id, principal, true);
+        projects.access(id, principal, true);
         const binary = request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() === 'application/octet-stream';
         const json = binary ? undefined : uploadSchema.parse(request.body);
         const body = binary ? parseMetadata(request.headers['x-media-metadata']) : { generation: json!.generation, entity: json!.entity ?? { type: 'asset' as const, id: json!.assetId! }, hash: json!.hash, size: json!.size, mime: json!.mime };
-        const maximum = binary ? policy.maxFileBytes : Math.min(legacyMediaMaxBytes, policy.maxFileBytes);
-        checkFileSize(body.size, maximum);
+        checkFileSize(body.size);
         const contentLength = request.headers['content-length'];
         if (binary && contentLength !== undefined && (!/^\d+$/.test(contentLength) || Number(contentLength) !== body.size)) throw new ProjectError(400, 'MEDIA_SIZE_MISMATCH', '媒体长度与声明大小不符');
-        if (binary && !blobs.putStream && body.size > legacyMediaMaxBytes) throw new ProjectError(501, 'STREAMING_STORE_REQUIRED', '当前媒体存储不支持大文件流式上传');
+        if (!blobs.putStream) assertMediaMemory(body.size);
         const check = () => {
           const current = projects.access(id, principal, true); projects.generation(current, body.generation);
           if (!projects.snapshotFromRow(current).entities.some(item => item.type === body.entity.type && item.id === body.entity.id && !item.deleted)) throw new ProjectError(409, 'ENTITY_DELETED', '媒体目标不存在或已删除');
         };
-        runtime.db.transaction(() => { check(); checkMediaQuota(runtime.db, id, body.hash, body.size, policy); release = reserveUpload({ db: runtime.db, userId: principal.id, ownerId: row.owner_id, projectId: id, hash: body.hash, size: body.size }, policy); }).immediate();
-        timer = setTimeout(() => abort.abort(uploadTimeout()), policy.uploadTimeoutMs); timer.unref();
+        runtime.db.transaction(() => { check(); checkMediaQuota(runtime.db, id, body.hash, body.size, policy); }).immediate();
+        release = await uploadAdmission.acquire(principal.id, policy, abort.signal);
+        check(); checkMediaQuota(runtime.db, id, body.hash, body.size, policy);
         if (request.raw.aborted) throw interrupted();
         let source: AsyncIterable<Uint8Array>;
         if (binary) {
           if (!request.body || typeof (request.body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] !== 'function') throw new ProjectError(400, 'INVALID_MEDIA', '媒体流格式无效');
           source = request.body as AsyncIterable<Uint8Array>;
         } else {
-          if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(json!.data)) throw new ProjectError(400, 'INVALID_MEDIA', '媒体必须使用规范 base64');
-          const bytes = Buffer.from(json!.data, 'base64');
-          source = Readable.from([bytes]);
+          source = decodeLegacyMedia(json!.data);
         }
-        if (blobs.putStream) await blobs.putStream(body.hash, source, { size: body.size, mime: body.mime, maxBytes: maximum, signal: abort.signal, timeoutMs: policy.uploadTimeoutMs });
+        if (blobs.putStream) await blobs.putStream(body.hash, source, { size: body.size, mime: body.mime, signal: abort.signal, timeoutMs: policy.uploadTimeoutMs });
         else {
           const chunks: Buffer[] = [];
-          await consumeMedia(source, { hash: body.hash, size: body.size, mime: body.mime, maximum: Math.min(maximum, legacyMediaMaxBytes), signal: abort.signal }, async chunk => { chunks.push(chunk); });
+          await consumeMedia(source, { hash: body.hash, size: body.size, mime: body.mime, signal: abort.signal, timeoutMs: policy.uploadTimeoutMs }, async chunk => { assertMediaMemory(body.size); chunks.push(chunk); });
           await blobs.put(body.hash, Buffer.concat(chunks, body.size));
         }
         if (abort.signal.aborted) throw abortReason(abort.signal);
-        runtime.db.transaction(() => { check(); checkMediaQuota(runtime.db, id, body.hash, body.size, policy); assertReservedQuota(runtime.db, id, row.owner_id, policy); runtime.db.prepare('INSERT OR IGNORE INTO shared_project_media VALUES(?,?,?,?,?,?,?)').run(id, body.generation, body.entity.type, body.entity.id, body.hash, body.size, body.mime); }).immediate();
+        runtime.db.transaction(() => { check(); checkMediaQuota(runtime.db, id, body.hash, body.size, policy); runtime.db.prepare('INSERT OR IGNORE INTO shared_project_media VALUES(?,?,?,?,?,?,?)').run(id, body.generation, body.entity.type, body.entity.id, body.hash, body.size, body.mime); }).immediate();
         return { ...(json?.assetId ? { assetId: json.assetId } : { entity: body.entity }), hash: body.hash, size: body.size, mime: body.mime };
       } catch (error) {
         if (isHttpInput(request.body) && !request.body.complete) { reply.header('Connection', 'close'); request.body.resume(); }
@@ -335,7 +310,7 @@ export function registerSystemMediaRoutes(app: FastifyInstance, options: { runti
         if (code && ['ENOSPC','EDQUOT','ELOOP','ENOTDIR','ABORT_ERR','ERR_STREAM_PREMATURE_CLOSE','ECONNRESET'].includes(code)) { try { storageError(error); } catch (mapped) { return sendError(reply,mapped); } }
         return sendError(reply,error);
       }
-      finally { if (timer) clearTimeout(timer); request.raw.removeListener('aborted', onAbort); release?.(); }
+      finally { request.raw.removeListener('aborted', onAbort); reply.raw.removeListener('close', onClose); release?.(); }
     });
     scoped.get('/api/system/projects/:projectId/media/:hash', async (request, reply) => {
       let stream: Readable | null | undefined;
@@ -349,7 +324,7 @@ export function registerSystemMediaRoutes(app: FastifyInstance, options: { runti
         let bytes: Buffer | null | undefined;
         if (blobs.verifiedRead) { stream = await blobs.verifiedRead(hash, link.size); if (!stream) throw new ProjectError(404, 'MEDIA_UNAVAILABLE', 'Media unavailable'); }
         else {
-          if (link.size > legacyMediaMaxBytes) throw new ProjectError(501, 'STREAMING_STORE_REQUIRED', '当前媒体存储不支持大文件流式下载');
+          assertMediaMemory(link.size);
           bytes = await blobs.get(hash);
           if (!bytes || bytes.length !== link.size || createHash('sha256').update(bytes).digest('hex') !== hash) throw new ProjectError(404, 'MEDIA_UNAVAILABLE', 'Media unavailable');
         }

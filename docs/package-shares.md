@@ -55,3 +55,15 @@ manifest 下载返回 snapshot 地址及按当前索引解析的媒体地址。�
 临时 SQLite 和真实 Fastify 注入用例覆盖任意独立 HTTP(S) 存储地址、无网络调用、丢回执恢复、幂等、并行发布、实时账号及 ACL、URL 隔离、软删除恢复与旧私有历史兼容。没有调用真实存储、生成或生产部署；另有定向用例验证媒体缺失不发布、两成员同哈希认领、取消／续期／过期接管、旧回执隔离、地址修复保留旧哈希与旧 ZIP 兼容；公开地址是否长期可访问和实际字节完整性由客户端传输与接收验证负责。
 
 2026-10-13 本轮从 `015ddfd0f8d333ce97721ed6cc1f53d20137eb08` 在 `feat/share-panel-global-tasks-20261013` 开发，媒体/租约/manifest/回执恢复/地址修复及旧ZIP定向检查、TypeScript与构建已通过。用户在本地验收完成后明确批准两仓“提交 合并 推送”；发布前fetch确认origin/main仍为起点，无用户新增提交需合并。提交使用 `Codex <noreply@openai.com>`，正常快进main，不强推、不执行部署或Actions。客户端详细验收记录位于 `aistudio/docs/package-sharing-global-manifest-state-20261013.md`。
+
+## 2026-10-13 分窗协议 v2
+
+新客户端显式传 `format=manifest-v2` 查询参数。capability 的 `manifestProtocol:'manifest-v2'` 表示可用；旧服务缺此标记时不能发送新stage字段。旧客户端无参数保持原JSON合同；后端逐行流式输出旧数组，旧客户端自身响应体预算仍需升级，不宣称它支持任意规模。
+
+v2列表用 `afterShareId`，详情版本用 `beforeSequence`（sequence倒序）；响应分别带 `complete/nextAfterShareId` 与 `versionsComplete/nextBeforeSequence`。`limit` 只是可持续续取的窗口，过大请求自动收窄，不成为总条目拒绝。v2版本摘要不内联media，附 `mediaCount/mediaDigest/mediaPageAvailable`。`GET /:shareId/versions/:versionId/media?after=0&limit=200` 返回稳定0起position、当前成员可得URL、nextAfter/complete及相同完整count/digest。摘要为按顺序 `SHA256(JSON.stringify({sha256,size,mime,kind})+'\n')`，URL不参与冻结事实；客户端必须核对位置、总数、摘要及快照依赖闭包。
+
+v2 stage声明必须带同算法 `mediaDigest`，mediaCount不再限制百万总量。每窗最多500条，连续登记任意总量；SQL按位置、唯一身份和媒体就绪校验，版本/规范媒体行/index/提交回执同事务可见，旧请求号不能变内容。重复commit可按持久stage回执恢复原版本。旧mediaJson仅首次读由SQLite json_each事务迁入，保留原记录，index标记使重启不扫描。
+
+大型scope可用 `scopeTransfer:{bytes,sha256,chunks}` 替代scope。`POST /:shareId/versions/stages/:stageId/scope {offset,items:[JSON文本片段]}` 连续登记，返回scopeReceived；JSON按UTF8字节与原文本SHA256冻结，片段不可拆破代理对。提交用SQLite检查完整JSON、字段类型、范围计数和重复身份。新摘要scope为null，并带 `scopeSummary:{kind,episodeCount,sourceEpisodeCount}`、scopePageAvailable/scopeBytes/scopeDigest/scopeChunks；`GET /:shareId/versions/:versionId/scope?after=0&limit=200` 返回items[{position,text}]、bytes/sha256/chunks、nextAfter/complete。旧默认JSON按原文本片段流式输出原scope。
+
+验证与剩余边界见 `package-sharing-pagination-design.md`。SQLite仍需完成最终事务与scope JSON组装，物理磁盘、运行时容量和真实大规模耗时未假装无限；本轮不部署、不访问真实桶，保留用户f605e2a COS诊断代码。

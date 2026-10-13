@@ -15,6 +15,7 @@ import type { AccountPool } from '../jobs/account-pool.js';
 import type { AssetStore } from '../stores/asset-store.js';
 import type { SessionStore } from '../stores/session-store.js';
 import { checkMediaQuota, resolveMediaPolicy, type MediaPolicy, type PrivateBlobStore } from '../system-media/routes.js';
+import { assertMediaMemory, MediaAdmission, mediaIdleWatchdog } from '../system-media/resources.js';
 export interface LegacyChannelRuntime {
   jobs: JobStore; runner: JobRunner; accountPool: AccountPool; assets: AssetStore; sessions: SessionStore;
 }
@@ -33,7 +34,8 @@ export class ChannelJobBridge {
   private timers = new Map<string, ReturnType<typeof setInterval>>();
   private reconciliation = new Map<string,Promise<void>>();
   private claims = new Map<string, { jobId: string; principal: ProjectPrincipal; lease: Lease }>();
-  private resultTransfers = new Map<string, number>();
+  private resultAdmission = new MediaAdmission();
+  private closing = new AbortController();
   constructor(private options: BridgeOptions) {
     const { runtime, jobs, channels, legacy } = options;
     runtime.db.exec('CREATE TABLE IF NOT EXISTS system_channel_jobs(job_id TEXT PRIMARY KEY,channel_job_id TEXT UNIQUE NOT NULL,account_id TEXT NOT NULL,created_at TEXT NOT NULL)');
@@ -70,33 +72,54 @@ export class ChannelJobBridge {
     if (typeof videoUrl !== 'string') throw new Error('Result is unavailable');
     const url = new URL(videoUrl);
     if (url.protocol !== 'https:' || !/(?:\.myqcloud\.com|\.miora\.design|\.miora\.ai)$/.test(url.hostname) || url.username || url.password) throw new Error('Result host is not allowed');
-    const active=[...this.resultTransfers.values()].reduce((sum,count)=>sum+count,0),mine=this.resultTransfers.get(principal.id)??0;
-    if(active>=policy.maxConcurrentUploads||mine>=policy.maxConcurrentPerUser||(active+1)*policy.maxFileBytes>policy.maxReservedBytes||(mine+1)*policy.maxFileBytes>policy.maxReservedPerUserBytes)throw new SystemError(429,'RESULT_TRANSFER_BUSY','视频结果传输繁忙，请稍后核对已有结果');
-    this.resultTransfers.set(principal.id,mine+1);
+    const release = await this.resultAdmission.acquire(principal.id, policy, this.closing.signal);
+    const idle = mediaIdleWatchdog(policy.uploadTimeoutMs, () => new SystemError(408, 'MEDIA_UPLOAD_TIMEOUT', '视频结果传输无进展，请稍后核对已有结果'), this.closing.signal);
     let directory:string|undefined,pendingResponse:Response|undefined;
     try {
-      const space=await statfs(tmpdir());if(Number(space.bavail)*Number(space.bsize)<(active+1)*policy.maxFileBytes*2+64*1024*1024)throw new SystemError(507,'MEDIA_DISK_FULL','临时磁盘空间不足，生成结果保留上游，稍后核对');
-      const response = await (this.options.fetchResult ?? fetch)(url, { redirect: 'error', signal: AbortSignal.timeout(120000) });
+      jobs.projects.access(row.project_id, principal, true);
+      const response = await (this.options.fetchResult ?? fetch)(url, { redirect: 'error', signal: idle.signal });
       pendingResponse=response;
       if (!response.ok || !response.body) throw new Error('Result is unavailable');
+      idle.progress();
       const lengthHeader=response.headers.get('content-length'),declared=lengthHeader===null?undefined:Number(lengthHeader);
-      if(declared!==undefined&&(!Number.isSafeInteger(declared)||declared<=0||declared>policy.maxFileBytes)){await response.body.cancel();throw new SystemError(413,'MEDIA_TOO_LARGE',`视频超过单文件 ${Math.floor(policy.maxFileBytes/1024/1024)} MiB 限制，请调整媒体策略或缩小视频`);}
+      if(declared!==undefined&&(!Number.isSafeInteger(declared)||declared<=0))throw new SystemError(400,'INVALID_MEDIA_SIZE','视频声明长度无效');
+      const checkSpace = async (remaining: number) => {
+        const space = await statfs(tmpdir(), { bigint: true });
+        if (space.bavail * space.bsize < BigInt(remaining) + BigInt(64 * 1024 * 1024)) throw new SystemError(507,'MEDIA_DISK_FULL','临时磁盘空间不足，生成结果保留上游，稍后核对');
+      };
+      await checkSpace(declared ?? 64 * 1024);
       directory=await mkdtemp(path.join(tmpdir(),'aistudio-result-'));const file=path.join(directory,'result.tmp');
-      const handle=await open(file,'wx',0o600),reader=response.body.getReader(),digest=createHash('sha256');let size=0,head=Buffer.alloc(0);
+      const handle=await open(file,'wx',0o600),reader=response.body.getReader(),digest=createHash('sha256');let size=0,head=Buffer.alloc(0),nextSpaceCheck=0;
+      let rejectAbort: (error: unknown) => void = () => {};
+      const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+      const onAbort = () => { rejectAbort(idle.signal.reason); void reader.cancel().catch(() => {}); };
+      idle.signal.addEventListener('abort', onAbort, { once: true });
       try {
-        for (;;) {const next=await reader.read();if(next.done)break;size+=next.value.length;if(size>policy.maxFileBytes)throw new SystemError(413,'MEDIA_TOO_LARGE',`视频超过单文件 ${Math.floor(policy.maxFileBytes/1024/1024)} MiB 限制`);const chunk=Buffer.from(next.value);digest.update(chunk);if(head.length<12)head=Buffer.concat([head,chunk.subarray(0,12-head.length)]);await handle.writeFile(chunk);}
+        for (;;) {
+          idle.signal.throwIfAborted();
+          const next=await Promise.race([reader.read(), aborted]);if(next.done)break;
+          idle.progress();size+=next.value.length;
+          if(!Number.isSafeInteger(size))throw new SystemError(400,'INVALID_MEDIA_SIZE','视频长度超出协议可表示范围');
+          if(declared!==undefined&&size>declared)throw new SystemError(400,'MEDIA_SIZE_MISMATCH','视频实际长度超过声明');
+          if(size>=nextSpaceCheck){await checkSpace(declared===undefined?next.value.length:Math.max(0,declared-size));nextSpaceCheck=size+4*1024*1024;}
+          const chunk=Buffer.from(next.value.buffer,next.value.byteOffset,next.value.byteLength);digest.update(chunk);if(head.length<12)head=Buffer.concat([head,chunk.subarray(0,12-head.length)]);await handle.writeFile(chunk);idle.progress();
+        }
         await handle.sync();
-      } finally {try{await handle.close();}finally{await reader.cancel().catch(()=>{});reader.releaseLock();}}
+      } finally {idle.signal.removeEventListener('abort',onAbort);try{await handle.close();}finally{await reader.cancel().catch(()=>{});reader.releaseLock();}}
+      idle.close();
       if(size<12||head.toString('ascii',4,8)!=='ftyp'||declared!==undefined&&declared!==size)throw new Error('Result signature or size does not match');
       const hash=digest.digest('hex');checkMediaQuota(runtime.db,row.project_id,hash,size,policy);
-      if(blobs.putStream)await blobs.putStream(hash,createReadStream(file),{size,mime:'video/mp4',maxBytes:policy.maxFileBytes});
-      else {if(size>20*1024*1024)throw new SystemError(503,'STREAM_STORAGE_REQUIRED','大视频需要流式媒体存储');await blobs.put(hash,await readFile(file));}
+      if(blobs.putStream)await blobs.putStream(hash,createReadStream(file),{size,mime:'video/mp4',timeoutMs:policy.uploadTimeoutMs,signal:this.closing.signal});
+      else {assertMediaMemory(size);await blobs.put(hash,await readFile(file));}
     // Async I/O above may overlap member removal, expiry, logout or target deletion.
       const project = jobs.projects.access(row.project_id, principal, true); jobs.projects.generation(project, row.generation);
       const target = jobs.projects.snapshotFromRow(project).entities.find(entity => entity.type === row.target_type && entity.id === row.target_id && !entity.deleted);
       if (!target) throw new Error('Result target was removed');
       return { channel: 'miora', media: { hash, size, mime: 'video/mp4' } };
-    } finally {await pendingResponse?.body?.cancel().catch(()=>{});this.resultTransfers.set(principal.id,(this.resultTransfers.get(principal.id)??1)-1);if(this.resultTransfers.get(principal.id)===0)this.resultTransfers.delete(principal.id);if(directory)await rm(directory,{recursive:true,force:true});}
+    } catch(error) {
+      if(['ENOSPC','EDQUOT'].includes((error as NodeJS.ErrnoException)?.code??''))throw new SystemError(507,'MEDIA_DISK_FULL','结果落盘空间不足，生成结果保留上游，稍后核对');
+      throw error;
+    } finally {idle.close();await pendingResponse?.body?.cancel().catch(()=>{});release();if(directory)await rm(directory,{recursive:true,force:true});}
   }
   private commitResult<T>(row:SystemJobRow,principal:ProjectPrincipal,result:{media:{hash:string;size:number;mime:string}},complete:()=>T):T {
     return this.options.runtime.db.transaction(()=>{
@@ -192,5 +215,5 @@ export class ChannelJobBridge {
     const result = await this.materialize(row, principal, completed.result);
     return this.commitResult(row,principal,result,()=>jobs.reconcileCompleted(jobId, principal, result));
   }
-  close() { for (const timer of this.timers.values()) clearInterval(timer); this.timers.clear(); this.claims.clear(); }
+  close() { this.closing.abort(new SystemError(503,'RESULT_TRANSFER_INTERRUPTED','服务正在关闭，生成结果保留供下次核对'));for (const timer of this.timers.values()) clearInterval(timer); this.timers.clear(); this.claims.clear(); }
 }

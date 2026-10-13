@@ -3,7 +3,6 @@ import { readFile, realpath } from 'node:fs/promises';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { createSystemRuntime, registerSystemRoutes, systemLoggerOptions, type SystemRuntimeOptions } from './index.js';
 import { SystemError } from './types.js';
-import { SystemRequestBudget } from './request-budget.js';
 import { registerProjectRoutes } from '../projects/routes.js';
 import { LocalPrivateBlobStore, registerSystemMediaRoutes, resolveMediaPolicy, type MediaPolicy } from '../system-media/routes.js';
 import { registerSystemJobRoutes } from '../system-jobs/routes.js';
@@ -27,20 +26,17 @@ export async function buildSystemWebApp(options:SystemWebOptions) {
     if(options.channelsEnabled){if(!options.credentialKey)throw new Error('Channel worker requires CHANNEL_CREDENTIAL_KEY');const {buildApp}=await import('../app.js');app=await buildApp({managedChannels:channels,managedGateway:options.videoGatewayEnabled,managedAccountCreditReader:options.managedAccountCreditReader,managedAccountArchived:(id,reason)=>runtime.store.audit({actorId:null,action:'channel.account.autoArchive',targetType:'channelAccount',targetId:id,metadata:{reason}}),trustProxy:options.trustProxy,warmup:false});}
     else app=Fastify({logger:systemLoggerOptions,bodyLimit:2*1024*1024,trustProxy:options.trustProxy??false});
     app.setErrorHandler<Error & {statusCode?:number}>((error,_request,reply)=>{if(error instanceof SystemError)return reply.code(error.statusCode).send({code:error.code,message:error.message});return reply.code(error.statusCode&&error.statusCode<500?error.statusCode:500).send({code:'REQUEST_FAILED',message:'Request failed'});});
-    const budget=new SystemRequestBudget();
     app.addHook('onRequest',async(request,reply)=>{
       if(!request.url.startsWith('/api/'))return;
       runtime.assertRequestOrigin(request);reply.header('Cache-Control','no-store').header('X-Content-Type-Options','nosniff');
       if(!['GET','HEAD','OPTIONS'].includes(request.method)&&request.url.startsWith('/api/system/projects')){
-        const principal=await runtime.authenticate(request);const pathname=request.url.split('?')[0]!;
-        const group=pathname.endsWith('/media')?'media':pathname.includes('/jobs')?'jobs':pathname.endsWith('/share')?'share':'commands';
-        budget.consume(principal.id,group,group==='media'?10:group==='jobs'?20:group==='share'?30:120);
+        await runtime.authenticate(request);
       }
     });
     await registerSystemRoutes(app,{runtime});
     const packageShares=registerPackageShareRoutes(app,{runtime,enabled:options.packageSharesEnabled});
     const mediaPolicy=resolveMediaPolicy(options.mediaPolicy);
-    app.get('/api/system/media-policy',async request=>{await runtime.authenticate(request);return {maxFileBytes:mediaPolicy.maxFileBytes,projectBytes:mediaPolicy.projectBytes,ownerBytes:mediaPolicy.ownerBytes};});
+    app.get('/api/system/media-policy',async request=>{await runtime.authenticate(request);return {streaming:true,deprecatedQuotaPolicy:true,maxFileBytes:mediaPolicy.maxFileBytes,projectBytes:mediaPolicy.projectBytes,ownerBytes:mediaPolicy.ownerBytes};});
     const projects=registerProjectRoutes(app,{runtime});const blobs=new LocalPrivateBlobStore(options.mediaDirectory);registerSystemMediaRoutes(app,{runtime,projects,blobs,mediaPolicy});
     const jobs=registerSystemJobRoutes(app,{runtime,projects,onServerJob:(id,principal)=>bridge.submit(id,principal)});
     const legacy=options.channelsEnabled?(app as unknown as {channelRuntime:LegacyChannelRuntime&{accountOperations?:ManagedAccountOperations}}).channelRuntime:undefined;

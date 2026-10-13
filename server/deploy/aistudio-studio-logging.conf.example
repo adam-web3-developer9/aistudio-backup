@@ -1,0 +1,5 @@
+# Optional drop-in for /etc/systemd/system/aistudio-studio.service.d/logging.conf.
+[Service]
+LogNamespace=aistudio-studio
+StandardOutput=journal
+StandardError=journal

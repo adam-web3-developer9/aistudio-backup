@@ -30,6 +30,9 @@ import {
 import { MioraAdapter, mioraEstimatedVideoCredits, mioraJobBudgetMs, mioraMinimumVideoCredits } from './adapters/miora-adapter.js';
 import { mioraTokenCookies, prepareCosUpload, readMioraTokens, useMioraProxy, type MioraTokens } from './adapters/miora-api.js';
 import { MioraClient } from './adapters/miora-client.js';
+import { readLegacyMediaJson } from './system-media/resources.js';
+import { ProjectError } from './projects/protocol.js';
+import { MioraDiagnosticSink, mioraDiagnostic, withMioraDiagnostics } from './adapters/miora-diagnostics.js';
 import { describeMioraTransferFailure, MioraCosTransferCoordinator, transferPublicMediaToMioraCos } from './adapters/miora-cos-transfer.js';
 import {
   MioraCredentials,
@@ -78,9 +81,14 @@ const uploadIntentSchema = z.object({
   assets: z.array(z.object({
     sha256: z.string().regex(/^[0-9a-f]{64}$/), size: z.int().positive(),
     mimeType: z.string().min(3).max(100), kind: z.enum(['image', 'video', 'audio']),
-    fileName: z.string().min(1).max(200).optional(), publicUrl: z.string().url().max(4096).optional()
+    fileName: z.string().min(1).optional(), publicUrl: z.string().url().optional()
   })).min(1)
 });
+const stagedUploadIntentSchema = uploadIntentSchema.omit({ assets:true }).extend({ assetCount:z.int().positive() });
+const manifestWindowSchema = z.object({ offset:z.int().nonnegative(), assets:uploadIntentSchema.shape.assets });
+// Window bounds are transport work budgets; there is no total manifest/reference cap.
+const uploadItemsQuerySchema = z.object({ offset:z.coerce.number().int().nonnegative().default(0), limit:z.coerce.number().int().min(1).max(100).default(3) });
+const completeSummarySchema = z.object({ summary:z.enum(['true','false']).optional() });
 const completeUploadIntentSchema = z.object({ indexes: z.array(z.int().nonnegative()).min(1) });
 /**
  * What `/v1/assets` accepts.
@@ -112,6 +120,10 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const uploadIntents = gateway && options.managedChannels ? new MioraUploadIntentStore(options.managedChannels.db, config.apiKey!) : undefined;
   const mioraTransfers = new MioraCosTransferCoordinator();
   const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
+  const mioraDiagnosticSink = new MioraDiagnosticSink(app.log);
+  app.addHook('onRequest', (request, _reply, done) => {
+    withMioraDiagnostics(mioraDiagnosticSink, { requestId:request.id }, done);
+  });
   /** Accounts seen at 0 credits, kept so `/v1/accounts` can report them. */
   const exhaustedAccounts = new Map<string, AccountSnapshot>();
   const assets = new AssetStore(config.dataDir, {
@@ -934,6 +946,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   }
 
   const runner = new JobRunner(jobs, assets, sessions, adapters, browsers, accountPool, {
+    runInContext:(jobId, run) => withMioraDiagnostics(mioraDiagnosticSink, { jobId }, run),
     beforeSubmitGuard: gateway ? job => gateway.assertExecution(job) : undefined,
     onAccountLeaseAcquired: uploadIntents ? job => uploadIntents.releaseReservationForJob(job.id) : undefined,
     timeoutMs: config.jobTimeoutMs,
@@ -958,6 +971,10 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
       })
     ),
     onJobSettled: (job) => {
+      if (job.adapterId === 'miora-v1') {
+        mioraDiagnostic('miora.job.finished', { jobId:job.id, taskId:job.progress?.providerJobId, outcome:job.status, code:job.error?.code });
+        mioraDiagnosticSink.flush();
+      }
       uploadIntents?.releaseReservationForJob(job.id);
       if (!job.sessionId) return;
       void releaseRetiredSession(job.sessionId).catch((error) => {
@@ -1093,10 +1110,15 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     return candidates;
   }
 
-  async function signedPendingItems(id: string) {
-    const description = uploadIntents!.describe(id);
+  async function signedPendingItems(id: string, window?: {offset:number;limit:number}) {
+    return withMioraDiagnostics(mioraDiagnosticSink, { uploadIntentId:id }, () => signedPendingItemsInContext(id, window));
+  }
+  async function signedPendingItemsInContext(id: string, window?: {offset:number;limit:number}) {
+    if (window) uploadIntents!.renewStaged(id);
+    const description = window ? uploadIntents!.describePage(id, window.offset, window.limit) : uploadIntents!.describe(id);
     const describedItems = new Map(description.items.map(item => [item.index, item]));
-    const plan = uploadIntents!.plan(id);
+    const plan = window ? uploadIntents!.page(id, window.offset, window.limit) : uploadIntents!.plan(id);
+    if ('finalized' in plan && !plan.finalized) throw new SystemError(409, 'UPLOAD_MANIFEST_INCOMPLETE', 'Manifest is not finalized');
     const session = await sessions.get(plan.accountId);
     const tokens = session && readMioraTokens(session.cookies);
     if (!tokens) throw new SystemError(409, 'UPLOAD_INTENT_ACCOUNT_UNAVAILABLE', 'Upload intent account is unavailable');
@@ -1116,18 +1138,25 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const importRuns = new Map<string,Promise<void>>();
   function resumePublicImports(id: string): void {
     if (importRuns.has(id)) return;
-    const run = (async () => {
-      const plan = uploadIntents!.plan(id);
-      if (plan.consumedJobId) return;
+    const run = withMioraDiagnostics(mioraDiagnosticSink, { uploadIntentId:id }, async () => {
+      mioraDiagnostic('miora.intent.import_started');
+      const plan = uploadIntents!.page(id, 0, 1);
+      if (plan.consumedJobId || !plan.finalized) return;
       const session = await sessions.get(plan.accountId);
       const tokens = session && readMioraTokens(session.cookies);
       if (!tokens) throw new SystemError(409, 'UPLOAD_INTENT_ACCOUNT_UNAVAILABLE', 'Upload intent account is unavailable');
       const client = new MioraClient(tokens, persistMioraClientRenewal);
-      const pending = plan.items.filter(item => item.status === 'importing' && item.source_url);
+      let offset = 0;
+      for (;;) {
+      const page = uploadIntents!.pendingImportPage(id, offset, 100);
+      if (!page.length) break;
+      offset = page[page.length - 1]!.idx + 1;
+      const pending = page.filter(item => item.source_url);
       let cursor = 0;
       await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
         while (cursor < pending.length) {
           const item = pending[cursor++]!;
+          await withMioraDiagnostics(mioraDiagnosticSink, { itemIndex:item.idx }, async () => {
           try {
             const key = await mioraTransfers.transfer({ accountId:plan.accountId,
               identity:`${item.sha256}:${item.size}:${item.mime_type}:${item.kind}`,
@@ -1140,12 +1169,94 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
             app.log.warn({ uploadIntentId:id, index:item.idx, ...failure }, 'Public media transfer failed');
             uploadIntents!.importFailed(id, item.idx, failure);
           }
+          });
         }
       }));
-    })().catch(error => app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed'))
+      }
+    }).catch(error => app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed'))
       .finally(() => importRuns.delete(id));
     importRuns.set(id, run);
   }
+
+  app.post('/v1/upload-intents/staged', async (request, reply) => {
+    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+    const parsed = stagedUploadIntentSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
+    const existing = uploadIntents.findByIdempotencyKey(parsed.data.idempotencyKey);
+    const candidates = existing ? [] : await intentAccounts();
+    const estimate = mioraEstimatedVideoCredits(parsed.data.options, { model:config.mioraVideo.model, durationSeconds:MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS });
+    try {
+      const created = uploadIntents.createStaged(parsed.data.idempotencyKey,
+        candidates.map(account => ({ accountId:account.sessionId, credits:account.availableCredits ?? account.credits, activeJobs:account.activeJobs })),
+        estimate, parsed.data.options, parsed.data.assetCount);
+      return reply.code(created.created ? 201 : 200).send(uploadIntents.summary(created.id));
+    } catch (error) {
+      if (error instanceof SystemError && ['INSUFFICIENT_CREDITS','ACCOUNT_BALANCE_UNAVAILABLE'].includes(error.code)) {
+        return reply.code(error.statusCode).send({ error:{ code:error.code, scope:error.code === 'INSUFFICIENT_CREDITS' ? 'pool' : 'task', retryable:error.code === 'ACCOUNT_BALANCE_UNAVAILABLE', message:error.message } });
+      }
+      throw error;
+    }
+  });
+  app.put('/v1/upload-intents/:id/manifest', { bodyLimit:1024 * 1024 }, async (request, reply) => {
+    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+    const params = idParamsSchema.safeParse(request.params); const body = manifestWindowSchema.safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send(validationError(params, body));
+    uploadIntents.appendManifest(params.data.id, body.data.offset, body.data.assets);
+    return reply.send(uploadIntents.summary(params.data.id));
+  });
+  // A single large scalar uses resource admission rather than a fixed JSON-frame quota.
+  await app.register(async streamingManifest => {
+    streamingManifest.removeContentTypeParser('application/json');
+    streamingManifest.addHook('preParsing', async (request, _reply, payload) => {
+      if (!uploadIntents) throw new SystemError(404, 'LEGACY_API_DISABLED', 'Video upload intents are disabled');
+      const params = idParamsSchema.safeParse(request.params);
+      if (!params.success) throw new SystemError(400, 'UPLOAD_INTENT_INVALID', 'Invalid upload intent');
+      uploadIntents.summary(params.data.id); // Owner check before reading/allocating request bytes.
+      return payload;
+    });
+    streamingManifest.addContentTypeParser('application/json', (request, payload, done) => {
+      void readLegacyMediaJson(payload, 60_000).then(body => done(null, body), error => {
+        if (error instanceof ProjectError) done(new SystemError(error.statusCode, error.code, error.message));
+        else done(new SystemError(400, 'UPLOAD_MANIFEST_INVALID', 'Manifest JSON is invalid'));
+      });
+    });
+    streamingManifest.put('/v1/upload-intents/:id/manifest-stream', async (request, reply) => {
+      const params = idParamsSchema.safeParse(request.params); const body = manifestWindowSchema.safeParse(request.body);
+      if (!params.success || !body.success) return reply.code(400).send(validationError(params, body));
+      uploadIntents!.appendManifest(params.data.id, body.data.offset, body.data.assets);
+      return reply.send(uploadIntents!.summary(params.data.id));
+    });
+  });
+
+  app.post('/v1/upload-intents/:id/finalize', async (request, reply) => {
+    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return reply.code(400).send(zodError(params.error));
+    uploadIntents.finalizeManifest(params.data.id); resumePublicImports(params.data.id);
+    return reply.send(uploadIntents.summary(params.data.id));
+  });
+  // Pure evidence read: no lease renewal, credential lookup, signing or import resume.
+  app.get('/v1/upload-intents/:id/diagnostics', async (request, reply) => {
+    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+    const params = idParamsSchema.safeParse(request.params); const query = uploadItemsQuerySchema.safeParse(request.query);
+    if (!params.success || !query.success) return reply.code(400).send(validationError(params, query));
+    return reply.send({ ...uploadIntents.describePage(params.data.id, query.data.offset, query.data.limit),
+      observedAt:new Date().toISOString(), requestId:request.id });
+  });
+  app.get('/v1/upload-intents/:id/status', async (request, reply) => {
+    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+    const params = idParamsSchema.safeParse(request.params);
+    if (!params.success) return reply.code(400).send(zodError(params.error));
+    uploadIntents.renewStaged(params.data.id);
+    resumePublicImports(params.data.id);
+    return reply.send(uploadIntents.summary(params.data.id));
+  });
+  app.get('/v1/upload-intents/:id/items', async (request, reply) => {
+    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+    const params = idParamsSchema.safeParse(request.params); const query = uploadItemsQuerySchema.safeParse(request.query);
+    if (!params.success || !query.success) return reply.code(400).send(validationError(params, query));
+    return reply.send(await signedPendingItems(params.data.id, query.data));
+  });
 
   app.post('/v1/upload-intents', async (request, reply) => {
     if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
@@ -1202,10 +1313,12 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   app.post('/v1/upload-intents/:id/complete', async (request, reply) => {
     if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
     const params = idParamsSchema.safeParse(request.params); const body = completeUploadIntentSchema.safeParse(request.body);
+    const query = completeSummarySchema.safeParse(request.query);
+    if (!query.success) return reply.code(400).send(zodError(query.error));
     if (!params.success || !body.success) return reply.code(400).send(validationError(params, body));
     uploadIntents.directUploadItems(params.data.id, body.data.indexes);
     uploadIntents.complete(params.data.id, body.data.indexes);
-    return reply.send(uploadIntents.describe(params.data.id));
+    return reply.send(query.data.summary === 'true' ? uploadIntents.summary(params.data.id) : uploadIntents.describe(params.data.id));
   });
 
   app.put('/v1/sessions/:id/cookies', async (request, reply) => {
@@ -1459,6 +1572,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   });
 
   app.addHook('onClose', async () => {
+    try {
     tokenWatcher.stop();
     dreamMakerWatcher.stop();
     higgsfieldWatcher.stop();
@@ -1471,6 +1585,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     clearInterval(pruneTimer);
     await browsers.close();
     await jobs.flush();
+    } finally { mioraDiagnosticSink.flush(); }
   });
   app.decorate('channelRuntime', { jobs, runner, assets, accountPool, sessions, accountOperations:managedAccountOperations });
   return app;

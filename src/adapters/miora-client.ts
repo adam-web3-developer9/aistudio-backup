@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
+import { mioraDiagnostic, mioraNetworkCode, withMioraDiagnosticContext } from './miora-diagnostics.js';
 import type { CreditBalance } from '../types.js';
 import {
   CDN_SIGN_PATH,
@@ -172,6 +173,7 @@ export class MioraClient {
 
     const taskId = response.json?.data?.data?.taskId ?? response.json?.data?.taskId;
     if (!taskId) throw toApiError(response, GENERATE_VIDEO_PATH);
+    mioraDiagnostic('miora.task.submitted', { taskId });
     return taskId;
   }
 
@@ -194,7 +196,9 @@ export class MioraClient {
     // single differently-keyed entry; fall back to the only value present.
     const raw = tasks?.[taskId] ?? (tasks ? Object.values(tasks)[0] : undefined);
     if (!raw) throw new MioraTaskNotFoundError(taskId);
-    return normalizeTask(taskId, raw);
+    const task = normalizeTask(taskId, raw);
+    mioraDiagnostic('miora.task.poll', { taskId, outcome:task.status });
+    return task;
   }
 
   /** Turn a result COS key into a downloadable signed URL. */
@@ -228,6 +232,18 @@ export class MioraClient {
     onPoll?: (task: MioraTask) => void;
     onPollRetry?: (info: RetryAttemptInfo) => void;
   }): Promise<MioraTask> {
+    const started = performance.now();
+    try {
+      const task = await withMioraDiagnosticContext({ taskId }, () => this.pollTask(taskId, options));
+      mioraDiagnostic('miora.task.finished', { taskId, outcome:'succeeded', elapsedMs:performance.now() - started });
+      return task;
+    } catch (error) {
+      mioraDiagnostic('miora.task.finished', { taskId, outcome:options.signal?.aborted ? 'cancelled' : error instanceof MioraRenderTimeoutError ? 'timeout' : 'failed', code:classifyMioraError(error).code, networkCode:mioraNetworkCode(error), elapsedMs:performance.now() - started });
+      throw error;
+    }
+  }
+
+  private async pollTask(taskId: string, options: Parameters<MioraClient['waitForTask']>[1]): Promise<MioraTask> {
     const interval = options.intervalMs ?? 5_000;
     const retryDelays = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
     const deadline = Date.now() + options.timeoutMs;
@@ -257,6 +273,7 @@ export class MioraClient {
           throw new ProviderJobError(failure, consecutiveFailures + 1, 'poll', { cause: error });
         }
         const delayMs = retryDelays[consecutiveFailures]!;
+        mioraDiagnostic('miora.task.poll_retry', { taskId, retry:consecutiveFailures + 1, delayMs, code:failure.code, networkCode:mioraNetworkCode(error) });
         consecutiveFailures += 1;
         options.onPollRetry?.({
           step: 'poll',
@@ -296,6 +313,7 @@ export class MioraClient {
       return await mioraRequest<T>(this.tokens.authToken, path, withCookie);
     } catch (error) {
       if (error instanceof MioraAuthError && this.tokens.refreshToken) {
+        mioraDiagnostic('miora.api.auth_retry', { path, httpStatus:401, retry:1 });
         await this.refresh(options.signal);
         return mioraRequest<T>(this.tokens.authToken, path, { ...withCookie, cookie: this.tokens.cookie });
       }
