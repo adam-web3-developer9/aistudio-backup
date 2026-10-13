@@ -26,6 +26,12 @@ importers:
       playwright:
         specifier: ^1.55.0
         version: 1.62.1
+      stream-chain:
+        specifier: 4.2.6
+        version: 4.2.6
+      stream-json:
+        specifier: 3.7.0
+        version: 3.7.0
       undici:
         specifier: ^8.10.2
         version: 8.10.2
@@ -898,6 +904,12 @@ packages:
   std-env@3.10.0:
     resolution: {integrity: sha512-5GS12FdOZNliM5mAOxFRg7Ir0pWz8MdpYm6AY6VPkGpbA7ZzmbzNcBJQ0GPvvyWgcY7QAhCgf9Uy89I03faLkg==}
 
+  stream-chain@4.2.6:
+    resolution: {integrity: sha512-1zeJ8CrtJfmiba26ui8jXkq/xLRFvhzkdH02D5QLO9Cnovgeb28IJxg88DdraWnjnkbOol/++uIAybJbJhk7ig==}
+
+  stream-json@3.7.0:
+    resolution: {integrity: sha512-rCSBdcBP/bPk6T8QFcxAj1MSzAuc5i49cYW6IE7sYObNEPccBJIUiL6fU9c9BWt40aJK0siVynLX7lWaW8alXw==}
+
   strip-literal@3.1.0:
     resolution: {integrity: sha512-8r3mkIM/2+PpjHoOtiAW8Rg3jJLHaV7xPwG+YRGrv6FP0wwk/toTpATxWYOW0BKdWwl82VT2tFYi5DlROa0Mxg==}
 
@@ -1695,6 +1707,12 @@ snapshots:
   stackback@0.0.2: {}
 
   std-env@3.10.0: {}
+
+  stream-chain@4.2.6: {}
+
+  stream-json@3.7.0:
+    dependencies:
+      stream-chain: 4.2.6
 
   strip-literal@3.1.0:
     dependencies:

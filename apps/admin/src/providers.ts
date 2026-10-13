@@ -139,6 +139,23 @@ export async function cleanupChannelAccounts(ids?: string[]) {
   }
   return total;
 }
+export async function createActivationCodes(input: {count: number; validityDays: number; redeemBefore: string | null; note?: string}, onProgress?: (created: number) => void) {
+  if (!Number.isSafeInteger(input.count) || input.count < 1) throw new ApiError("数量必须为正整数。", 400);
+  const data: (Record<string, any> & {id: string})[] = [];
+  for (let offset = 0; offset < input.count; offset += 100) {
+    const count = Math.min(100, input.count - offset);
+    try {
+      const result = await mutation<{data: (Record<string, any> & {id: string})[]}>("/api/admin/activation-codes", "POST", {...input,count});
+      data.push(...result.data);
+      if (result.data.length !== count) throw new ApiError("服务未返回当前批次全部激活码。", 502);
+      onProgress?.(data.length);
+    } catch (error) {
+      // Plaintext codes return once: an uncertain creation window must not be resent silently.
+      return {data, unconfirmed: count, unsubmitted: input.count-offset-count, error};
+    }
+  }
+  return {data, unconfirmed: 0, unsubmitted: 0, error: undefined};
+}
 export async function getAdmin(): Promise<AdminIdentity> {
   const identity = await request<AdminIdentity>("/api/admin/me");
   if (!["superadmin", "operator", "readonly"].includes(identity.role))

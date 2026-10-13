@@ -4,8 +4,9 @@ import type { SystemRuntime } from '../system/index.js';
 import { SystemError } from '../system/types.js';
 import { ChannelStore } from './store.js';
 import type { ManagedAccountOperations } from './account-operations.js';
+import { readCredentialMutation, type CredentialBytes } from './credential-stream.js';
 const idSchema=z.string().regex(/^managed-miora-[a-f0-9]{24}$/);
-const credentialsSchema=z.string().min(1).max(512*1024);
+const credentialsSchema=z.string().min(1);
 const labelSchema=z.string().trim().min(1).max(120);
 // A transport window, not a limit on the total size of an administrative operation.
 const idsSchema=z.array(idSchema).max(500);
@@ -45,8 +46,14 @@ export function registerChannelRoutes(app:FastifyInstance,options:{runtime:Syste
     scoped.post('/api/admin/channels/accounts/cleanup',async request=>{
       const principal=await operate(request);const body=z.object({ids:idsSchema.optional()}).strict().parse(request.body??{});if(!options.operations)throw new SystemError(503,'CHANNEL_WORKER_DISABLED','Channel account checks are unavailable');const result=await options.operations.cleanup(body.ids);runtime.store.audit({actorId:principal.id,action:'channel.accounts.cleanup',targetType:'channelAccount',targetId:'multiple',metadata:result});return result;
     });
-    scoped.post('/api/admin/channels/accounts/miora/import',{bodyLimit:600*1024},async request=>{const principal=await operate(request);const body=z.object({credentials:credentialsSchema,label:labelSchema.optional()}).strict().parse(request.body);const result=store.import(body.credentials,body.label);runtime.store.audit({actorId:principal.id,action:'channel.credentials.import',targetType:'channelAccount',targetId:result.id});await options.changed?.();return result;});
-    scoped.patch('/api/admin/channels/accounts/:id',{bodyLimit:600*1024},async request=>{const principal=await operate(request);const id=idSchema.parse((request.params as {id:string}).id);const body=z.object({credentials:credentialsSchema.optional(),label:labelSchema.optional(),enabled:z.boolean().optional()}).strict().parse(request.body);if(!store.row(id))throw new SystemError(404,'ACCOUNT_UNAVAILABLE','Channel account unavailable');if(body.credentials)store.import(body.credentials,body.label,id);const result=store.update(id,body);runtime.store.audit({actorId:principal.id,action:body.credentials?'channel.credentials.update':'channel.account.update',targetType:'channelAccount',targetId:id,metadata:{...(body.enabled===undefined?{}:{enabled:body.enabled})}});await options.changed?.();return result;});
+    scoped.register(async credentials=>{
+      credentials.removeContentTypeParser('application/json');
+      credentials.addContentTypeParser('application/json',(_request,payload,done)=>done(null,payload));
+      credentials.addHook('onRequest',async request=>{await operate(request);});
+      const bodyOf=async(request: {body:unknown})=>{try{return await readCredentialMutation(request.body as CredentialBytes);}catch{throw new SystemError(400,'INVALID_CREDENTIALS','凭据格式无效，请检查导出文件或令牌。');}};
+      credentials.post('/api/admin/channels/accounts/miora/import',async request=>{const principal=await operate(request);const body=z.object({credentials:credentialsSchema,label:labelSchema.optional()}).strict().parse(await bodyOf(request));const result=store.import(body.credentials,body.label);runtime.store.audit({actorId:principal.id,action:'channel.credentials.import',targetType:'channelAccount',targetId:result.id});await options.changed?.();return result;});
+      credentials.patch('/api/admin/channels/accounts/:id',async request=>{const principal=await operate(request);const id=idSchema.parse((request.params as {id:string}).id);const body=z.object({credentials:credentialsSchema.optional(),label:labelSchema.optional(),enabled:z.boolean().optional()}).strict().parse(await bodyOf(request));if(!store.row(id))throw new SystemError(404,'ACCOUNT_UNAVAILABLE','Channel account unavailable');if(body.credentials)store.import(body.credentials,body.label,id);const result=store.update(id,body);runtime.store.audit({actorId:principal.id,action:body.credentials?'channel.credentials.update':'channel.account.update',targetType:'channelAccount',targetId:id,metadata:{...(body.enabled===undefined?{}:{enabled:body.enabled})}});await options.changed?.();return result;});
+    });
     scoped.delete('/api/admin/channels/accounts/:id',async request=>{const principal=await operate(request);const id=idSchema.parse((request.params as {id:string}).id);const result=store.update(id,{archived:true});runtime.store.audit({actorId:principal.id,action:'channel.account.archive',targetType:'channelAccount',targetId:id});await options.changed?.();return result;});
     scoped.post('/api/admin/channels/accounts/:id/restore',async request=>{const principal=await operate(request);const id=idSchema.parse((request.params as {id:string}).id);const result=store.update(id,{archived:false,enabled:false});runtime.store.audit({actorId:principal.id,action:'channel.account.restore',targetType:'channelAccount',targetId:id});await options.changed?.();return result;});
     scoped.get('/api/admin/channels/accounts/:id/jobs',async request=>{

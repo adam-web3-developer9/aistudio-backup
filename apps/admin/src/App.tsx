@@ -37,6 +37,7 @@ import {
   CloudOutlined,
 } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
+import {extractCredentialText, readableChunks} from "../../../src/system-channels/credential-stream";
 import {
   authProvider,
   getAdmin,
@@ -45,6 +46,7 @@ import {
   cleanupChannelAccounts,
   selectChannelAccountIds,
   summarizeChannelBatch,
+  createActivationCodes,
   type ChannelBatchSummary,
   type ChannelBatchAction,
   type ChannelStatistics,
@@ -444,6 +446,7 @@ function ResourcePage({
   const [channelResult, setChannelResult] = useState<{ text: string; warning: boolean } | null>(null);
   const [channelBatch, setChannelBatch] = useState<{ action: ChannelBatchAction; summary: ChannelBatchSummary } | null>(null);
   const [batchProgress, setBatchProgress] = useState("");
+  const [codesFailure, setCodesFailure] = useState("");
   const channelOperationBusy = useRef(false);
   const readyFileCount = credentialFiles.filter(
     (file) => file.status === "ready",
@@ -475,21 +478,15 @@ function ResourcePage({
         if (version !== fileReadVersion.current) return;
         let error = !/\.(json|txt)$/i.test(file.name)
           ? "请选择 .json 或 .txt 文件。"
-          : file.size > 512 * 1024
-            ? "文件不能超过 512 KiB。"
-            : !file.size
+          : !file.size
               ? "文件为空，请选择包含凭据的文件。"
               : "";
         let contents = "";
         if (!error) {
           try {
-            contents = await file.text();
-            if (new TextEncoder().encode(contents).length > 512 * 1024)
-              error = "凭据文本不能超过 512 KiB。";
-            else if (!contents.trim())
-              error = "文件为空，请选择包含凭据的文件。";
+            contents = await extractCredentialText(readableChunks(file.stream()));
           } catch {
-            error = "文件读取失败，请重新选择。";
+            error = "文件读取或凭据格式检查失败，请重新选择。";
           }
         }
         loaded.push({
@@ -1048,16 +1045,16 @@ function ResourcePage({
     }
     try {
       if (dialog === "codes") {
-        const response = (await run(
-          "submit",
-          () =>
-            mutation<{ data: Row[] }>("/api/admin/activation-codes", "POST", {
-              ...values,
-              redeemBefore: values.redeemBefore?.toISOString() ?? null,
-            }),
-          "激活码创建成功",
-        )) as { data: Row[] };
+        setPending("submit");setOperationError("");setCodesFailure("");
+        const response = await createActivationCodes({count: values.count, validityDays: values.validityDays, note: values.note, redeemBefore: values.redeemBefore?.toISOString() ?? null}, created => setBatchProgress(`已创建 ${created} / ${values.count} 个激活码…`)).finally(() => {setPending("");setBatchProgress("");});
         setCodes(response.data);
+        if (response.error) {
+          const text=`已收到 ${response.data.length} 个激活码；当前批次 ${response.unconfirmed} 个结果尚未确认，后续 ${response.unsubmitted} 个未提交。${errorText(response.error)} 请先保存已收到的激活码并查询审计核对当前批次，避免重复创建。`;
+          setCodesFailure(text);setOperationError(text);message.warning(text);setDialog("");
+          if ((response.error as any).statusCode === 401) onExpired();
+          return;
+        }
+        message.success(`已创建 ${response.data.length} 个激活码`);void query.refetch();
       } else if (dialog === "admin") {
         await run(
           "submit",
@@ -1092,7 +1089,11 @@ function ResourcePage({
         form.resetFields();
       }
       setDialog("");
-    } catch {
+    } catch (error) {
+      if (dialog === "codes") {
+        setOperationError(errorText(error));
+        message.error(errorText(error));
+      }
       if (dialog === "channel") {
         clearFileSelection();
         form.setFieldValue("credentials", "");
@@ -1358,7 +1359,7 @@ function ResourcePage({
                 激活期限从兑换成功后计算，最晚兑换时间单独限制兑换窗口。
               </Paragraph>
               <Form.Item name="count" label="数量" rules={[{ required: true }]}>
-                <InputNumber min={1} max={100} />
+                <InputNumber min={1} precision={0} />
               </Form.Item>
               <Form.Item
                 name="validityDays"
@@ -1437,7 +1438,7 @@ function ResourcePage({
                   type="secondary"
                   style={{ marginTop: 8, marginBottom: 0 }}
                 >
-                  支持多选 .json/.txt 文件，每份最大 512 KiB；点击导入后提交。批量导入时账户 ID 留空，标签应用于全部文件。
+                  支持多选 .json/.txt 文件；逐份流式读取并提取账户凭据，点击导入后提交。批量导入时账户 ID 留空，标签应用于全部文件。
                 </Paragraph>
               </Form.Item>
               {fileReading && (
@@ -1519,15 +1520,6 @@ function ResourcePage({
                   label="Miora 导出 JSON 或 Cookie 文本"
                   rules={[
                     { required: true, message: "请输入导出的凭据" },
-                    {
-                      validator: (_, value) =>
-                        !value ||
-                        new TextEncoder().encode(value).length <= 512 * 1024
-                          ? Promise.resolve()
-                          : Promise.reject(
-                              new Error("凭据文本不能超过 512 KiB。"),
-                            ),
-                    },
                   ]}
                 >
                   <Input.TextArea
@@ -1541,6 +1533,7 @@ function ResourcePage({
             </>
           )}
         </Form>
+        {batchProgress && dialog === "codes" && <Alert type="info" title={batchProgress} />}
         {operationError && <Alert type="error" title={operationError} />}
       </Modal>
       <Modal
@@ -1569,6 +1562,7 @@ function ResourcePage({
           showIcon
           title="完整激活码仅显示本次，关闭后无法再次读取。"
         />
+        {codesFailure && <Alert type="error" title={codesFailure} />}
         <div className="codes-output">
           {codes.map((r) => (
             <Paragraph key={r.id} code copyable={{ text: r.code }}>

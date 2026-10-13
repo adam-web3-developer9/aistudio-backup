@@ -8,7 +8,7 @@ import { ChannelStore } from './store.js';
 const close:Array<()=>void|Promise<unknown>>=[];
 afterEach(async()=>{for(const fn of close.splice(0).reverse())await fn();});
 async function fixture(){
-  const db=new Database(':memory:');close.push(()=>db.close());
+  const db=new Database(':memory:');close.push(()=>{db.close();});
   const store=new ChannelStore(db);const audits:unknown[]=[];
   const runtime={db,assertRequestOrigin:()=>{},requireAdmin:async()=>({id:'test-admin'}),store:{audit:(entry:unknown)=>audits.push(entry)}} as unknown as SystemRuntime;
   const app=Fastify();close.push(()=>app.close());registerChannelRoutes(app,{runtime,store});await app.ready();
@@ -17,7 +17,7 @@ async function fixture(){
 }
 test('partial batch isolates item errors, is idempotent, and retains the atomic API default',async()=>{
   const {app,store,add}=await fixture();const first=add(1),second=add(2),missing='managed-miora-'+'f'.repeat(24);
-  const post=(payload:unknown)=>app.inject({method:'POST',url:'/api/admin/channels/accounts/batch',payload});
+  const post=(payload:Record<string,unknown>)=>app.inject({method:'POST',url:'/api/admin/channels/accounts/batch',payload});
   expect((await post({ids:[first,missing],action:'disable'})).statusCode).toBe(404);
   expect(store.row(first)!.enabled).toBe(1);
   const result=await post({ids:[first,missing,first,second],action:'archive',partial:true});

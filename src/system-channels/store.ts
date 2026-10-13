@@ -82,7 +82,7 @@ export class ChannelStore {
     // detection scans text and must only be used after that structured format.
     const parsed = parseMioraAccounts(credentials).accounts[0] ?? imported;
     const tokens=parsed?.tokens;
-    if (!tokens?.authToken || tokens.authToken.length>16384 || /[\r\n]/.test(tokens.cookie ?? '') || tokens.authToken.split('.').length!==3) throw new SystemError(400,'INVALID_CREDENTIALS','A valid Miora export or token is required');
+    if (!tokens?.authToken || /[\r\n]/.test(tokens.cookie ?? '') || tokens.authToken.split('.').length!==3) throw new SystemError(400,'INVALID_CREDENTIALS','A valid Miora export or token is required');
     let subject: string; try { const claims=JSON.parse(Buffer.from(tokens.authToken.split('.')[1]!, 'base64url').toString()); subject=String(claims.sub ?? claims.userId ?? claims.id ?? parsed?.email ?? ''); } catch { subject=''; }
     if (!subject) throw new SystemError(400,'INVALID_CREDENTIALS','Credential account identity is missing');
     const id='managed-miora-'+createHash('sha256').update(subject).digest('hex').slice(0,24);

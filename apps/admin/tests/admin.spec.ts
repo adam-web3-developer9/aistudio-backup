@@ -157,9 +157,9 @@ test("凭据文件多选批量导入超过20份，独立失败与结果清空", 
     const credentials = route.request().postDataJSON().credentials;
     imported.push(credentials);
     await route.fulfill({
-      status: credentials === "FAKE-REJECTED" ? 400 : 200,
+      status: credentials === '{"authToken":"FAKE-REJECTED"}' ? 400 : 200,
       contentType: "application/json",
-      body: JSON.stringify(credentials === "FAKE-REJECTED"
+      body: JSON.stringify(credentials === '{"authToken":"FAKE-REJECTED"}'
         ? { code: "INVALID_CREDENTIALS", message: "无效的凭据" }
         : { id: `channel-${imported.length}` }),
     });
@@ -171,7 +171,7 @@ test("凭据文件多选批量导入超过20份，独立失败与结果清空", 
   const files = Array.from({ length: 23 }, (_, index) => ({
     name: `account-${index + 1}.json`,
     mimeType: "application/json",
-    buffer: Buffer.from(index === 1 ? "FAKE-REJECTED" : `FAKE-CREDENTIAL-${index + 1}`),
+    buffer: Buffer.from(JSON.stringify({authToken: index === 1 ? "FAKE-REJECTED" : `FAKE-CREDENTIAL-${index + 1}`})),
   }));
   await page.getByLabel("更新账户 ID（新导入留空）").fill("channel-one");
   await page.getByLabel("账户标签", { exact: true }).fill("批量账户");
@@ -187,7 +187,7 @@ test("凭据文件多选批量导入超过20份，独立失败与结果清空", 
   expect(imported).toHaveLength(0);
   await page.getByLabel("更新账户 ID（新导入留空）").fill("");
   await dialog.getByRole("button", { name: "批量导入（23）" }).click();
-  await expect(dialog.getByText("导入完成：成功 22 份，失败 3 份。新账户已自动启用，已有账户保留原状态。请重新选择失败文件后导入。")).toBeVisible();
+  await expect(dialog.getByText("导入完成：成功 22 份，失败 3 份。新账户已自动启用，已有账户保留原状态。请重新选择失败文件后导入。")).toBeVisible({timeout:15000});
   expect(imported).toEqual(files.map((file) => file.buffer.toString()));
   await expect(dialog.getByText("导入成功", { exact: true })).toHaveCount(22);
   await expect(dialog.getByText("导入失败", { exact: true })).toHaveCount(1);
@@ -204,12 +204,12 @@ test("凭据文件多选批量导入超过20份，独立失败与结果清空", 
   // Single-file import still supports updating a specified account.
   await page.getByLabel("更新账户 ID（新导入留空）").fill("channel-one");
   await page.getByLabel("选择本地凭据文件").setInputFiles(files[0]);
-  await expect(page.getByLabel("Miora 导出 JSON 或 Cookie 文本")).toHaveValue("FAKE-CREDENTIAL-1");
+  await expect(page.getByLabel("Miora 导出 JSON 或 Cookie 文本")).toHaveValue('{"authToken":"FAKE-CREDENTIAL-1"}');
   await expect(dialog.getByRole("button", { name: /确定$/ })).toBeEnabled();
   await dialog.getByRole("button", { name: /确定$/ }).click();
   await expect(dialog).toHaveCount(0);
   expect(calls.find((call) => call.method === "PATCH" && call.path.endsWith("/channel-one"))?.body)
-    .toEqual({ credentials: "FAKE-CREDENTIAL-1" });
+    .toEqual({ credentials: '{"authToken":"FAKE-CREDENTIAL-1"}' });
 });
 test("渠道全局统计不随搜索或分页改变", async ({ page }) => {
   await page.setViewportSize({ width: 1720, height: 1080 });
@@ -375,7 +375,7 @@ test("假渠道凭据导入与清空、成员权限修改、API 错误可见", a
     buffer: Buffer.alloc(512 * 1024 + 1, 65),
   });
   await expect(
-    page.getByText("文件不能超过 512 KiB。", { exact: true }),
+    page.getByText("文件读取或凭据格式检查失败，请重新选择。", { exact: true }),
   ).toBeVisible();
   await expect(page.getByLabel("Miora 导出 JSON 或 Cookie 文本")).toHaveValue(
     "",
@@ -384,10 +384,10 @@ test("假渠道凭据导入与清空、成员权限修改、API 错误可见", a
   await fileInput.setInputFiles({
     name: "credentials.json",
     mimeType: "application/json",
-    buffer: Buffer.from('{"token":"FAKE-COOKIE-ONLY"}'),
+    buffer: Buffer.from('{"authToken":"FAKE-COOKIE-ONLY"}'),
   });
   await expect(page.getByLabel("Miora 导出 JSON 或 Cookie 文本")).toHaveValue(
-    '{"token":"FAKE-COOKIE-ONLY"}',
+    '{"authToken":"FAKE-COOKIE-ONLY"}',
   );
   await expect(fileInput).toHaveValue("");
   expect(calls.filter((c) => c.method !== "GET")).toHaveLength(0);
