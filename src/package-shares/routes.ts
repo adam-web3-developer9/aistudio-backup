@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { Readable } from 'node:stream';
 import { z } from 'zod';
 import type { SystemRuntime } from '../system/runtime.js';
 import { SystemError } from '../system/types.js';
@@ -27,8 +28,11 @@ const manifestBase = { kind: z.literal('manifest'), requestId, draftId: id, titl
 const manifestBody = z.object({ ...manifestBase, media: z.array(mediaFact) }).strict().superRefine((manifest, ctx) => {
   if (new Set(manifest.media.map(item => `${item.sha256}:${item.size}`)).size !== manifest.media.length) ctx.addIssue({ code: 'custom', message: 'Duplicate media identities' });
 });
-const manifestStageBody = z.object({ ...manifestBase, mediaCount: z.int().nonnegative().max(1_000_000) }).strict();
+const manifestStageBody = z.object({ ...manifestBase, scope: scopeSchema.optional(), scopeTransfer: z.object({ bytes: z.int().positive(), sha256: z.string().regex(/^[a-f0-9]{64}$/), chunks: z.int().positive() }).strict().optional(), mediaCount: z.int().nonnegative(), mediaDigest: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().refine(input => Boolean(input.scope) !== Boolean(input.scopeTransfer), 'Supply scope or scopeTransfer');
 const stageParams = z.object({ shareId: id, stageId: id });
+const paging = (request: FastifyRequest) => z.object({ format: z.literal('manifest-v2').optional(), afterShareId: z.string().default(''), beforeSequence: z.coerce.number().int().positive().default(Number.MAX_SAFE_INTEGER), after: z.coerce.number().int().nonnegative().default(0), limit: z.coerce.number().int().positive().default(200) }).parse(request.query);
+const v2 = (request: FastifyRequest) => paging(request).format === 'manifest-v2';
+const pageLimit = (request: FastifyRequest) => Math.min(paging(request).limit, 500);
 const paramsOf = (request: FastifyRequest) => z.object({ shareId: id, versionId: id.optional(), userId: id.optional(), claimId: id.optional() }).parse(request.params);
 
 export function registerPackageShareRoutes(app: FastifyInstance, options: { runtime: SystemRuntime; enabled?: boolean; clock?: () => number }) {
@@ -44,7 +48,7 @@ export function registerPackageShareRoutes(app: FastifyInstance, options: { runt
     app.route({ method, url: `/api/system/package-shares${url}`, onRequest: async request => runtime.assertRequestOrigin(request),
       handler: async (request, reply) => {
         reply.header('Cache-Control', 'no-store');
-        try { return await run(request); }
+        try { const result = await run(request); return v2(request) ? result : reply.type('application/json').send(Readable.from(store.legacyResponse(result, request.url.split('?')[0]!.endsWith('/download')))); }
         catch (error) {
           if (error instanceof SystemError) return reply.code(error.statusCode).send({ code: error.code, message: error.message });
           if (error instanceof z.ZodError) return reply.code(400).send({ code: 'INVALID_PACKAGE_SHARE_REQUEST', message: '共享包请求格式无效' });
@@ -55,9 +59,9 @@ export function registerPackageShareRoutes(app: FastifyInstance, options: { runt
   };
   route('GET', '/capability', async request => {
     const principal = await runtime.authenticate(request);
-    return { enabled, eligible: principal.cloudEligible };
+    return { enabled, eligible: principal.cloudEligible, ...(v2(request) ? { manifestProtocol: 'manifest-v2' } : {}) };
   });
-  route('GET', '', async request => ({ data: store.list(await actor(request)) }));
+  route('GET', '', async request => { const principal = await actor(request); return v2(request) ? store.listPage(principal, paging(request).afterShareId, pageLimit(request)) : { data: store.list(principal) }; });
   route('POST', '', async request => {
     const principal = await actor(request);
     const share = store.create(principal, z.object({ requestId, draftId: id, title: z.string().min(1) }).strict().parse(request.body));
@@ -67,7 +71,7 @@ export function registerPackageShareRoutes(app: FastifyInstance, options: { runt
   route('GET', '/:shareId', async request => {
     const principal = await actor(request); const { shareId } = paramsOf(request);
     const share = store.access(shareId, principal, false, true);
-    return { ...store.publicShare(share), members: store.members(shareId).map(member => ({ ...member, email: runtime.store.getIdentity(member.userId)?.email ?? '' })), versions: store.versions(shareId) };
+    return { ...store.publicShare(share), members: store.members(shareId).map(member => ({ ...member, email: runtime.store.getIdentity(member.userId)?.email ?? '' })), ...(v2(request) ? store.versionsPage(shareId, paging(request).beforeSequence, pageLimit(request)) : { versions: store.versions(shareId) }) };
   });
   route('POST', '/:shareId/members', async request => {
     const principal = await actor(request); const { shareId } = paramsOf(request);
@@ -134,7 +138,13 @@ export function registerPackageShareRoutes(app: FastifyInstance, options: { runt
   route('POST', '/:shareId/versions/stages', async request => {
     const principal = await actor(request); const { shareId } = paramsOf(request);
     const input = manifestStageBody.parse(request.body);
+    if (v2(request) && !input.mediaDigest) throw new SystemError(400, 'PACKAGE_MEDIA_DIGEST_REQUIRED', '分窗声明需要完整媒体摘要');
     return store.stageManifest(shareId, principal, { ...input, baseVersionId: input.baseVersionId ?? null });
+  });
+  route('POST', '/:shareId/versions/stages/:stageId/scope', async request => {
+    const principal = await actor(request); const { shareId, stageId } = stageParams.parse(request.params);
+    const input = z.object({ offset: z.int().nonnegative(), items: z.array(z.string().min(1)).min(1).max(500) }).strict().parse(request.body);
+    return store.appendScope(shareId, stageId, principal, input.offset, input.items);
   });
   route('POST', '/:shareId/versions/stages/:stageId/media', async request => {
     const principal = await actor(request); const { shareId, stageId } = stageParams.parse(request.params);
@@ -147,10 +157,18 @@ export function registerPackageShareRoutes(app: FastifyInstance, options: { runt
     runtime.store.audit({ actorId: principal.id, action: 'package.version.publish', targetType: 'packageShare', targetId: shareId, metadata: { versionId: version.versionId, sequence: version.sequence } });
     return { version };
   });
+  route('GET', '/:shareId/versions/:versionId/scope', async request => {
+    const principal = await actor(request); const { shareId, versionId } = paramsOf(request);
+    return store.scopePage(shareId, versionId!, principal, paging(request).after, pageLimit(request));
+  });
+  route('GET', '/:shareId/versions/:versionId/media', async request => {
+    const principal = await actor(request); const { shareId, versionId } = paramsOf(request);
+    return store.mediaPage(shareId, versionId!, principal, paging(request).after, pageLimit(request));
+  });
   route('POST', '/:shareId/versions/:versionId/download', async request => {
     const principal = await actor(request); const { shareId, versionId } = paramsOf(request);
     store.access(shareId, principal); const version = store.version(shareId, versionId!);
-    if (version.mediaJson !== undefined) return store.manifestDownload(shareId, versionId!, principal);
+    if (version.isManifest === 1) return store.manifestDownload(shareId, versionId!, principal);
     if (!version.url) throw new SystemError(409, 'PACKAGE_VERSION_REPUBLISH_REQUIRED', '旧私有版本没有公开地址，请重新发布');
     if (!isSafePackageUrl(version.url)) throw new SystemError(409, 'PACKAGE_VERSION_URL_INVALID', '版本地址无效，请重新发布');
     return { ...store.publicVersion(version), url: version.url };
