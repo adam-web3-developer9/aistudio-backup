@@ -28,7 +28,7 @@ import {
   useHiggsfieldMcpProxy
 } from './adapters/higgsfield-mcp.js';
 import { MioraAdapter, mioraJobBudgetMs, mioraMinimumVideoCredits } from './adapters/miora-adapter.js';
-import { mioraTokenCookies, prepareCosHead, prepareCosUpload, readMioraTokens, useMioraProxy, type MioraTokens } from './adapters/miora-api.js';
+import { mioraTokenCookies, prepareCosUpload, readMioraTokens, useMioraProxy, type MioraTokens } from './adapters/miora-api.js';
 import { MioraClient } from './adapters/miora-client.js';
 import { transferPublicMediaToMioraCos } from './adapters/miora-cos-transfer.js';
 import {
@@ -1096,7 +1096,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
       if (item.status !== 'upload_required') { items.push(publicItem); continue; }
       const grant = await client.getCosGrant();
       const upload = prepareCosUpload(grant, uploadFileName({ sha256:item.sha256,size:item.size,mimeType:item.mime_type,kind:item.kind }), item.mime_type, item.size);
-      if (upload.key !== item.cos_key) throw new SystemError(409, 'UPLOAD_INTENT_PREFIX_CHANGED', 'Miora upload prefix changed');
+      uploadIntents!.assignUploadKey(id, item.idx, upload.key);
       items.push({ ...publicItem, upload: { method: 'PUT', url: upload.url, headers: upload.headers, expiresAt: upload.expiresAt } });
     }
     return { ...description, items };
@@ -1121,8 +1121,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
             const key = await transferPublicMediaToMioraCos({ client, sourceUrl:item.source_url!, allowedHosts:config.mioraPublicMediaHosts,
               fileName:uploadFileName({sha256:item.sha256,size:item.size,mimeType:item.mime_type,kind:item.kind}),
               mimeType:item.mime_type,size:item.size,sha256:item.sha256 });
-            if (key !== item.cos_key) throw new Error('Miora upload prefix changed during public-media transfer');
-            uploadIntents!.importReady(id, item.idx);
+            uploadIntents!.importReady(id, item.idx, key);
           } catch (error) {
             app.log.warn({ err:error, uploadIntentId:id, index:item.idx }, 'Public media transfer failed');
             uploadIntents!.importFailed(id, item.idx, error);
@@ -1149,10 +1148,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     for (const [index, asset] of parsed.data.assets.entries()) {
       const cached = uploadIntents.cached(session.id, asset);
       if (cached) { prepared.push({ ...asset, index, cosKey: cached, status: 'ready' }); continue; }
-      const grant = await client.getCosGrant();
-      const upload = prepareCosUpload(grant, uploadFileName(asset), asset.mimeType, asset.size);
-      prepared.push({ ...asset, index, cosKey: upload.key, status: asset.publicUrl ? 'importing' : 'upload_required',
-        ...(!asset.publicUrl ? { upload: { method: 'PUT' as const, url: upload.url, headers: upload.headers, expiresAt: upload.expiresAt } } : {}) });
+      prepared.push({ ...asset, index, cosKey: '', status: asset.publicUrl ? 'importing' : 'upload_required' });
     }
     const created = uploadIntents.createOrGet(parsed.data.idempotencyKey, session.id, prepared);
     if (!created.created) uploadIntents.resume(created.id, parsed.data.assets);
@@ -1172,17 +1168,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
     const params = idParamsSchema.safeParse(request.params); const body = completeUploadIntentSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send(validationError(params, body));
-    const direct = uploadIntents.directUploadItems(params.data.id, body.data.indexes);
-    const session = await sessions.get(direct.accountId); const tokens = session && readMioraTokens(session.cookies);
-    if (!tokens) throw new SystemError(409, 'UPLOAD_INTENT_ACCOUNT_UNAVAILABLE', 'Upload intent account is unavailable');
-    const client = new MioraClient(tokens, persistMioraClientRenewal);
-    for (const item of direct.items) {
-      const grant = await client.getCosGrant(); const head = prepareCosHead(grant, item.cos_key);
-      const response = await fetch(head.url, { method:'HEAD', headers:head.headers });
-      if (!response.ok || Number(response.headers.get('content-length')) !== item.size) {
-        throw new SystemError(409, 'UPLOAD_OBJECT_NOT_VERIFIED', `Uploaded object ${item.idx} is unavailable or has the wrong size`);
-      }
-    }
+    uploadIntents.directUploadItems(params.data.id, body.data.indexes);
     uploadIntents.complete(params.data.id, body.data.indexes);
     return reply.send(uploadIntents.describe(params.data.id));
   });

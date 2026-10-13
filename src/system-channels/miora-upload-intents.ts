@@ -131,6 +131,14 @@ export class MioraUploadIntentStore {
     return { accountId: intent.account_id, items: items.filter(item => item.status === 'upload_required') };
   }
 
+  assignUploadKey(id: string, index: number, key: string): void {
+    this.active(id);
+    const item = this.item(id, index);
+    if (item.status !== 'upload_required') throw new SystemError(409, 'UPLOAD_ITEM_NOT_SIGNABLE', `Upload item ${index} is not awaiting a direct upload`);
+    this.db.prepare('UPDATE video_gateway_upload_items SET cos_key=? WHERE intent_id=? AND idx=?')
+      .run(key, id, index);
+  }
+
   complete(id: string, indexes: number[]): void {
     const intent = this.active(id);
     this.db.transaction(() => {
@@ -143,11 +151,12 @@ export class MioraUploadIntentStore {
     })();
   }
 
-  importReady(id: string, index: number): void {
+  importReady(id: string, index: number, key: string): void {
     const intent = this.active(id); const item = this.item(id, index);
     if (item.status === 'ready') return;
     if (item.status !== 'importing') throw new SystemError(409, 'UPLOAD_ITEM_NOT_IMPORTING', `Upload item ${index} is not being imported`);
-    this.ready(intent.account_id, item, true);
+    this.db.prepare('UPDATE video_gateway_upload_items SET cos_key=? WHERE intent_id=? AND idx=?').run(key, id, index);
+    this.ready(intent.account_id, { ...item, cos_key: key }, true);
   }
 
   importFailed(id: string, index: number, error: unknown): void {

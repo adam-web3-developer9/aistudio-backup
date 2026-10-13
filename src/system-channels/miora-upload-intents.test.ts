@@ -9,12 +9,13 @@ describe('Miora upload intents', () => {
     const db = new Database(':memory:');
     const store = new MioraUploadIntentStore(db, 'x'.repeat(32));
     const id = store.create('task:attempt:manifest', 'account-a', [{ ...asset, index: 0, cosKey: 'prefix/a.png', status: 'upload_required' }]);
+    store.assignUploadKey(id, 0, 'rotated-prefix/a.png');
     store.complete(id, [0]);
     // A client PUT is existence/size checked by the route, but its content hash is not independently proven.
     expect(store.cached('account-a', asset)).toBeUndefined();
     expect(store.cached('account-b', asset)).toBeUndefined();
     expect(store.consume(id, 'job_gateway_one')).toMatchObject({ accountId: 'account-a', jobId: 'job_gateway_one' });
-    expect(store.consume(id, 'job_gateway_one').references).toEqual([{ key: 'prefix/a.png', kind: 'image' }]);
+    expect(store.consume(id, 'job_gateway_one').references).toEqual([{ key: 'rotated-prefix/a.png', kind: 'image' }]);
     expect(() => store.consume(id, 'job_gateway_two')).toThrow(/already consumed/i);
   });
 
