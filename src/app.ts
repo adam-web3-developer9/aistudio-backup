@@ -60,6 +60,7 @@ import { JobRunner } from './jobs/job-runner.js';
 import { createJobSchema, putSessionSchema } from './schemas.js';
 import type { BrowserAdapter } from './adapters/adapter.js';
 import type { CreditBalance, JobStatus, ProviderAccount, SessionRecord } from './types.js';
+import { readMioraRequestJson } from './system-channels/miora-request-json.js';
 import { MioraUploadIntentStore, type UploadIntentAssetInput } from './system-channels/miora-upload-intents.js';
 
 const idParamsSchema = z.object({ id: z.string().min(1).max(200) });
@@ -1110,11 +1111,19 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     return candidates;
   }
 
+  function renewActiveUploadIntent(id:string):void {
+    const plan = uploadIntents!.page(id, 0, 1);
+    if (plan.consumedJobId) return;
+    const account = options.managedChannels!.row(plan.accountId);
+    if (!account?.enabled || account.archived_at) throw new SystemError(409, 'UPLOAD_INTENT_ACCOUNT_UNAVAILABLE', 'Upload intent account is unavailable');
+    uploadIntents!.renewActive(id);
+  }
+
   async function signedPendingItems(id: string, window?: {offset:number;limit:number}) {
     return withMioraDiagnostics(mioraDiagnosticSink, { uploadIntentId:id }, () => signedPendingItemsInContext(id, window));
   }
   async function signedPendingItemsInContext(id: string, window?: {offset:number;limit:number}) {
-    if (window) uploadIntents!.renewStaged(id);
+    if (window) renewActiveUploadIntent(id);
     const description = window ? uploadIntents!.describePage(id, window.offset, window.limit) : uploadIntents!.describe(id);
     const describedItems = new Map(description.items.map(item => [item.index, item]));
     const plan = window ? uploadIntents!.page(id, window.offset, window.limit) : uploadIntents!.plan(id);
@@ -1149,12 +1158,12 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
       let offset = 0;
       for (;;) {
       const page = uploadIntents!.pendingImportPage(id, offset, 100);
-      if (!page.length) break;
+      if (!page.length || mioraTransfers.signal.aborted) break;
       offset = page[page.length - 1]!.idx + 1;
       const pending = page.filter(item => item.source_url);
       let cursor = 0;
       await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
-        while (cursor < pending.length) {
+        while (cursor < pending.length && !mioraTransfers.signal.aborted) {
           const item = pending[cursor++]!;
           await withMioraDiagnostics(mioraDiagnosticSink, { itemIndex:item.idx }, async () => {
           try {
@@ -1162,7 +1171,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
               identity:`${item.sha256}:${item.size}:${item.mime_type}:${item.kind}`,
               run:() => transferPublicMediaToMioraCos({ client, sourceUrl:item.source_url!, allowedHosts:config.mioraPublicMediaHosts,
                 fileName:uploadFileName({sha256:item.sha256,size:item.size,mimeType:item.mime_type,kind:item.kind}),
-                mimeType:item.mime_type,size:item.size,sha256:item.sha256 }) });
+                mimeType:item.mime_type,size:item.size,sha256:item.sha256,signal:mioraTransfers.signal }) });
             uploadIntents!.importReady(id, item.idx, key);
           } catch (error) {
             const failure = describeMioraTransferFailure(error);
@@ -1173,30 +1182,22 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
         }
       }));
       }
-    }).catch(error => app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed'))
+    }).catch(error => {
+      app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed');
+      const failure = error instanceof SystemError && error.code === 'UPLOAD_INTENT_ACCOUNT_UNAVAILABLE'
+        ? {code:error.code,stage:'cos_grant' as const,retryable:false} : describeMioraTransferFailure(error);
+      try {
+        for (;;) {
+          const pending=uploadIntents!.pendingImportPage(id,0,100);
+          if(!pending.length)break;
+          for(const item of pending)uploadIntents!.importFailed(id,item.idx,failure);
+        }
+      } catch(stateError) {app.log.warn({err:stateError,uploadIntentId:id},'Upload intent preparation failure could not be recorded');}
+    })
       .finally(() => importRuns.delete(id));
     importRuns.set(id, run);
   }
 
-  app.post('/v1/upload-intents/staged', async (request, reply) => {
-    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
-    const parsed = stagedUploadIntentSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
-    const existing = uploadIntents.findByIdempotencyKey(parsed.data.idempotencyKey);
-    const candidates = existing ? [] : await intentAccounts();
-    const estimate = mioraEstimatedVideoCredits(parsed.data.options, { model:config.mioraVideo.model, durationSeconds:MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS });
-    try {
-      const created = uploadIntents.createStaged(parsed.data.idempotencyKey,
-        candidates.map(account => ({ accountId:account.sessionId, credits:account.availableCredits ?? account.credits, activeJobs:account.activeJobs })),
-        estimate, parsed.data.options, parsed.data.assetCount);
-      return reply.code(created.created ? 201 : 200).send(uploadIntents.summary(created.id));
-    } catch (error) {
-      if (error instanceof SystemError && ['INSUFFICIENT_CREDITS','ACCOUNT_BALANCE_UNAVAILABLE'].includes(error.code)) {
-        return reply.code(error.statusCode).send({ error:{ code:error.code, scope:error.code === 'INSUFFICIENT_CREDITS' ? 'pool' : 'task', retryable:error.code === 'ACCOUNT_BALANCE_UNAVAILABLE', message:error.message } });
-      }
-      throw error;
-    }
-  });
   app.put('/v1/upload-intents/:id/manifest', { bodyLimit:1024 * 1024 }, async (request, reply) => {
     if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
     const params = idParamsSchema.safeParse(request.params); const body = manifestWindowSchema.safeParse(request.body);
@@ -1247,7 +1248,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send(zodError(params.error));
-    uploadIntents.renewStaged(params.data.id);
+    renewActiveUploadIntent(params.data.id);
     resumePublicImports(params.data.id);
     return reply.send(uploadIntents.summary(params.data.id));
   });
@@ -1258,54 +1259,11 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     return reply.send(await signedPendingItems(params.data.id, query.data));
   });
 
-  app.post('/v1/upload-intents', async (request, reply) => {
-    if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
-    const parsed = uploadIntentSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
-    const existing = uploadIntents.findByIdempotencyKey(parsed.data.idempotencyKey);
-    if (existing) {
-      uploadIntents.resume(existing, parsed.data.assets);
-      resumePublicImports(existing);
-      return reply.send(await signedPendingItems(existing));
-    }
-    const estimate = mioraEstimatedVideoCredits(parsed.data.options, {
-      model: config.mioraVideo.model,
-      durationSeconds: MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS
-    });
-    const candidates = await intentAccounts();
-    let created: ReturnType<MioraUploadIntentStore['createReserved']>;
-    try {
-      created = uploadIntents.createReserved(
-        parsed.data.idempotencyKey,
-        candidates.map(account => ({
-          accountId: account.sessionId,
-          credits: account.availableCredits ?? account.credits,
-          activeJobs: account.activeJobs
-        })),
-        estimate,
-        parsed.data.options,
-        parsed.data.assets
-      );
-    } catch (error) {
-      if (error instanceof SystemError && (error.code === 'INSUFFICIENT_CREDITS' || error.code === 'ACCOUNT_BALANCE_UNAVAILABLE')) {
-        return reply.code(error.statusCode).send({ error: {
-          code: error.code,
-          scope: error.code === 'INSUFFICIENT_CREDITS' ? 'pool' : 'task',
-          retryable: error.code === 'ACCOUNT_BALANCE_UNAVAILABLE',
-          message: error.message
-        } });
-      }
-      throw error;
-    }
-    if (!created.created) uploadIntents.resume(created.id, parsed.data.assets);
-    resumePublicImports(created.id);
-    return reply.code(created.created ? 201 : 200).send(await signedPendingItems(created.id));
-  });
-
   app.get('/v1/upload-intents/:id', async (request, reply) => {
     if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send(zodError(params.error));
+    renewActiveUploadIntent(params.data.id);
     resumePublicImports(params.data.id);
     return reply.send(uploadIntents.describe(params.data.id));
   });
@@ -1421,134 +1379,6 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     };
   });
 
-  app.post('/v1/jobs', async (request, reply) => {
-    const parsed = createJobSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
-
-    const requestedSessionId = 'sessionId' in parsed.data ? parsed.data.sessionId : undefined;
-    const requestedAssetId = 'assetId' in parsed.data ? parsed.data.assetId : '';
-    const requestedAdditionalAssetIds = 'assetIds' in parsed.data ? parsed.data.assetIds ?? [] : [];
-    if (gateway && (parsed.data.adapterId !== 'miora-v1' || requestedSessionId !== undefined)) {
-      return reply.code(400).send(errorBody('GATEWAY_INPUT_INVALID', 'The video gateway accepts Miora jobs and selects enabled managed accounts automatically'));
-    }
-
-    const adapter = adapters.get(parsed.data.adapterId);
-    if (!adapter) {
-      return reply.code(400).send(errorBody('ADAPTER_NOT_FOUND', 'Unknown adapter'));
-    }
-    // Kept whole: the adapter decides how many its provider takes.
-    const uploadIntentId = 'uploadIntentId' in parsed.data ? parsed.data.uploadIntentId : undefined;
-    const requestedAssetIds = uploadIntentId ? [] : Array.from(new Set([
-      requestedAssetId,
-      ...requestedAdditionalAssetIds
-    ]));
-    const missingAssetId = requestedAssetIds.find((assetId) => !assets.get(assetId) || gateway && !gateway.hasAsset(assetId));
-    if (missingAssetId !== undefined) {
-      return reply.code(400).send(errorBody('ASSET_NOT_FOUND', `Unknown asset: ${missingAssetId}`));
-    }
-
-    // Fail fast rather than queueing work no account can pay for.
-    let gatewaySessionId: string | undefined;
-    let preparedReferences: Array<{key:string;kind:'image'|'video'|'audio'}> | undefined;
-    let durableGatewayJobId: string | undefined;
-    if (uploadIntentId) {
-      if (!uploadIntents || !gateway) return reply.code(400).send(errorBody('UPLOAD_INTENTS_UNAVAILABLE', 'Upload intents are unavailable'));
-      durableGatewayJobId = `${gatewayJobIdPrefix}${uploadIntentId}`;
-      const prepared = uploadIntents.readyForJob(uploadIntentId, durableGatewayJobId);
-      gatewaySessionId = prepared.accountId;
-      preparedReferences = prepared.references;
-      const existing = jobs.get(prepared.jobId);
-      if (prepared.consumed) {
-        if (!existing) return reply.code(410).send(errorBody('JOB_RESULT_EXPIRED', 'This upload intent was already submitted and its retained job result has expired'));
-        await jobs.flushOrThrow(existing.id); gateway.ownJob(existing.id);
-        if (existing.status === 'queued') runner.submit(existing);
-        return reply.code(202).send({ jobId: existing.id, status: existing.status, statusUrl: `/v1/jobs/${existing.id}` });
-      }
-      const estimatedCredits = mioraEstimatedVideoCredits(parsed.data.options, {
-        model: config.mioraVideo.model,
-        durationSeconds: config.mioraVideo.duration
-      });
-      if (estimatedCredits !== undefined) {
-        const candidates = (await accountPool.snapshot({ loadCredits: true, adapterId: 'miora-v1' }))
-          .filter(account => {
-            const row = options.managedChannels!.row(account.sessionId);
-            return !!row?.enabled && !row.archived_at && !account.exhausted;
-          });
-        const pinned = candidates.find(account => account.sessionId === gatewaySessionId);
-        const pinnedCredits = pinned?.availableCredits ?? pinned?.credits;
-        if (pinnedCredits === undefined) return reply.code(503).send({ error: {
-          code:'ACCOUNT_BALANCE_UNAVAILABLE', scope:'task', retryable:true,
-          message:'The upload intent account balance could not be confirmed'
-        } });
-        const pinnedAvailable = pinnedCredits - uploadIntents.reservedCredits(gatewaySessionId, uploadIntentId);
-        if (pinnedAvailable < estimatedCredits) {
-          const poolCanPay = candidates.some(account => {
-            const credits = account.availableCredits ?? account.credits;
-            return credits !== undefined
-              && credits - uploadIntents.reservedCredits(account.sessionId, uploadIntentId) >= estimatedCredits;
-          });
-          const poolUnknown = candidates.some(account => (account.availableCredits ?? account.credits) === undefined);
-          if (!poolCanPay && poolUnknown) return reply.code(503).send({ error: {
-            code:'ACCOUNT_BALANCE_UNAVAILABLE', scope:'task', retryable:true,
-            message:'The Miora account pool balance could not be confirmed'
-          } });
-          return reply.code(409).send({ error: {
-            code: poolCanPay ? 'ACCOUNT_INSUFFICIENT_CREDITS' : 'INSUFFICIENT_CREDITS',
-            scope: poolCanPay ? 'account' : 'pool',
-            retryable: poolCanPay,
-            message: poolCanPay
-              ? 'The upload intent account cannot pay for this job; create a new upload intent with the job options'
-              : 'No enabled account has enough credits for this job'
-          } });
-        }
-      }
-    }
-    if (adapter.runWithoutBrowser || requestedSessionId) {
-      const candidates = (await accountPool.snapshot({ adapterId: parsed.data.adapterId }))
-        .filter((a) => !(requestedSessionId || gatewaySessionId) || a.sessionId === (requestedSessionId || gatewaySessionId))
-        .filter((a) => {
-          if (!gateway) return true;
-          const account = options.managedChannels!.row(a.sessionId);
-          return !!account?.enabled && !account.archived_at;
-        });
-
-      if (!candidates.length) {
-        return reply.code(400).send(errorBody(
-          'NO_ACCOUNTS_AVAILABLE',
-          requestedSessionId
-            ? `Session ${requestedSessionId} is not a usable ${parsed.data.adapterId} account`
-            : `No ${parsed.data.adapterId} account is configured`
-        ));
-      }
-      if (candidates.every((a) => a.exhausted)) {
-        return reply.code(409).send({
-          error: {
-            code: 'INSUFFICIENT_CREDITS',
-            message: 'Every account is out of credits',
-            ...(gateway ? {} : { accounts: candidates })
-          }
-        });
-      }
-      if (gateway && !gatewaySessionId) gatewaySessionId = candidates.filter(account => !account.exhausted)
-        .sort((left, right) => accountPool.activeJobs(left.sessionId) - accountPool.activeJobs(right.sessionId))[0]!.sessionId;
-    }
-
-    const jobInput = { ...parsed.data, assetId: uploadIntentId ? '' : requestedAssetId, assetIds: requestedAssetIds,
-      ...(preparedReferences ? { preparedReferences } : {}), ...(gatewaySessionId ? { sessionId: gatewaySessionId } : {}) };
-    const job = jobs.create(jobInput, gateway ? durableGatewayJobId ?? `${gatewayJobIdPrefix}${randomUUID()}` : undefined);
-    if (gateway) {
-      await jobs.flushOrThrow(job.id);
-      gateway.ownJob(job.id);
-      if (uploadIntentId) uploadIntents!.consume(uploadIntentId, job.id);
-    }
-    runner.submit(job);
-    return reply.code(202).send({
-      jobId: job.id,
-      status: job.status,
-      statusUrl: `/v1/jobs/${job.id}`
-    });
-  });
-
   app.get('/v1/jobs/:id', async (request, reply) => {
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send(zodError(params.error));
@@ -1571,8 +1401,218 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     return reply.send({ total: all.length, jobs: all.slice(0, query.data.limit).map(job => gateway ? projectGatewayJob(job) : job) });
   });
 
+  // Existing routes/wire shape; only Miora input boundaries gain token streaming.
+  await app.register(async mioraRequests => {
+    mioraRequests.removeContentTypeParser('application/json');
+    mioraRequests.addContentTypeParser('application/json', (request, payload, done) => {
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      request.raw.once('aborted', abort);
+      void readMioraRequestJson(payload, { signal:controller.signal }).then(parsed => {
+        const value = parsed.value as { adapterId?:unknown } | null;
+        if (request.url.split('?')[0] === '/v1/jobs' && value?.adapterId !== 'miora-v1' && parsed.bytes > 2 * 1024 * 1024) {
+          done(new SystemError(413, 'FST_ERR_CTP_BODY_TOO_LARGE', 'Request body is too large'));
+        } else done(null, parsed.value);
+      }, error => done(error)).finally(() => request.raw.removeListener('aborted', abort));
+    });
+
+    mioraRequests.post('/v1/upload-intents/staged', async (request, reply) => {
+      if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+      const parsed = stagedUploadIntentSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
+      const existing = uploadIntents.findByIdempotencyKey(parsed.data.idempotencyKey);
+      const candidates = existing ? [] : await intentAccounts();
+      const estimate = mioraEstimatedVideoCredits(parsed.data.options, { model:config.mioraVideo.model, durationSeconds:MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS });
+      try {
+        const created = uploadIntents.createStaged(parsed.data.idempotencyKey,
+          candidates.map(account => ({ accountId:account.sessionId, credits:account.availableCredits ?? account.credits, activeJobs:account.activeJobs })),
+          estimate, parsed.data.options, parsed.data.assetCount);
+        return reply.code(created.created ? 201 : 200).send(uploadIntents.summary(created.id));
+      } catch (error) {
+        if (error instanceof SystemError && ['INSUFFICIENT_CREDITS','ACCOUNT_BALANCE_UNAVAILABLE'].includes(error.code)) {
+          return reply.code(error.statusCode).send({ error:{ code:error.code, scope:error.code === 'INSUFFICIENT_CREDITS' ? 'pool' : 'task', retryable:error.code === 'ACCOUNT_BALANCE_UNAVAILABLE', message:error.message } });
+        }
+        throw error;
+      }
+    });
+
+    mioraRequests.post('/v1/upload-intents', async (request, reply) => {
+      if (!uploadIntents) return reply.code(404).send(errorBody('LEGACY_API_DISABLED', 'Video upload intents are disabled'));
+      const parsed = uploadIntentSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
+      const existing = uploadIntents.findByIdempotencyKey(parsed.data.idempotencyKey);
+      if (existing) {
+        uploadIntents.resume(existing, parsed.data.assets);
+        resumePublicImports(existing);
+        return reply.send(await signedPendingItems(existing));
+      }
+      const estimate = mioraEstimatedVideoCredits(parsed.data.options, {
+        model: config.mioraVideo.model,
+        durationSeconds: MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS
+      });
+      const candidates = await intentAccounts();
+      let created: ReturnType<MioraUploadIntentStore['createReserved']>;
+      try {
+        created = uploadIntents.createReserved(
+          parsed.data.idempotencyKey,
+          candidates.map(account => ({
+            accountId: account.sessionId,
+            credits: account.availableCredits ?? account.credits,
+            activeJobs: account.activeJobs
+          })),
+          estimate,
+          parsed.data.options,
+          parsed.data.assets
+        );
+      } catch (error) {
+        if (error instanceof SystemError && (error.code === 'INSUFFICIENT_CREDITS' || error.code === 'ACCOUNT_BALANCE_UNAVAILABLE')) {
+          return reply.code(error.statusCode).send({ error: {
+            code: error.code,
+            scope: error.code === 'INSUFFICIENT_CREDITS' ? 'pool' : 'task',
+            retryable: error.code === 'ACCOUNT_BALANCE_UNAVAILABLE',
+            message: error.message
+          } });
+        }
+        throw error;
+      }
+      if (!created.created) uploadIntents.resume(created.id, parsed.data.assets);
+      resumePublicImports(created.id);
+      return reply.code(created.created ? 201 : 200).send(await signedPendingItems(created.id));
+    });
+
+    mioraRequests.post('/v1/jobs', async (request, reply) => {
+      const parsed = createJobSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
+
+      const requestedSessionId = 'sessionId' in parsed.data ? parsed.data.sessionId : undefined;
+      const requestedAssetId = 'assetId' in parsed.data ? parsed.data.assetId : '';
+      const requestedAdditionalAssetIds = 'assetIds' in parsed.data ? parsed.data.assetIds ?? [] : [];
+      if (gateway && (parsed.data.adapterId !== 'miora-v1' || requestedSessionId !== undefined)) {
+        return reply.code(400).send(errorBody('GATEWAY_INPUT_INVALID', 'The video gateway accepts Miora jobs and selects enabled managed accounts automatically'));
+      }
+
+      const adapter = adapters.get(parsed.data.adapterId);
+      if (!adapter) {
+        return reply.code(400).send(errorBody('ADAPTER_NOT_FOUND', 'Unknown adapter'));
+      }
+      // Kept whole: the adapter decides how many its provider takes.
+      const uploadIntentId = 'uploadIntentId' in parsed.data ? parsed.data.uploadIntentId : undefined;
+      const requestedAssetIds = uploadIntentId ? [] : Array.from(new Set([
+        requestedAssetId,
+        ...requestedAdditionalAssetIds
+      ]));
+      const missingAssetId = requestedAssetIds.find((assetId) => !assets.get(assetId) || gateway && !gateway.hasAsset(assetId));
+      if (missingAssetId !== undefined) {
+        return reply.code(400).send(errorBody('ASSET_NOT_FOUND', `Unknown asset: ${missingAssetId}`));
+      }
+
+      // Fail fast rather than queueing work no account can pay for.
+      let gatewaySessionId: string | undefined;
+      let preparedReferences: Array<{key:string;kind:'image'|'video'|'audio'}> | undefined;
+      let durableGatewayJobId: string | undefined;
+      if (uploadIntentId) {
+        if (!uploadIntents || !gateway) return reply.code(400).send(errorBody('UPLOAD_INTENTS_UNAVAILABLE', 'Upload intents are unavailable'));
+        durableGatewayJobId = `${gatewayJobIdPrefix}${uploadIntentId}`;
+        const prepared = uploadIntents.readyForJob(uploadIntentId, durableGatewayJobId);
+        gatewaySessionId = prepared.accountId;
+        preparedReferences = prepared.references;
+        const existing = jobs.get(prepared.jobId);
+        if (prepared.consumed) {
+          if (!existing) return reply.code(410).send(errorBody('JOB_RESULT_EXPIRED', 'This upload intent was already submitted and its retained job result has expired'));
+          await jobs.flushOrThrow(existing.id); gateway.ownJob(existing.id);
+          if (existing.status === 'queued') runner.submit(existing);
+          return reply.code(202).send({ jobId: existing.id, status: existing.status, statusUrl: `/v1/jobs/${existing.id}` });
+        }
+        const estimatedCredits = mioraEstimatedVideoCredits(parsed.data.options, {
+          model: config.mioraVideo.model,
+          durationSeconds: config.mioraVideo.duration
+        });
+        if (estimatedCredits !== undefined) {
+          const candidates = (await accountPool.snapshot({ loadCredits: true, adapterId: 'miora-v1' }))
+            .filter(account => {
+              const row = options.managedChannels!.row(account.sessionId);
+              return !!row?.enabled && !row.archived_at && !account.exhausted;
+            });
+          const pinned = candidates.find(account => account.sessionId === gatewaySessionId);
+          const pinnedCredits = pinned?.availableCredits ?? pinned?.credits;
+          if (pinnedCredits === undefined) return reply.code(503).send({ error: {
+            code:'ACCOUNT_BALANCE_UNAVAILABLE', scope:'task', retryable:true,
+            message:'The upload intent account balance could not be confirmed'
+          } });
+          const pinnedAvailable = pinnedCredits - uploadIntents.reservedCredits(gatewaySessionId, uploadIntentId);
+          if (pinnedAvailable < estimatedCredits) {
+            const poolCanPay = candidates.some(account => {
+              const credits = account.availableCredits ?? account.credits;
+              return credits !== undefined
+                && credits - uploadIntents.reservedCredits(account.sessionId, uploadIntentId) >= estimatedCredits;
+            });
+            const poolUnknown = candidates.some(account => (account.availableCredits ?? account.credits) === undefined);
+            if (!poolCanPay && poolUnknown) return reply.code(503).send({ error: {
+              code:'ACCOUNT_BALANCE_UNAVAILABLE', scope:'task', retryable:true,
+              message:'The Miora account pool balance could not be confirmed'
+            } });
+            return reply.code(409).send({ error: {
+              code: poolCanPay ? 'ACCOUNT_INSUFFICIENT_CREDITS' : 'INSUFFICIENT_CREDITS',
+              scope: poolCanPay ? 'account' : 'pool',
+              retryable: poolCanPay,
+              message: poolCanPay
+                ? 'The upload intent account cannot pay for this job; create a new upload intent with the job options'
+                : 'No enabled account has enough credits for this job'
+            } });
+          }
+        }
+      }
+      if (adapter.runWithoutBrowser || requestedSessionId) {
+        const candidates = (await accountPool.snapshot({ adapterId: parsed.data.adapterId }))
+          .filter((a) => !(requestedSessionId || gatewaySessionId) || a.sessionId === (requestedSessionId || gatewaySessionId))
+          .filter((a) => {
+            if (!gateway) return true;
+            const account = options.managedChannels!.row(a.sessionId);
+            return !!account?.enabled && !account.archived_at;
+          });
+
+        if (!candidates.length) {
+          return reply.code(400).send(errorBody(
+            'NO_ACCOUNTS_AVAILABLE',
+            requestedSessionId
+              ? `Session ${requestedSessionId} is not a usable ${parsed.data.adapterId} account`
+              : `No ${parsed.data.adapterId} account is configured`
+          ));
+        }
+        if (candidates.every((a) => a.exhausted)) {
+          return reply.code(409).send({
+            error: {
+              code: 'INSUFFICIENT_CREDITS',
+              message: 'Every account is out of credits',
+              ...(gateway ? {} : { accounts: candidates })
+            }
+          });
+        }
+        if (gateway && !gatewaySessionId) gatewaySessionId = candidates.filter(account => !account.exhausted)
+          .sort((left, right) => accountPool.activeJobs(left.sessionId) - accountPool.activeJobs(right.sessionId))[0]!.sessionId;
+      }
+
+      const jobInput = { ...parsed.data, assetId: uploadIntentId ? '' : requestedAssetId, assetIds: requestedAssetIds,
+        ...(preparedReferences ? { preparedReferences } : {}), ...(gatewaySessionId ? { sessionId: gatewaySessionId } : {}) };
+      const job = jobs.create(jobInput, gateway ? durableGatewayJobId ?? `${gatewayJobIdPrefix}${randomUUID()}` : undefined);
+      if (gateway) {
+        await jobs.flushOrThrow(job.id);
+        gateway.ownJob(job.id);
+        if (uploadIntentId) uploadIntents!.consume(uploadIntentId, job.id);
+      }
+      runner.submit(job);
+      return reply.code(202).send({
+        jobId: job.id,
+        status: job.status,
+        statusUrl: `/v1/jobs/${job.id}`
+      });
+    });
+  });
+
   app.addHook('onClose', async () => {
     try {
+    mioraTransfers.close();
+    await Promise.allSettled(importRuns.values());
     tokenWatcher.stop();
     dreamMakerWatcher.stop();
     higgsfieldWatcher.stop();

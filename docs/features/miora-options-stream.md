@@ -1,0 +1,15 @@
+# Miora request JSON streaming (2026-10-13)
+
+The user authorized closing the remaining generation/options request omission on a new branch. Responsibility remains architecture 8.7/8.8/8.13–8.15. Fastify's inherited 2 MiB raw JSON parser currently rejects otherwise valid Miora generation and normal/staged intent options before their existing schemas run.
+
+Keep original paths, JSON shape, authentication, validation, responses and idempotency. A scoped parser for POST `/v1/jobs`, `/v1/upload-intents` and `/v1/upload-intents/staged` uses the installed stream-json tokenizer with packing disabled. It constructs only the request object and the current scalar from bounded input chunks; it retains no whole raw Buffer/string or duplicate serialized envelope. Dynamic process/heap resource admission and native string capacity protect actual allocation. JSON last-key-wins, exact numbers, UTF-8, syntax and own `__proto__` semantics stay explicit. Non-Miora jobs retain their previous inline byte budget. All other routes retain their current parser.
+
+Shared gateway authentication runs before request reading. Partial/disconnected requests and inactivity stop parsing, do not create an intent or enqueue a job, and release parser resources. Resource failure reports a safe 507 code. The client can send chunked `application/json` through its existing network boundary without a new protocol.
+
+Long-running active preparations also need lease continuity: owned inline GET and staged status heartbeats renew the existing intent/reservation only while the pinned managed account remains enabled and unarchived. Consumed intents never renew; the pure diagnostics endpoint never mutates. The actual ten-minute COS signature lifetime is unchanged.
+
+Targeted acceptance uses real loopback HTTP >2 MiB valid generation options and staged options with a disabled runner/fake provider, repeats to prove idempotency, plus unauthorized/invalid input, low-memory and cancellation at parser boundaries. No deployment, Actions, production configuration, real media uploads or paid calls. Current COS public transfer has caller cancellation and native network timeouts but no explicit read/PUT inactivity watchdog; this module does not claim to add one.
+
+The separately verified same-day `miora-transfer-idle.md` follow-up adds that transport inactivity watchdog and explicit preparation-bootstrap failures, allowing the paired client to remove its aggregate import-wait deadline.
+
+The repository's gateway nginx example streams bodies with `client_max_body_size 0`, which disables the body-size check according to the [nginx directive documentation](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size). Its existing read/send inactivity timers remain. Repository changes do not replace live nginx configuration or deploy the new Node parser; operators must explicitly apply the updated example in a separately authorized deployment. Production acceptance is not implied by loopback HTTP tests.

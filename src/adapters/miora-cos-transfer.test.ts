@@ -202,3 +202,70 @@ test('Miora caller cancellation cannot be mistaken for a retryable TypeError or 
     expect(vi.mocked(fetch).mock.calls.length - before).toBe(1);
   } finally { vi.restoreAllMocks(); }
 });
+
+const idleBytes=Buffer.from('abcd');
+const idleInput=()=>({client:{getCosGrant:vi.fn(async()=>({prefix:'prefix',bucket:'bucket',region:'ap-test',token:'token',secret_id:'id',secret_key:'key'}))} as unknown as MioraClient,
+  sourceUrl:'https://source.invalid/idle',allowedHosts:['source.invalid'],fileName:'idle.png',mimeType:'image/png',size:idleBytes.length,
+  sha256:createHash('sha256').update(idleBytes).digest('hex'),idleTimeoutMs:25,retryDelaysMs:[] as number[]});
+const pendingFetch=(signal?:AbortSignal)=>new Promise<never>((_resolve,reject)=>{if(signal?.aborted)reject(signal.reason);else signal?.addEventListener('abort',()=>reject(signal.reason),{once:true});});
+
+test.each(['headers','reader','put'] as const)('Miora %s stall has a transient typed idle failure and releases readers',async mode=>{
+  vi.mocked(fetch).mockClear();let returned=false;
+  const body=mode==='reader'?{[Symbol.asyncIterator]:()=>({next:()=>new Promise<IteratorResult<Uint8Array>>(()=>{}),return:async()=>{returned=true;return {done:true as const,value:undefined};}})}:(async function*(){yield idleBytes;})();
+  vi.mocked(fetch).mockImplementation(async(address,options)=>{
+    if(String(address).startsWith('https://source.invalid/')) {
+      if(mode==='headers')return pendingFetch(options?.signal ?? undefined);
+      return {ok:true,status:200,headers:new Headers({'content-length':'4'}),body} as unknown as Awaited<ReturnType<typeof fetch>>;
+    }
+    for await(const _chunk of options!.body as AsyncIterable<Uint8Array>){/* drain the source */}
+    return pendingFetch(options?.signal ?? undefined);
+  });
+  try {
+    await expect(transferPublicMediaToMioraCos(idleInput())).rejects.toMatchObject({failure:{code:'TRANSFER_IDLE_TIMEOUT',stage:mode==='put'?'cos_put':'source_fetch',retryable:true}});
+    if(mode==='reader')expect(returned).toBe(true);
+  }finally{vi.restoreAllMocks();}
+});
+
+test('Miora idle retries retain the existing attempt budget while sustained progress has no total clock',async()=>{
+  vi.mocked(fetch).mockClear();vi.mocked(fetch).mockImplementation(async(_address,options)=>pendingFetch(options?.signal ?? undefined));
+  const retried={...idleInput(),retryDelaysMs:[0,0]};
+  await expect(transferPublicMediaToMioraCos(retried)).rejects.toMatchObject({failure:{code:'TRANSFER_IDLE_TIMEOUT',retryable:true}});
+  expect(fetch).toHaveBeenCalledTimes(3);
+  expect(retried.client.getCosGrant).toHaveBeenCalledTimes(3);
+  const data=Buffer.from('abcdefgh');
+  vi.mocked(fetch).mockImplementation(async(address,options)=>{
+    if(String(address).startsWith('https://source.invalid/')) return {ok:true,status:200,headers:new Headers({'content-length':String(data.length)}),
+      body:(async function*(){for(const byte of data){await new Promise(resolve=>setTimeout(resolve,10));yield Buffer.from([byte]);}})()} as unknown as Awaited<ReturnType<typeof fetch>>;
+    for await(const _chunk of options!.body as AsyncIterable<Uint8Array>){/* repeated progress */}
+    return {status:200} as Awaited<ReturnType<typeof fetch>>;
+  });
+  try {
+    const started=Date.now();
+    await expect(transferPublicMediaToMioraCos({...idleInput(),idleTimeoutMs:40,size:data.length,sha256:createHash('sha256').update(data).digest('hex')})).resolves.toBe('prefix/idle.png');
+    expect(Date.now()-started).toBeGreaterThan(40);
+  }finally{vi.restoreAllMocks();}
+});
+
+test('a streaming retry after signed validity elapsed obtains a fresh grant without nesting another retry budget',async()=>{
+  let clock=1_791_904_000_000, grants=0, puts=0;
+  vi.spyOn(Date,'now').mockImplementation(()=>clock);
+  const input=idleInput();
+  vi.mocked(input.client.getCosGrant).mockImplementation(async()=>({prefix:`prefix-${++grants}`,bucket:'bucket',region:'ap-test',token:`TOKEN-${grants}`,secret_id:'id',secret_key:'key'}));
+  vi.mocked(fetch).mockImplementation(async(address,options)=>{
+    if(String(address).startsWith('https://source.invalid/'))return {ok:true,status:200,headers:new Headers({'content-length':'4'}),body:(async function*(){yield idleBytes;})()} as unknown as Awaited<ReturnType<typeof fetch>>;
+    for await(const _chunk of options!.body as AsyncIterable<Uint8Array>){/* consume */}
+    if(++puts===1){clock+=601_000;return {status:503} as Awaited<ReturnType<typeof fetch>>;}
+    return {status:(options!.headers as Record<string,string>)['x-cos-security-token']==='TOKEN-2'?200:403} as Awaited<ReturnType<typeof fetch>>;
+  });
+  try{await expect(transferPublicMediaToMioraCos({...input,retryDelaysMs:[0]})).resolves.toBe('prefix-2/idle.png');expect(grants).toBe(2);expect(puts).toBe(2);}
+  finally{vi.restoreAllMocks();}
+});
+
+test('service shutdown aborts an active source attempt as resumable without retrying',async()=>{
+  const coordinator=new MioraCosTransferCoordinator();let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});
+  vi.mocked(fetch).mockClear();vi.mocked(fetch).mockImplementation(async(_address,options)=>{entered();return pendingFetch(options?.signal ?? undefined);});
+  const transfer=transferPublicMediaToMioraCos({...idleInput(),signal:coordinator.signal,retryDelaysMs:[0,0]});
+  await started;coordinator.close();
+  try {await expect(transfer).rejects.toMatchObject({failure:{code:'TRANSFER_SERVICE_STOPPED',stage:'source_fetch',retryable:true}});expect(fetch).toHaveBeenCalledTimes(1);}
+  finally{vi.restoreAllMocks();}
+});
