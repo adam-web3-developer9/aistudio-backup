@@ -11,6 +11,7 @@ export interface PackageManifestInput {
   kind: 'manifest'; requestId: string; draftId: string; title: string; scope: PackageScope; baseVersionId: string | null;
   snapshot: { url: string; sha256: string; size: number }; media: PackageMediaFact[];
 }
+export interface PackageManifestStageInput extends Omit<PackageManifestInput, 'media'> { mediaCount: number }
 export interface PackageMediaClaim {
   claimId: string; shareId: string; sha256: string; size: number; actorId: string; requestId: string;
   repair: number; status: 'active' | 'completed' | 'cancelled' | 'expired'; leaseUntil: string;
