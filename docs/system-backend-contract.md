@@ -54,8 +54,8 @@ Miora 管理 AES-256-GCM 独立加密库，`CHANNEL_CREDENTIAL_KEY` 无默认、
 
 服务端任务支持 `kind=miora.video`，参数 `{text,mediaHashes,options?}`，仅使用本项目/本代数已授权上传媒体。先 durable claim + bridge映射 + 普通渠道任务落盘，真实paid阶段及401续期后重新校验账号、ACL与lease；adapter禁用隐式付费提交重试与失败后重新生成；有ID重试已有查询，无ID且无法查询时明确失败并保留收费未知，交统一有限预算/明确手动重试新attempt；客户端直连任务同样需明确local租约。取消/撤权围栏阻止新的付费提交；已接受的上游任务保持query/checkpoint，不让adapter自行叠加重付。进程重启有原provider ID的服务端任务变 `uncertain`，保留映射供查询；无ID且无法查询则结算failed并释放旧目标，以明确错误允许后续统一重试；用户可调用 `/api/system/projects/:p/jobs/:id/reconcile` 收取已有成功回执，该路径仅查询已有任务/搬运结果，不重新生成；queued managed记录不会被旧recover自动提交。结果只以私有sha256媒体引用和稳定候选追加推送，不将provider原始响应或signed URL放共享命令。
 
-客户端、私有媒体路由和视频结果迁移均采用有界流式传输，默认单文件256MiB，可通过SYSTEM_MEDIA_MAX_FILE_BYTES配置但最多1GiB；兼容旧JSON/base64接口仍最多20MiB。超限会返回明确限制，结果搬运失败保留原任务ID供核对，不新付费。现有 Miora 渠道参考输入仍经过旧 image AssetStore 的有界 Buffer 准备，单文件最多20MiB；共享可存储大视频不代表该渠道接受大视频/任意媒体作为生成输入，此轮没有扩展 provider 输入类型。密钥轮换须先用旧密钥解密再用新密钥事务重加密；不能直接替换key，否则fail-closed。旧明文渠道文件未自动迁移/删除，托管账号与旧文件所有权分离，管理员可以逐个导入核对后另行撤旧账号，避免同身份重复池配置。
+私有媒体路由和视频结果迁移采用有界流式传输，不设固定文件/累计业务容量配额，旧 SYSTEM_MEDIA_MAX_FILE_BYTES/PROJECT_BYTES/OWNER_BYTES 字段弃用，不因已有环境变量复制值重新拒绝合法内容。旧 JSON/base64 格式仍兼容，由实际 process/heap 资源预算解析并按块解码写盘；只有 Buffer 接口的旧 image AssetStore 仍需实际可分配内存，不伪称已全链路流式。资源不足、停滞或验证失败保留原任务ID供核对，不新付费。共享可存储大视频不代表渠道接受大视频/任意媒体作为生成输入，此轮没有扩展 provider 输入类型。并发以排队/背压控制，持续读写进展刷新 idle watchdog，不用15/30分钟总时长或120秒 fetch总截止终止合法大文件。密钥轮换须先用旧密钥解密再用新密钥事务重加密；不能直接替换key，否则fail-closed。旧明文渠道文件未自动迁移/删除，托管账号与旧文件所有权分离，管理员可以逐个导入核对后另行撤旧账号，避免同身份重复池配置。
 
 首次管理员通过正常邮箱注册验证后，部署操作人显式离线执行 `scripts/bootstrap-admin.mjs --database /absolute/existing.sqlite --email VERIFIED --confirm GRANT_FIRST_SUPERADMIN`；只在0 superadmin时授权，审计及会话撤销同事务，无公开bootstrap路由。本轮只使用/tmp测试库、MemoryMailer和假provider，不发送真实邮件，不导入生产Cookie，不部署服务，不配置Apple或云secret。
 
-云资源预算：项目写请求按已鉴权用户在解析大body前限流（上传10/min、任务20/min、分享30/min、命令120/min）；单项目私有媒体默认1GiB，项目owner总计2GiB，旧代数/关闭分享的保留链接也计入，按distinct hash计数。上限可配置；大规模对象存储回收/保留期仍需部署时定义，孤儿内容可按链接审计后回收，不能删除仍有待处理命令/任务引用的媒体。
+云资源预算：私有媒体采用实际磁盘/内存检查与并发排队，不设单项目1GiB或owner2GiB的业务上限。大规模对象存储回收/保留期仍需部署时定义，孤儿内容可按链接审计后回收，不能删除仍有待处理命令/任务引用的媒体。请求前的旧数量限流属于独立入口接线，本轮统一容量清理不得将其与真实认证、凭据到期、ACL或物理编码边界混为一谈。
