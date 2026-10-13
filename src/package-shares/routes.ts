@@ -18,8 +18,16 @@ export function isSafePackageUrl(value: string): boolean {
   catch { return false; }
 }
 const versionBody = z.object({ requestId, draftId: id, title: z.string().min(1), size: z.int().positive(), sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  scope: scopeSchema, baseVersionId: id.nullable().optional(), url: z.string().refine(isSafePackageUrl, 'Invalid public package URL') }).strict();
-const paramsOf = (request: FastifyRequest) => z.object({ shareId: id, versionId: id.optional(), userId: id.optional() }).parse(request.params);
+  kind: z.literal('zip').optional(), scope: scopeSchema, baseVersionId: id.nullable().optional(), url: z.string().refine(isSafePackageUrl, 'Invalid public package URL') }).strict();
+const mediaIdentity = z.object({ sha256: z.string().regex(/^[a-f0-9]{64}$/), size: z.int().nonnegative() }).strict();
+const mediaFact = mediaIdentity.extend({ mime: z.string().min(1), kind: z.string().min(1) });
+const publicUrl = z.string().refine(isSafePackageUrl, 'Invalid public package URL');
+const manifestBody = z.object({ kind: z.literal('manifest'), requestId, draftId: id, title: z.string().min(1), scope: scopeSchema,
+  baseVersionId: id.nullable().optional(), snapshot: mediaIdentity.extend({ size: z.int().positive(), url: publicUrl }), media: z.array(mediaFact)
+}).strict().superRefine((manifest, ctx) => {
+  if (new Set(manifest.media.map(item => `${item.sha256}:${item.size}`)).size !== manifest.media.length) ctx.addIssue({ code: 'custom', message: 'Duplicate media identities' });
+});
+const paramsOf = (request: FastifyRequest) => z.object({ shareId: id, versionId: id.optional(), userId: id.optional(), claimId: id.optional() }).parse(request.params);
 
 export function registerPackageShareRoutes(app: FastifyInstance, options: { runtime: SystemRuntime; enabled?: boolean; clock?: () => number }) {
   const { runtime } = options;
@@ -77,15 +85,54 @@ export function registerPackageShareRoutes(app: FastifyInstance, options: { runt
   });
   route('DELETE', '/:shareId', async request => store.setDeleted(paramsOf(request).shareId, await actor(request), true));
   route('POST', '/:shareId/restore', async request => store.setDeleted(paramsOf(request).shareId, await actor(request), false));
+  route('POST', '/:shareId/versions/receipt', async request => {
+    const principal = await actor(request); const { shareId } = paramsOf(request);
+    const input = z.object({ requestId }).strict().parse(request.body);
+    return { version: store.receipt(shareId, principal, input.requestId) };
+  });
+  route('POST', '/:shareId/versions/:versionId/snapshot/repair', async request => {
+    const principal = await actor(request); const { shareId, versionId } = paramsOf(request);
+    const input = mediaIdentity.extend({ size: z.int().positive(), url: publicUrl }).parse(request.body);
+    const version = store.repairSnapshot(shareId, versionId!, principal, input);
+    runtime.store.audit({ actorId: principal.id, action: 'package.snapshot.repair', targetType: 'packageShare', targetId: shareId, metadata: { versionId } });
+    return { version };
+  });
+  route('GET', '/:shareId/latest', async request => ({ version: store.latest(paramsOf(request).shareId, await actor(request)) }));
+  route('POST', '/:shareId/media/lookup', async request => {
+    const principal = await actor(request); const { shareId } = paramsOf(request);
+    const { items } = z.object({ items: z.array(mediaIdentity) }).strict().parse(request.body);
+    return { items: store.lookupMedia(shareId, principal, items) };
+  });
+  route('POST', '/:shareId/media/claims', async request => {
+    const principal = await actor(request); const { shareId } = paramsOf(request);
+    const input = mediaIdentity.extend({ requestId, repair: z.boolean().optional() }).parse(request.body);
+    return store.claimMedia(shareId, principal, { ...input, repair: input.repair ?? false });
+  });
+  route('POST', '/:shareId/media/claims/:claimId/renew', async request => {
+    const principal = await actor(request); const { shareId, claimId } = paramsOf(request);
+    return store.renewMediaClaim(shareId, claimId!, principal);
+  });
+  route('POST', '/:shareId/media/claims/:claimId/cancel', async request => {
+    const principal = await actor(request); const { shareId, claimId } = paramsOf(request);
+    return store.cancelMediaClaim(shareId, claimId!, principal);
+  });
+  route('POST', '/:shareId/media/claims/:claimId/complete', async request => {
+    const principal = await actor(request); const { shareId, claimId } = paramsOf(request);
+    const input = z.object({ url: publicUrl, mime: z.string().min(1), kind: z.string().min(1) }).strict().parse(request.body);
+    return store.completeMediaClaim(shareId, claimId!, principal, input);
+  });
   route('POST', '/:shareId/versions', async request => {
-    const principal = await actor(request); const { shareId } = paramsOf(request); const input = versionBody.parse(request.body);
-    const version = store.publish(shareId, principal, { ...input, baseVersionId: input.baseVersionId ?? null });
+    const principal = await actor(request); const { shareId } = paramsOf(request);
+    const input = z.union([manifestBody, versionBody]).parse(request.body);
+    const version = input.kind === 'manifest' ? store.publishManifest(shareId, principal, { ...input, baseVersionId: input.baseVersionId ?? null })
+      : store.publish(shareId, principal, { ...input, baseVersionId: input.baseVersionId ?? null });
     runtime.store.audit({ actorId: principal.id, action: 'package.version.publish', targetType: 'packageShare', targetId: shareId, metadata: { versionId: version.versionId, sequence: version.sequence } });
     return { version };
   });
   route('POST', '/:shareId/versions/:versionId/download', async request => {
     const principal = await actor(request); const { shareId, versionId } = paramsOf(request);
     store.access(shareId, principal); const version = store.version(shareId, versionId!);
+    if (version.mediaJson !== undefined) return store.manifestDownload(shareId, versionId!, principal);
     if (!version.url) throw new SystemError(409, 'PACKAGE_VERSION_REPUBLISH_REQUIRED', '旧私有版本没有公开地址，请重新发布');
     if (!isSafePackageUrl(version.url)) throw new SystemError(409, 'PACKAGE_VERSION_URL_INVALID', '版本地址无效，请重新发布');
     return { ...store.publicVersion(version), url: version.url };
