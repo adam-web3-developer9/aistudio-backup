@@ -30,7 +30,7 @@ import {
 import { MioraAdapter, mioraEstimatedVideoCredits, mioraJobBudgetMs, mioraMinimumVideoCredits } from './adapters/miora-adapter.js';
 import { mioraTokenCookies, prepareCosUpload, readMioraTokens, useMioraProxy, type MioraTokens } from './adapters/miora-api.js';
 import { MioraClient } from './adapters/miora-client.js';
-import { transferPublicMediaToMioraCos } from './adapters/miora-cos-transfer.js';
+import { describeMioraTransferFailure, MioraCosTransferCoordinator, transferPublicMediaToMioraCos } from './adapters/miora-cos-transfer.js';
 import {
   MioraCredentials,
   MioraAccountPruner,
@@ -110,6 +110,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   assertVideoGatewayProxyConfiguration(options.managedGateway === true, config.mioraProxyUrl);
   const gateway = options.managedGateway && options.managedChannels ? new ManagedVideoGatewayRecords(options.managedChannels, config.apiKey!) : undefined;
   const uploadIntents = gateway && options.managedChannels ? new MioraUploadIntentStore(options.managedChannels.db, config.apiKey!) : undefined;
+  const mioraTransfers = new MioraCosTransferCoordinator();
   const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
   /** Accounts seen at 0 credits, kept so `/v1/accounts` can report them. */
   const exhaustedAccounts = new Map<string, AccountSnapshot>();
@@ -1094,6 +1095,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
 
   async function signedPendingItems(id: string) {
     const description = uploadIntents!.describe(id);
+    const describedItems = new Map(description.items.map(item => [item.index, item]));
     const plan = uploadIntents!.plan(id);
     const session = await sessions.get(plan.accountId);
     const tokens = session && readMioraTokens(session.cookies);
@@ -1101,7 +1103,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     const client = new MioraClient(tokens, persistMioraClientRenewal);
     const items = [];
     for (const item of plan.items) {
-      const publicItem = { index: item.idx, status: item.status, ...(item.error ? { error: 'UPLOAD_IMPORT_FAILED' } : {}) };
+      const publicItem = describedItems.get(item.idx) ?? { index:item.idx, status:item.status };
       if (item.status !== 'upload_required') { items.push(publicItem); continue; }
       const grant = await client.getCosGrant();
       const upload = prepareCosUpload(grant, uploadFileName({ sha256:item.sha256,size:item.size,mimeType:item.mime_type,kind:item.kind }), item.mime_type, item.size);
@@ -1127,13 +1129,16 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
         while (cursor < pending.length) {
           const item = pending[cursor++]!;
           try {
-            const key = await transferPublicMediaToMioraCos({ client, sourceUrl:item.source_url!, allowedHosts:config.mioraPublicMediaHosts,
-              fileName:uploadFileName({sha256:item.sha256,size:item.size,mimeType:item.mime_type,kind:item.kind}),
-              mimeType:item.mime_type,size:item.size,sha256:item.sha256 });
+            const key = await mioraTransfers.transfer({ accountId:plan.accountId,
+              identity:`${item.sha256}:${item.size}:${item.mime_type}:${item.kind}`,
+              run:() => transferPublicMediaToMioraCos({ client, sourceUrl:item.source_url!, allowedHosts:config.mioraPublicMediaHosts,
+                fileName:uploadFileName({sha256:item.sha256,size:item.size,mimeType:item.mime_type,kind:item.kind}),
+                mimeType:item.mime_type,size:item.size,sha256:item.sha256 }) });
             uploadIntents!.importReady(id, item.idx, key);
           } catch (error) {
-            app.log.warn({ err:error, uploadIntentId:id, index:item.idx }, 'Public media transfer failed');
-            uploadIntents!.importFailed(id, item.idx, error);
+            const failure = describeMioraTransferFailure(error);
+            app.log.warn({ uploadIntentId:id, index:item.idx, ...failure }, 'Public media transfer failed');
+            uploadIntents!.importFailed(id, item.idx, failure);
           }
         }
       }));

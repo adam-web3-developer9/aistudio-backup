@@ -20,7 +20,20 @@ export interface PreparedUploadItem extends UploadIntentAssetInput {
   cosKey: string;
   status: UploadItemStatus;
   upload?: { method: 'PUT'; url: string; headers: Record<string, string>; expiresAt: string };
-  error?: string;
+  error?: UploadImportFailure;
+}
+
+export interface UploadImportFailure extends MioraTransferFailure {
+  code: 'UPLOAD_IMPORT_FAILED';
+  reason: string;
+}
+
+interface MioraTransferFailure {
+  code: string;
+  stage: 'source_fetch' | 'source_verify' | 'cos_grant' | 'cos_put' | 'internal';
+  retryable: boolean;
+  httpStatus?: number;
+  networkCode?: string;
 }
 
 interface IntentRow { id:string; key_hash:string; idempotency_key:string; account_id:string; expires_at:string; consumed_job_id:string|null; created_at:string; reserved_credits:number|null; reservation_until:string|null; options_json:string|null }
@@ -171,7 +184,7 @@ export class MioraUploadIntentStore {
   describe(id: string) {
     const intent = this.owned(id);
     const items = this.rows(id).map(row => ({ index: row.idx, status: row.status,
-      ...(row.error ? { error: 'UPLOAD_IMPORT_FAILED' } : {}) }));
+      ...(row.error ? { error: this.publicFailure(row.error) } : {}) }));
     return { id, expiresAt: intent.expires_at,
       status: intent.consumed_job_id ? 'consumed' : items.every(item => item.status === 'ready') ? 'ready'
         : items.some(item => item.status === 'failed') ? 'failed' : 'preparing',
@@ -238,10 +251,12 @@ export class MioraUploadIntentStore {
     this.ready(intent.account_id, { ...item, cos_key: key }, true);
   }
 
-  importFailed(id: string, index: number, error: unknown): void {
+  importFailed(id: string, index: number, failure: MioraTransferFailure): void {
     this.owned(id);
     this.db.prepare('UPDATE video_gateway_upload_items SET status=?,error=? WHERE intent_id=? AND idx=?')
-      .run('failed', 'UPLOAD_IMPORT_FAILED', id, index);
+      .run('failed', JSON.stringify({ code:'UPLOAD_IMPORT_FAILED', reason:failure.code, stage:failure.stage,
+        retryable:failure.retryable, ...(failure.httpStatus !== undefined ? { httpStatus:failure.httpStatus } : {}),
+        ...(failure.networkCode ? { networkCode:failure.networkCode } : {}) } satisfies UploadImportFailure), id, index);
   }
 
   consume(id: string, jobId: string): { accountId:string; jobId:string; references:Array<{key:string;kind:UploadItemKind}> } {
@@ -281,6 +296,19 @@ export class MioraUploadIntentStore {
       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account_id,sha256,size,mime_type,kind)
       DO UPDATE SET cos_key=excluded.cos_key,verified_at=excluded.verified_at,last_used_at=excluded.last_used_at`)
       .run(accountId, item.sha256, item.size, item.mime_type, item.kind, item.cos_key, now, now);
+  }
+  private publicFailure(value:string):UploadImportFailure {
+    try {
+      const parsed = JSON.parse(value) as Partial<UploadImportFailure>;
+      if (parsed.code === 'UPLOAD_IMPORT_FAILED' && typeof parsed.reason === 'string'
+        && ['source_fetch','source_verify','cos_grant','cos_put','internal'].includes(parsed.stage ?? '')
+        && typeof parsed.retryable === 'boolean') return {
+          code:'UPLOAD_IMPORT_FAILED', reason:parsed.reason, stage:parsed.stage!, retryable:parsed.retryable,
+          ...(Number.isInteger(parsed.httpStatus) ? { httpStatus:parsed.httpStatus } : {}),
+          ...(typeof parsed.networkCode === 'string' ? { networkCode:parsed.networkCode } : {})
+        };
+    } catch { /* Legacy rows contain only UPLOAD_IMPORT_FAILED. */ }
+    return { code:'UPLOAD_IMPORT_FAILED', reason:'INTERNAL_ERROR', stage:'internal', retryable:false };
   }
   private assertManifest(id:string, items:Array<Pick<PreparedUploadItem,'index'|'sha256'|'size'|'mimeType'|'kind'|'fileName'|'publicUrl'>>):void {
     const rows = this.rows(id);

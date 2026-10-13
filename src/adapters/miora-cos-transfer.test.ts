@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { expect, test, vi } from 'vitest';
 import { fetch } from 'undici';
-import { transferPublicMediaToMioraCos } from './miora-cos-transfer.js';
+import { MioraApiError } from './miora-api.js';
+import { MioraCosTransferCoordinator, MioraTransferError, transferPublicMediaToMioraCos } from './miora-cos-transfer.js';
 import type { MioraClient } from './miora-client.js';
 
 vi.mock('undici', async importOriginal => ({
@@ -36,10 +37,102 @@ test('Miora cloud transfer streams original chunks and refuses excess bytes or a
     expect(uploadedChunks.map(chunk => Buffer.from(chunk).toString())).toEqual(['abc', 'def']);
     uploadedChunks.length = 0;
     declaredSize = 5;
-    await expect(transferPublicMediaToMioraCos({ ...input, size: 5 })).rejects.toThrow('exceeded its declared size');
+    await expect(transferPublicMediaToMioraCos({ ...input, size: 5 })).rejects.toMatchObject({
+      failure: { code:'SOURCE_SIZE_EXCEEDED', stage:'source_verify', retryable:false }
+    });
     expect(uploadedChunks.map(chunk => Buffer.from(chunk).toString())).toEqual(['abc']);
     uploadedChunks.length = 0;
     declaredSize = 6;
-    await expect(transferPublicMediaToMioraCos({ ...input, sha256: '0'.repeat(64) })).rejects.toThrow('content hash changed');
+    await expect(transferPublicMediaToMioraCos({ ...input, sha256: '0'.repeat(64) })).rejects.toMatchObject({
+      failure: { code:'SOURCE_HASH_CHANGED', stage:'source_verify', retryable:false }
+    });
   } finally { vi.restoreAllMocks(); }
+});
+
+test('Miora cloud transfer retries transient source and COS failures without exposing signed locations', async () => {
+  const bytes = Buffer.from('verified');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const client = { getCosGrant: vi.fn(async () => ({ prefix:'safe-prefix', bucket:'bucket', region:'ap-test',
+    token:'secret-token', secret_id:'secret-id', secret_key:'secret-key' })) } as unknown as MioraClient;
+  let sourceCalls = 0;
+  let putCalls = 0;
+  vi.mocked(fetch).mockImplementation(async address => {
+    if (String(address).startsWith('https://source.invalid/')) {
+      sourceCalls += 1;
+      if (sourceCalls === 1) return { ok:false, status:503, headers:new Headers(), body:null } as unknown as Awaited<ReturnType<typeof fetch>>;
+      return { ok:true, status:200, headers:new Headers({ 'content-length':String(bytes.length) }),
+        body:(async function* () { yield bytes; })() } as unknown as Awaited<ReturnType<typeof fetch>>;
+    }
+    putCalls += 1;
+    return { status:putCalls === 1 ? 503 : 200 } as Awaited<ReturnType<typeof fetch>>;
+  });
+  try {
+    await expect(transferPublicMediaToMioraCos({ client, sourceUrl:'https://source.invalid/private?signature=do-not-log',
+      allowedHosts:['source.invalid'], fileName:'verified.png', mimeType:'image/png', size:bytes.length, sha256,
+      retryDelaysMs:[0, 0] })).resolves.toBe('safe-prefix/verified.png');
+    expect(sourceCalls).toBe(3);
+    expect(putCalls).toBe(2);
+  } finally { vi.restoreAllMocks(); }
+});
+
+test('Miora transfer failure is typed and contains no source URL', async () => {
+  vi.mocked(fetch).mockResolvedValue({ ok:false, status:403, headers:new Headers(), body:null } as unknown as Awaited<ReturnType<typeof fetch>>);
+  const client = { getCosGrant:vi.fn(async () => ({ prefix:'safe-prefix', bucket:'bucket', region:'ap-test',
+    token:'secret-token', secret_id:'secret-id', secret_key:'secret-key' })) } as unknown as MioraClient;
+  try {
+    let error: MioraTransferError | undefined;
+    try {
+      await transferPublicMediaToMioraCos({ client, sourceUrl:'https://source.invalid/private?signature=secret',
+        allowedHosts:['source.invalid'], fileName:'a.png', mimeType:'image/png', size:1, sha256:'0'.repeat(64), retryDelaysMs:[] });
+    } catch (value) { error = value as MioraTransferError; }
+    expect(error).toBeInstanceOf(MioraTransferError);
+    if (!error) throw new Error('Expected transfer to fail');
+    expect(error.failure).toEqual({ code:'SOURCE_FETCH_HTTP', stage:'source_fetch', retryable:false, httpStatus:403 });
+    expect(JSON.stringify(error.failure)).not.toContain('source.invalid');
+    expect(error.message).not.toContain('signature');
+  } finally { vi.restoreAllMocks(); }
+});
+
+test('Miora cloud transfer retries a transient COS grant without downloading the source first', async () => {
+  const bytes = Buffer.from('x');
+  const getCosGrant = vi.fn()
+    .mockRejectedValueOnce(new MioraApiError(503, undefined, 'temporarily unavailable', '/sts/tokens'))
+    .mockResolvedValue({ prefix:'safe-prefix', bucket:'bucket', region:'ap-test', token:'token', secret_id:'id', secret_key:'key' });
+  vi.mocked(fetch).mockImplementation(async (address, options) => {
+    if (String(address).startsWith('https://source.invalid/')) return { ok:true, status:200,
+      headers:new Headers({ 'content-length':'1' }), body:(async function* () { yield bytes; })() } as unknown as Awaited<ReturnType<typeof fetch>>;
+    for await (const _chunk of options!.body as AsyncIterable<Uint8Array>) { /* consume and verify */ }
+    return { status:200 } as Awaited<ReturnType<typeof fetch>>;
+  });
+  try {
+    await expect(transferPublicMediaToMioraCos({ client:{ getCosGrant } as unknown as MioraClient,
+      sourceUrl:'https://source.invalid/a', allowedHosts:['source.invalid'], fileName:'a.png', mimeType:'image/png',
+      size:1, sha256:createHash('sha256').update(bytes).digest('hex'), retryDelaysMs:[0] })).resolves.toBe('safe-prefix/a.png');
+    expect(getCosGrant).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  } finally { vi.restoreAllMocks(); }
+});
+
+test('Miora transfer coordinator singleflights by account and bounds account concurrency', async () => {
+  const coordinator = new MioraCosTransferCoordinator(4, 1);
+  let active = 0;
+  let peak = 0;
+  let runs = 0;
+  const gates: Array<() => void> = [];
+  const run = async (value:string) => {
+    runs += 1; active += 1; peak = Math.max(peak, active);
+    await new Promise<void>(resolve => gates.push(resolve));
+    active -= 1;
+    return value;
+  };
+  const first = coordinator.transfer({ accountId:'a', identity:'same', run:() => run('key-a') });
+  const shared = coordinator.transfer({ accountId:'a', identity:'same', run:() => run('should-not-run') });
+  const queued = coordinator.transfer({ accountId:'a', identity:'other', run:() => run('key-b') });
+  await vi.waitFor(() => expect(gates).toHaveLength(1));
+  gates.shift()!();
+  await vi.waitFor(() => expect(gates).toHaveLength(1));
+  gates.shift()!();
+  await expect(Promise.all([first, shared, queued])).resolves.toEqual(['key-a', 'key-a', 'key-b']);
+  expect(runs).toBe(2);
+  expect(peak).toBe(1);
 });

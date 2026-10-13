@@ -73,4 +73,22 @@ describe('Miora upload intents', () => {
       { accountId:'low', credits:20, activeJobs:0 }
     ], 70, { durationSeconds:10 }, [asset])).toThrow(/could not be confirmed/i);
   });
+
+  it('persists a safe typed import failure and resumes only failed public items', () => {
+    const db = new Database(':memory:');
+    const store = new MioraUploadIntentStore(db, 'f'.repeat(32));
+    const publicAsset = { ...asset, publicUrl:'https://media.invalid/signed?secret=hidden' };
+    const created = store.createReserved('failed-import-0001', [{ accountId:'account-a', credits:100, activeJobs:0 }],
+      10, { durationSeconds:10 }, [publicAsset, { ...asset, sha256:'b'.repeat(64) }]);
+    store.importFailed(created.id, 0, { code:'SOURCE_FETCH_HTTP', stage:'source_fetch', retryable:true, httpStatus:503 });
+    expect(store.describe(created.id).items[0]?.error).toEqual({
+      code:'UPLOAD_IMPORT_FAILED', reason:'SOURCE_FETCH_HTTP', stage:'source_fetch', retryable:true, httpStatus:503
+    });
+    const stored = db.prepare('SELECT error FROM video_gateway_upload_items WHERE intent_id=? AND idx=0')
+      .get(created.id) as { error:string };
+    expect(stored.error).not.toContain('media.invalid');
+    expect(stored.error).not.toContain('secret');
+    expect(store.resume(created.id, [publicAsset, { ...asset, sha256:'b'.repeat(64) }]).map(item => item.idx)).toEqual([0]);
+    expect(store.plan(created.id).items.map(item => item.status)).toEqual(['importing', 'upload_required']);
+  });
 });
