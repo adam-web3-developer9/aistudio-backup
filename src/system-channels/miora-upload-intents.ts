@@ -40,7 +40,7 @@ interface MioraTransferFailure {
   providerCode?: string;
 }
 
-interface IntentRow { id:string; key_hash:string; idempotency_key:string; account_id:string; expires_at:string; consumed_job_id:string|null; created_at:string; reserved_credits:number|null; reservation_until:string|null; options_json:string|null }
+interface IntentRow { id:string; key_hash:string; idempotency_key:string; account_id:string; expires_at:string; consumed_job_id:string|null; created_at:string; reserved_credits:number|null; reservation_until:string|null; options_json:string|null; declared_count:number|null; manifest_finalized:number }
 export interface UploadIntentAccountCandidate { accountId:string; credits?:number; activeJobs:number }
 export interface UploadIntentItemRow { intent_id:string; idx:number; sha256:string; size:number; mime_type:string; kind:UploadItemKind; file_name:string|null; cos_key:string; status:UploadItemStatus; source_url:string|null; error:string|null }
 
@@ -60,6 +60,7 @@ export class MioraUploadIntentStore {
         mime_type TEXT NOT NULL,kind TEXT NOT NULL,file_name TEXT,cos_key TEXT NOT NULL,
         status TEXT NOT NULL,source_url TEXT,error TEXT,PRIMARY KEY(intent_id,idx)
       );
+      CREATE INDEX IF NOT EXISTS video_gateway_upload_items_status ON video_gateway_upload_items(intent_id,status,idx);
       CREATE TABLE IF NOT EXISTS video_gateway_miora_cos_cache(
         account_id TEXT NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,mime_type TEXT NOT NULL,
         kind TEXT NOT NULL,cos_key TEXT NOT NULL,verified_at TEXT NOT NULL,last_used_at TEXT NOT NULL,
@@ -69,6 +70,8 @@ export class MioraUploadIntentStore {
     this.ensureColumn('video_gateway_upload_intents', 'reserved_credits', 'REAL');
     this.ensureColumn('video_gateway_upload_intents', 'reservation_until', 'TEXT');
     this.ensureColumn('video_gateway_upload_intents', 'options_json', 'TEXT');
+    this.ensureColumn('video_gateway_upload_intents', 'declared_count', 'INTEGER');
+    this.ensureColumn('video_gateway_upload_intents', 'manifest_finalized', 'INTEGER NOT NULL DEFAULT 1');
   }
 
   cached(accountId: string, asset: UploadIntentAssetInput): string | undefined {
@@ -169,6 +172,110 @@ export class MioraUploadIntentStore {
     })();
   }
 
+  createStaged(idempotencyKey:string, candidates:UploadIntentAccountCandidate[], requiredCredits:number|undefined,
+    options:JobOptions|undefined, assetCount:number): { id:string; created:boolean; accountId:string } {
+    if (!Number.isSafeInteger(assetCount) || assetCount < 1) throw new SystemError(400, 'UPLOAD_MANIFEST_COUNT_INVALID', 'Manifest item count must be positive');
+    return this.db.transaction(() => {
+      const existingId = this.findByIdempotencyKey(idempotencyKey);
+      if (existingId) {
+        const existing = this.owned(existingId);
+        if (existing.declared_count !== assetCount || existing.options_json !== (options ? JSON.stringify(options) : null)) {
+          throw new SystemError(409, 'UPLOAD_INTENT_PAYLOAD_MISMATCH', 'Idempotency key was already used with another manifest');
+        }
+        if (!existing.consumed_job_id) this.renew(existingId);
+        return { id:existingId, created:false, accountId:existing.account_id };
+      }
+      const created = this.createReserved(idempotencyKey, candidates, requiredCredits, options, []);
+      this.db.prepare('UPDATE video_gateway_upload_intents SET declared_count=?,manifest_finalized=0 WHERE id=?').run(assetCount, created.id);
+      return created;
+    })();
+  }
+
+  appendManifest(id:string, offset:number, assets:UploadIntentAssetInput[]): void {
+    this.db.transaction(() => {
+      const intent = this.owned(id);
+      if (intent.declared_count === null) throw new SystemError(409, 'UPLOAD_MANIFEST_NOT_STAGED', 'Intent does not use a staged manifest');
+      if (!Number.isSafeInteger(offset) || offset < 0 || !assets.length || offset > intent.declared_count - assets.length) {
+        throw new SystemError(400, 'UPLOAD_MANIFEST_WINDOW_INVALID', 'Manifest window is outside the declared item count');
+      }
+      const insert = this.db.prepare(`INSERT INTO video_gateway_upload_items
+        (intent_id,idx,sha256,size,mime_type,kind,file_name,cos_key,status,source_url,error) VALUES(?,?,?,?,?,?,?,?,?,?,NULL)`);
+      const get = this.db.prepare('SELECT * FROM video_gateway_upload_items WHERE intent_id=? AND idx=?');
+      assets.forEach((asset, index) => {
+        const idx = offset + index;
+        const existing = get.get(id, idx) as UploadIntentItemRow|undefined;
+        if (existing) {
+          if (!this.sameAsset(existing, asset)) throw new SystemError(409, 'UPLOAD_INTENT_PAYLOAD_MISMATCH', 'Manifest window conflicts with an existing declaration');
+          return;
+        }
+        if (intent.manifest_finalized || intent.consumed_job_id) throw new SystemError(409, 'UPLOAD_MANIFEST_FINALIZED', 'Finalized manifest cannot gain new items');
+        const cached = this.cached(intent.account_id, asset);
+        insert.run(id, idx, asset.sha256, asset.size, asset.mimeType, asset.kind, asset.fileName ?? null,
+          cached ?? '', cached ? 'ready' : asset.publicUrl ? 'importing' : 'upload_required', asset.publicUrl ?? null);
+      });
+      if (!intent.consumed_job_id) this.renew(id);
+    })();
+  }
+
+  finalizeManifest(id:string): void {
+    this.db.transaction(() => {
+      const intent = this.owned(id);
+      if (intent.declared_count === null) throw new SystemError(409, 'UPLOAD_MANIFEST_NOT_STAGED', 'Intent does not use a staged manifest');
+      const count = (this.db.prepare('SELECT COUNT(*) count FROM video_gateway_upload_items WHERE intent_id=?').get(id) as {count:number}).count;
+      if (count !== intent.declared_count) throw new SystemError(409, 'UPLOAD_MANIFEST_INCOMPLETE', 'Not every declared manifest window was received');
+      this.db.prepare('UPDATE video_gateway_upload_intents SET manifest_finalized=1 WHERE id=?').run(id);
+      if (!intent.consumed_job_id) {
+        this.renew(id);
+        this.db.prepare("UPDATE video_gateway_upload_items SET status='importing',error=NULL WHERE intent_id=? AND status='failed' AND source_url IS NOT NULL").run(id);
+      }
+    })();
+  }
+
+  summary(id:string) {
+    const intent = this.owned(id);
+    const counts = this.db.prepare(`SELECT COUNT(*) total, COALESCE(SUM(status='ready'),0) ready,
+      COALESCE(SUM(status='failed'),0) failed FROM video_gateway_upload_items WHERE intent_id=?`).get(id) as {total:number;ready:number;failed:number};
+    const failed = counts.failed ? this.db.prepare("SELECT idx,error FROM video_gateway_upload_items WHERE intent_id=? AND status='failed' ORDER BY idx LIMIT 1").get(id) as {idx:number;error:string}|undefined : undefined;
+    return { id, createdAt:intent.created_at, expiresAt:intent.expires_at,
+      ...(intent.declared_count !== null ? { protocol:'staged', assetCount:intent.declared_count, declaredCount:counts.total, manifestFinalized:!!intent.manifest_finalized } : {}),
+      status:intent.consumed_job_id ? 'consumed' : !intent.manifest_finalized ? 'declaring' : counts.failed ? 'failed' : counts.ready === counts.total ? 'ready' : 'preparing',
+      readyCount:counts.ready, total:counts.total,
+      ...(intent.consumed_job_id ? { jobId:intent.consumed_job_id } : {}),
+      ...(failed ? { error:{ index:failed.idx, ...this.publicFailure(failed.error) } } : {}) };
+  }
+
+  page(id:string, offset:number, limit:number): { accountId:string; expiresAt:string; consumedJobId?:string; finalized:boolean; items:UploadIntentItemRow[] } {
+    const intent = this.owned(id);
+    return { accountId:intent.account_id, expiresAt:intent.expires_at, finalized:!!intent.manifest_finalized,
+      ...(intent.consumed_job_id ? { consumedJobId:intent.consumed_job_id } : {}),
+      items:this.db.prepare('SELECT * FROM video_gateway_upload_items WHERE intent_id=? AND idx>=? ORDER BY idx LIMIT ?').all(id, offset, limit) as UploadIntentItemRow[] };
+  }
+
+  pendingImportPage(id:string, offset:number, limit:number):UploadIntentItemRow[] {
+    const intent = this.owned(id);
+    if (!intent.manifest_finalized || intent.consumed_job_id) return [];
+    return this.db.prepare("SELECT * FROM video_gateway_upload_items WHERE intent_id=? AND status='importing' AND idx>=? ORDER BY idx LIMIT ?").all(id, offset, limit) as UploadIntentItemRow[];
+  }
+
+  describePage(id:string, offset:number, limit:number) {
+    return { ...this.summary(id), items:this.page(id, offset, limit).items.map(row => ({ index:row.idx, status:row.status,
+      ...(row.error ? { error:this.publicFailure(row.error) } : {}) })) };
+  }
+
+  renewStaged(id:string):void {
+    const intent = this.owned(id);
+    if (intent.declared_count !== null && !intent.consumed_job_id) this.renew(id);
+  }
+
+  private renew(id:string): void {
+    const expiry = new Date(Date.now() + 15 * 60_000).toISOString();
+    this.db.prepare('UPDATE video_gateway_upload_intents SET expires_at=?,reservation_until=? WHERE id=?').run(expiry, expiry, id);
+  }
+  private sameAsset(row:UploadIntentItemRow, asset:UploadIntentAssetInput):boolean {
+    return row.sha256 === asset.sha256 && row.size === asset.size && row.mime_type === asset.mimeType && row.kind === asset.kind
+      && row.file_name === (asset.fileName ?? null) && row.source_url === (asset.publicUrl ?? null);
+  }
+
   /** Live reservations for an account, excluding one intent during its own submit validation. */
   reservedCredits(accountId: string, excludingIntentId?: string): number {
     const row = this.db.prepare(`SELECT COALESCE(SUM(reserved_credits),0) total
@@ -190,7 +297,7 @@ export class MioraUploadIntentStore {
     const items = this.rows(id).map(row => ({ index: row.idx, status: row.status,
       ...(row.error ? { error: this.publicFailure(row.error) } : {}) }));
     return { id, expiresAt: intent.expires_at,
-      status: intent.consumed_job_id ? 'consumed' : items.every(item => item.status === 'ready') ? 'ready'
+      status: intent.consumed_job_id ? 'consumed' : !intent.manifest_finalized ? 'declaring' : items.every(item => item.status === 'ready') ? 'ready'
         : items.some(item => item.status === 'failed') ? 'failed' : 'preparing',
       ...(intent.consumed_job_id ? { jobId: intent.consumed_job_id } : {}), items };
   }
@@ -271,7 +378,8 @@ export class MioraUploadIntentStore {
   consume(id: string, jobId: string): { accountId:string; jobId:string; references:Array<{key:string;kind:UploadItemKind}> } {
     return this.db.transaction(() => {
       const intent = this.owned(id);
-      if (intent.consumed_job_id && intent.consumed_job_id !== jobId) throw new SystemError(409, 'UPLOAD_INTENT_CONSUMED', 'Upload intent was already consumed');
+      if (!intent.manifest_finalized) throw new SystemError(409, 'UPLOAD_MANIFEST_INCOMPLETE', 'Manifest is not finalized');
+    if (intent.consumed_job_id && intent.consumed_job_id !== jobId) throw new SystemError(409, 'UPLOAD_INTENT_CONSUMED', 'Upload intent was already consumed');
       if (!intent.consumed_job_id && Date.parse(intent.expires_at) <= Date.now()) throw new SystemError(410, 'UPLOAD_INTENT_EXPIRED', 'Upload intent expired');
       const items = this.rows(id);
       const unfinished = items.find(item => item.status !== 'ready');
@@ -289,6 +397,7 @@ export class MioraUploadIntentStore {
 
   readyForJob(id: string, jobId: string): { accountId:string; jobId:string; consumed:boolean; references:Array<{key:string;kind:UploadItemKind}> } {
     const intent = this.owned(id);
+    if (!intent.manifest_finalized) throw new SystemError(409, 'UPLOAD_MANIFEST_INCOMPLETE', 'Manifest is not finalized');
     if (intent.consumed_job_id && intent.consumed_job_id !== jobId) throw new SystemError(409, 'UPLOAD_INTENT_CONSUMED', 'Upload intent was already consumed');
     if (!intent.consumed_job_id && Date.parse(intent.expires_at) <= Date.now()) throw new SystemError(410, 'UPLOAD_INTENT_EXPIRED', 'Upload intent expired');
     const items = this.rows(id); const unfinished = items.find(item => item.status !== 'ready');
@@ -310,12 +419,12 @@ export class MioraUploadIntentStore {
   private publicFailure(value:string):UploadImportFailure {
     try {
       const parsed = JSON.parse(value) as Partial<UploadImportFailure>;
-      if (parsed.code === 'UPLOAD_IMPORT_FAILED' && typeof parsed.reason === 'string'
+      if (parsed.code === 'UPLOAD_IMPORT_FAILED' && typeof parsed.reason === 'string' && /^[A-Z0-9_]{1,80}$/.test(parsed.reason)
         && ['source_fetch','source_verify','cos_grant','cos_put','internal'].includes(parsed.stage ?? '')
         && typeof parsed.retryable === 'boolean') return {
           code:'UPLOAD_IMPORT_FAILED', reason:parsed.reason, stage:parsed.stage!, retryable:parsed.retryable,
-          ...(Number.isInteger(parsed.httpStatus) ? { httpStatus:parsed.httpStatus } : {}),
-          ...(typeof parsed.networkCode === 'string' ? { networkCode:parsed.networkCode } : {}),
+          ...(Number.isInteger(parsed.httpStatus) && parsed.httpStatus! >= 100 && parsed.httpStatus! <= 599 ? { httpStatus:parsed.httpStatus } : {}),
+          ...(typeof parsed.networkCode === 'string' && /^[A-Z0-9_]{1,80}$/.test(parsed.networkCode) ? { networkCode:parsed.networkCode } : {}),
           ...(typeof parsed.cosCode === 'string' && /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(parsed.cosCode) ? { cosCode:parsed.cosCode } : {}),
           ...(typeof parsed.cosRequestId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(parsed.cosRequestId)
             ? { cosRequestId:parsed.cosRequestId } : {}),
@@ -337,7 +446,7 @@ export class MioraUploadIntentStore {
   private item(id:string,index:number):UploadIntentItemRow { const row=this.db.prepare('SELECT * FROM video_gateway_upload_items WHERE intent_id=? AND idx=?').get(id,index) as UploadIntentItemRow|undefined; if(!row)throw new SystemError(404,'UPLOAD_ITEM_NOT_FOUND','Upload item is unavailable');return row; }
   private rows(id:string):UploadIntentItemRow[]{return this.db.prepare('SELECT * FROM video_gateway_upload_items WHERE intent_id=? ORDER BY idx').all(id) as UploadIntentItemRow[];}
   private owned(id:string):IntentRow { const row=this.db.prepare('SELECT * FROM video_gateway_upload_intents WHERE id=? AND key_hash=?').get(id,this.keyHash) as IntentRow|undefined;if(!row)throw new SystemError(404,'UPLOAD_INTENT_NOT_FOUND','Upload intent is unavailable');return row; }
-  private active(id:string):IntentRow { const row=this.owned(id);if(row.consumed_job_id)throw new SystemError(409,'UPLOAD_INTENT_CONSUMED','Upload intent was already consumed');if(Date.parse(row.expires_at)<=Date.now())throw new SystemError(410,'UPLOAD_INTENT_EXPIRED','Upload intent expired');return row; }
+  private active(id:string):IntentRow { const row=this.owned(id);if(!row.manifest_finalized)throw new SystemError(409,'UPLOAD_MANIFEST_INCOMPLETE','Manifest is not finalized');if(row.consumed_job_id)throw new SystemError(409,'UPLOAD_INTENT_CONSUMED','Upload intent was already consumed');if(Date.parse(row.expires_at)<=Date.now())throw new SystemError(410,'UPLOAD_INTENT_EXPIRED','Upload intent expired');return row; }
   private ensureColumn(table:string,column:string,type:string):void {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name:string}>;
     if (!columns.some(item => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);

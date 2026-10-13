@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { fetch } from 'undici';
 import { MioraApiError, prepareCosUpload } from './miora-api.js';
 import type { MioraClient } from './miora-client.js';
+import { sleep } from './provider-retry.js';
 import { mioraDiagnostic, mioraSourceIdentity } from './miora-diagnostics.js';
 
 export type MioraTransferStage = 'source_fetch' | 'source_verify' | 'cos_grant' | 'cos_put' | 'internal';
@@ -99,17 +100,17 @@ function transientFailure(stage: MioraTransferStage, error: unknown): MioraTrans
     ...(recognizedCode ? { networkCode:recognizedCode } : {}) }, error);
 }
 
-function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-async function retry<T>(operation: (attempt: number) => Promise<T>, delays: readonly number[]): Promise<T> {
+async function retry<T>(operation: (attempt: number) => Promise<T>, delays: readonly number[], signal?:AbortSignal): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
-    try { return await operation(attempt + 1); }
+    try { signal?.throwIfAborted(); return await operation(attempt + 1); }
     catch (error) {
       const typed = error instanceof MioraTransferError ? error
         : failureError({ code:'INTERNAL_ERROR', stage:'internal', retryable:false }, error);
+      if (signal?.aborted) throw failureError({ code:'TRANSFER_CANCELLED', stage:typed.failure.stage, retryable:false }, error);
       if (!typed.failure.retryable || attempt >= delays.length) throw typed;
       mioraDiagnostic('miora.transfer.retry', { ...typed.failure, attempt:attempt + 1, retry:attempt + 1, delayMs:delays[attempt] });
-      await wait(delays[attempt]!);
+      try { await sleep(delays[attempt]!, signal); }
+      catch (cause) { throw failureError({ code:'TRANSFER_CANCELLED', stage:typed.failure.stage, retryable:false }, cause); }
     }
   }
 }
@@ -158,9 +159,9 @@ export async function transferPublicMediaToMioraCos(input: {
   const started = performance.now();
   mioraDiagnostic('miora.transfer.started', { expectedBytes:input.size, sourceId:mioraSourceIdentity(input.sourceUrl) });
   try {
-  const key = await transfer(input);
-  mioraDiagnostic('miora.transfer.finished', { outcome:'succeeded', elapsedMs:performance.now() - started, bytes:input.size });
-  return key;
+    const key = await transfer(input);
+    mioraDiagnostic('miora.transfer.finished', { outcome:'succeeded', elapsedMs:performance.now() - started, bytes:input.size });
+    return key;
   } catch (error) {
     const failure = describeMioraTransferFailure(error);
     mioraDiagnostic('miora.transfer.finished', { ...failure, outcome:input.signal?.aborted ? 'cancelled' : 'failed', elapsedMs:performance.now() - started });
@@ -183,7 +184,7 @@ async function transfer(input: Parameters<typeof transferPublicMediaToMioraCos>[
       mioraDiagnostic('miora.transfer.cos_grant', { ...failure.failure, outcome:input.signal?.aborted ? 'cancelled' : 'failed', attempt, elapsedMs:performance.now() - started });
       throw failure;
     }
-  }, delays);
+  }, delays, input.signal);
   const upload = prepareCosUpload(grant, input.fileName, input.mimeType, input.size);
   return retry(async attempt => {
     const started = performance.now();
@@ -224,7 +225,7 @@ async function transfer(input: Parameters<typeof transferPublicMediaToMioraCos>[
       retryable:RETRYABLE_HTTP(uploaded.status), httpStatus:uploaded.status,
       ...await cosFailureIdentifiers(uploaded) });
     return upload.key;
-  }, delays);
+  }, delays, input.signal);
 }
 
 class Semaphore {

@@ -5,6 +5,39 @@ import { MioraUploadIntentStore } from './miora-upload-intents.js';
 const asset = { sha256: 'a'.repeat(64), size: 12, mimeType: 'image/png', kind: 'image' as const };
 
 describe('Miora upload intents', () => {
+  it('staged manifests cannot be consumed before finalization and valid activity renews their lease', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MioraUploadIntentStore(db, 's'.repeat(32));
+      const staged = store.createStaged('staged-store-test-key', [{accountId:'account-a',credits:100,activeJobs:0}], 10, undefined, 2);
+      expect(store.describe(staged.id).status).toBe('declaring');
+      expect(() => store.consume(staged.id, 'job_gateway_staged')).toThrow('not finalized');
+      store.appendManifest(staged.id, 0, [asset]);
+      expect(() => store.finalizeManifest(staged.id)).toThrow('Not every');
+      store.appendManifest(staged.id, 1, [{...asset,sha256:'b'.repeat(64)}]);
+      expect(() => store.readyForJob(staged.id, 'job_gateway_staged')).toThrow('not finalized');
+      store.finalizeManifest(staged.id);
+      db.prepare('UPDATE video_gateway_upload_intents SET expires_at=? WHERE id=?').run('2000-01-01T00:00:00.000Z', staged.id);
+      store.renewStaged(staged.id);
+      expect(Date.parse(store.summary(staged.id).expiresAt)).toBeGreaterThan(Date.now());
+      store.assignUploadKey(staged.id, 0, 'prefix/a.png'); store.assignUploadKey(staged.id, 1, 'prefix/b.png');
+      store.complete(staged.id, [0,1]);
+      expect(store.consume(staged.id, 'job_gateway_staged').references).toHaveLength(2);
+    } finally { db.close(); }
+  });
+
+  it('evidence projection excludes malformed stored failure messages and network fields', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MioraUploadIntentStore(db, 'e'.repeat(32));
+      const id = store.create('readonly-redaction-key', 'account-a', [{...asset,index:0,cosKey:'SECRET',status:'importing',publicUrl:'https://source.invalid/?signature=SECRET'}]);
+      db.prepare('UPDATE video_gateway_upload_items SET status=?,error=? WHERE intent_id=?').run('failed', JSON.stringify({
+        code:'UPLOAD_IMPORT_FAILED', reason:'https://SECRET.invalid/?token=SECRET', stage:'cos_put', retryable:false,networkCode:'SECRET\nforged'
+      }), id);
+      expect(JSON.stringify(store.describePage(id,0,1))).not.toContain('SECRET');
+      expect(store.describePage(id,0,1).items[0]?.error).toMatchObject({reason:'INTERNAL_ERROR',stage:'internal'});
+    } finally { db.close(); }
+  });
   it('keeps cache account-scoped and consumes one stable job only once', () => {
     const db = new Database(':memory:');
     const store = new MioraUploadIntentStore(db, 'x'.repeat(32));

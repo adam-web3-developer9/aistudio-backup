@@ -1,0 +1,17 @@
+# Optional isolated Studio namespace; never install as global journald.conf.
+# Copy only during a separately authorized operator maintenance window.
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse=256M
+SystemKeepFree=1G
+SystemMaxFileSize=16M
+RuntimeMaxUse=32M
+RuntimeMaxFileSize=4M
+MaxRetentionSec=14day
+MaxFileSec=1day
+# The application bounds its queue and counts overflow. Avoid silently suppressing
+# a final failure in a journal rate-limit window; disk retention remains bounded.
+RateLimitIntervalSec=0
+ForwardToSyslog=no
+ForwardToConsole=no

@@ -8,6 +8,8 @@ import type { AccountLease, AccountPool } from './account-pool.js';
 import { AccountBalanceUnavailableError, InsufficientCreditsError, NoAccountsError } from './account-pool.js';
 
 export interface JobRunnerOptions {
+  /** Service-owned asynchronous diagnostic context, including recovered jobs. */
+  runInContext?: (jobId:string, run:() => Promise<void>) => Promise<void>;
   /** Budget for a browser-driven job. */
   timeoutMs: number;
   /** Budget for a direct API job, which polls a render that takes minutes. */
@@ -99,6 +101,11 @@ export class JobRunner {
   }
 
   private async execute(jobId: string): Promise<void> {
+    const run = () => this.executeInContext(jobId);
+    return this.options.runInContext ? this.options.runInContext(jobId, run) : run();
+  }
+
+  private async executeInContext(jobId: string): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job) return;
 
@@ -256,6 +263,11 @@ export class JobRunner {
 
   /** Continue polling a render that the previous process had already submitted. */
   private async resume(jobId: string): Promise<void> {
+    const run = () => this.resumeInContext(jobId);
+    return this.options.runInContext ? this.options.runInContext(jobId, run) : run();
+  }
+
+  private async resumeInContext(jobId: string): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job?.progress?.providerJobId || !job.sessionId) return;
 

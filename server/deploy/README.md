@@ -57,6 +57,47 @@ code releases; the daily existing renewal job handles expiry.
 
 ## Operations
 
+Detailed Miora diagnostics reuse the Node service logger. The repository also
+contains optional, isolated retention examples:
+`journald@aistudio-studio.conf.example` and
+`aistudio-studio-logging.conf.example`. They do not run from `install.sh` or normal
+code deployment and have not been installed on the live host. The example uses a
+256 MiB persistent journal budget, 32 MiB fallback runtime budget, 16/4 MiB file
+rotation, daily rotation and 14-day retention. The active journal file can remain
+until the next rotation; retention is an operational journal budget rather than
+an application business limit.
+
+On a host supporting `LogNamespace` (systemd >=245), a separately authorized
+maintenance window can copy the first example to
+`/etc/systemd/journald@aistudio-studio.conf` and the second to
+`/etc/systemd/system/aistudio-studio.service.d/logging.conf`, then reload systemd
+and restart only Studio and its namespace journal. Do not change global
+`/etc/systemd/journald.conf`; other services keep their own logging policy.
+Reference: [systemd journal namespace configuration](https://github.com/systemd/systemd/blob/main/man/journald.conf.xml)
+and [LogNamespace](https://github.com/systemd/systemd/blob/main/man/systemd.exec.xml).
+
+The following commands are **an operator runbook, not executed by this change**:
+
+```sh
+systemd --version
+install -m 0644 journald@aistudio-studio.conf.example /etc/systemd/journald@aistudio-studio.conf
+install -d -m 0755 /etc/systemd/system/aistudio-studio.service.d
+install -m 0644 aistudio-studio-logging.conf.example /etc/systemd/system/aistudio-studio.service.d/logging.conf
+systemctl daemon-reload
+systemctl restart systemd-journald@aistudio-studio.service
+systemctl restart aistudio-studio.service
+journalctl --namespace=aistudio-studio --disk-usage
+journalctl --namespace=aistudio-studio -u aistudio-studio.service --utc -n 50 --no-pager
+```
+
+Before enabling the namespace, existing logs are in the default journal. Search
+that journal separately for earlier failures. Application overflow/sink errors
+are reported with `miora.diagnostics.dropped`; a flush runs after business
+shutdown/record flushing, including the error path. Staged intent status polling
+renews an active preparation lease. Status endpoints may resume pending imports,
+so historical investigation must use already captured client errors, database
+SELECTs or journals instead of triggering a real transfer through polling.
+
 `systemctl status aistudio-studio.service` checks application health.
 `cat /www/server/aistudio-studio/deployed-commit` shows the running revision.
 `systemctl start aistudio-studio-deploy.service` requests an immediate main check.

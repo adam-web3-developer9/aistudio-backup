@@ -187,3 +187,18 @@ test('Miora source read failure retains its stage, byte count and intent correla
     expect(JSON.stringify(records)).not.toContain('SECRET');
   } finally { vi.restoreAllMocks(); }
 });
+
+test('Miora caller cancellation cannot be mistaken for a retryable TypeError or restart source reads', async () => {
+  const controller = new AbortController();
+  const client = { getCosGrant:vi.fn(async () => ({ prefix:'prefix', bucket:'bucket', region:'ap-test', token:'token', secret_id:'id', secret_key:'key' })) } as unknown as MioraClient;
+  vi.mocked(fetch).mockImplementation(async () => {
+    const reason = new TypeError('user cancellation'); controller.abort(reason); throw reason;
+  });
+  try {
+    const before = vi.mocked(fetch).mock.calls.length;
+    await expect(transferPublicMediaToMioraCos({ client, sourceUrl:'https://source.invalid/x', allowedHosts:['source.invalid'],
+      fileName:'x.png', mimeType:'image/png', size:1, sha256:'0'.repeat(64), signal:controller.signal, retryDelaysMs:[0,0] }))
+      .rejects.toMatchObject({ failure:{code:'TRANSFER_CANCELLED',retryable:false,stage:'source_fetch'} });
+    expect(vi.mocked(fetch).mock.calls.length - before).toBe(1);
+  } finally { vi.restoreAllMocks(); }
+});
