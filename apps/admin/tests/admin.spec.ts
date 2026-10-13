@@ -270,7 +270,7 @@ test("渠道批量管理、真实积分状态和可恢复清理", async ({ page 
       operations.push({ path, body });
       if (path.endsWith("/batch")) {
         for (const row of rows) if (body.ids.includes(row.id)) row.enabled = body.action === "enable";
-        result = { updated: body.ids.length, accounts: rows.filter(row => body.ids.includes(row.id)) };
+        result = { updated: body.ids.length, accounts: rows.filter(row => body.ids.includes(row.id)), results: body.ids.map((id: string) => ({id, status: "succeeded"})) };
       } else if (path.endsWith("/cleanup")) {
         rows[1].enabled = false; rows[1].archivedAt = "2026-10-12T12:01:00Z";
         rows[1].cleanupReason = "insufficient-credits";
@@ -290,7 +290,7 @@ test("渠道批量管理、真实积分状态和可恢复清理", async ({ page 
   await page.getByRole("button", { name: "批量停用", exact: true }).click();
   await page.getByRole("button", { name: "确定", exact: true }).click();
   await expect(page.getByRole("row").filter({ hasText: "一号 Miora" }).getByText("已停用", { exact: true })).toBeVisible();
-  expect(operations[0]).toEqual({ path: "/api/admin/channels/accounts/batch", body: { ids: [ids[0]], action: "disable" } });
+  expect(operations[0]).toEqual({ path: "/api/admin/channels/accounts/batch", body: { ids: [ids[0]], action: "disable", partial: true } });
   await expect(page.getByText("已选 0 个", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "刷新积分", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "刷新选中积分", exact: true })).toHaveCount(0);

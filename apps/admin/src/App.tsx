@@ -43,6 +43,9 @@ import {
   mutation,
   batchChannelAccounts,
   cleanupChannelAccounts,
+  selectChannelAccountIds,
+  summarizeChannelBatch,
+  type ChannelBatchSummary,
   type ChannelBatchAction,
   type ChannelStatistics,
   type AdminIdentity,
@@ -439,6 +442,9 @@ function ResourcePage({
   const [credentialFiles, setCredentialFiles] = useState<CredentialFile[]>([]);
   const [selectedChannelIds, setSelectedChannelIds] = useState<string[]>([]);
   const [channelResult, setChannelResult] = useState<{ text: string; warning: boolean } | null>(null);
+  const [channelBatch, setChannelBatch] = useState<{ action: ChannelBatchAction; summary: ChannelBatchSummary } | null>(null);
+  const [batchProgress, setBatchProgress] = useState("");
+  const channelOperationBusy = useRef(false);
   const readyFileCount = credentialFiles.filter(
     (file) => file.status === "ready",
   ).length;
@@ -516,17 +522,14 @@ function ResourcePage({
     setSelectedChannelIds([]);
     setChannelResult(null);
   }, [section]);
-  const selectedChannels = result.data.filter(row => selectedChannelIds.includes(row.id));
-  const selectedFor = (operation: ChannelBatchAction) => selectedChannels
-    .filter(row => operation === "restore" ? !!row.archivedAt : !row.archivedAt)
-    .map(row => row.id);
   const channelOperation = async <T,>(
     key: string,
     task: () => Promise<T>,
     describe: (response: T) => { text: string; warning: boolean },
     clearSelection = false,
   ) => {
-    if (!superadmin || pending) return;
+    if (!superadmin || pending || channelOperationBusy.current) return;
+    channelOperationBusy.current = true;
     setPending(key);
     setOperationError("");
     setChannelResult(null);
@@ -541,22 +544,45 @@ function ResourcePage({
       setOperationError(errorText(error));
       if ((error as any).statusCode === 401) onExpired();
     } finally {
+      channelOperationBusy.current = false;
       setPending("");
     }
   };
   const cleanChannels = (ids?: string[]) => {
     void channelOperation("channel-cleanup", () => cleanupChannelAccounts(ids), response => ({
-      text: `清理完成：检查 ${response.checked} 个，归档 ${response.archived} 个，保留 ${response.retained} 个，读取失败 ${response.failed} 个。`,
-      warning: response.failed > 0,
-    }), true);
+      text: `${response.unprocessed ? "清理未完成" : "清理完成"}：检查 ${response.checked} 个，归档 ${response.archived} 个，保留 ${response.retained} 个，读取失败 ${response.failed} 个。${response.unprocessed ? `另有 ${response.unprocessed} 个尚未确认，${errorText(response.error)}` : ""}`,
+      warning: response.failed > 0 || !!response.unprocessed,
+    }));
   };
-  const batchChannels = (operation: ChannelBatchAction) => {
-    const ids = selectedFor(operation);
+  const selectMatchingChannels = async () => {
+    if (!superadmin || pending || channelOperationBusy.current) return;
+    channelOperationBusy.current = true;
+    setPending("channel-select");setOperationError("");
+    try {
+      const ids = await selectChannelAccountIds(q, count => setBatchProgress(`正在选择匹配账户：已读取 ${count} 个…`));
+      setSelectedChannelIds(ids);
+    } catch (error) {setOperationError(errorText(error));if ((error as any).statusCode === 401) onExpired();}
+    finally {channelOperationBusy.current = false;setPending("");setBatchProgress("");}
+  };
+  const batchChannels = async (operation: ChannelBatchAction, retry = false) => {
+    if (!superadmin || pending || channelOperationBusy.current) return;
+    const previous = retry ? channelBatch?.summary.results ?? [] : [];
+    const ids = retry ? previous.filter(item => item.status !== "succeeded").map(item => item.id) : selectedChannelIds;
     if (!ids.length) return;
-    void channelOperation(`channel-batch-${operation}`, () => batchChannelAccounts(ids, operation), response => ({
-      text: `已${channelBatchNames[operation]} ${response.updated} 个账户。`,
-      warning: false,
-    }), true);
+    channelOperationBusy.current = true;setPending(`channel-batch-${operation}`);setOperationError("");setChannelResult(null);
+    setBatchProgress(`正在${channelBatchNames[operation]}：0 / ${ids.length} 个账户`);
+    try {
+      const response = await batchChannelAccounts(ids, operation, summary => setBatchProgress(`正在${channelBatchNames[operation]}：已处理 ${summary.succeeded + summary.failed} / ${summary.total} 个，成功 ${summary.succeeded} 个，失败 ${summary.failed} 个`));
+      const latest = new Map(response.results.map(item => [item.id, item]));
+      const summary = summarizeChannelBatch(retry ? previous.map(item => latest.get(item.id) ?? item) : response.results, response.error);
+      setChannelBatch({action: operation, summary});
+      setSelectedChannelIds(summary.results.filter(item => item.status !== "succeeded").map(item => item.id));
+      const text = `${channelBatchNames[operation]}结果：成功 ${summary.succeeded} 个，失败 ${summary.failed} 个，尚未确认 ${summary.unconfirmed} 个。`;
+      setChannelResult({text, warning: summary.failed + summary.unconfirmed > 0});
+      if (summary.failed + summary.unconfirmed) message.warning(text);else message.success(text);
+      if ((response.error as any)?.statusCode === 401) onExpired();
+      await query.refetch();
+    } finally {channelOperationBusy.current = false;setPending("");setBatchProgress("");}
   };
   useEffect(() => {
     if (query.error?.statusCode === 401) onExpired();
@@ -1123,12 +1149,14 @@ function ResourcePage({
               <Input.Search
                 aria-label="搜索记录"
                 allowClear
+                disabled={!!pending}
                 placeholder="搜索邮箱、标识或备注"
                 style={{ width: 300 }}
                 onSearch={(value) => {
                   setQ(value);
                   setPage(1);
                   setSelectedChannelIds([]);
+                  setChannelBatch(null);
                 }}
               />
             )}
@@ -1172,17 +1200,19 @@ function ResourcePage({
             <div className="channel-batch-bar">
               <Space wrap>
                 <Text strong>已选 {selectedChannelIds.length} 个</Text>
-                <Text type="secondary">可全选当前页</Text>
+                <Text type="secondary">选择跨页保留</Text>
+                <Button disabled={!superadmin || !!pending} loading={pending === "channel-select"} onClick={() => void selectMatchingChannels()}>选择全部匹配账户</Button>
+                <Button disabled={!!pending || !selectedChannelIds.length} onClick={() => setSelectedChannelIds([])}>清空选择</Button>
                 {(["enable", "disable", "archive", "restore"] as ChannelBatchAction[]).map(operation => (
                   <Popconfirm
                     key={operation}
-                    title={`${channelBatchNames[operation]}选中的 ${selectedFor(operation).length} 个${operation === "restore" ? "已归档" : "未归档"}账户？`}
+                    title={`${channelBatchNames[operation]}选中的 ${selectedChannelIds.length} 个账户？`}
                     description={operation === "restore" ? "恢复后为停用状态，可再批量启用。" : operation === "archive" ? "归档后停止接收新任务，账户可恢复。" : undefined}
-                    onConfirm={() => batchChannels(operation)}
+                    onConfirm={() => void batchChannels(operation)}
                   >
                     <Button
                       danger={operation === "archive"}
-                      disabled={!superadmin || !!pending || !selectedFor(operation).length}
+                      disabled={!superadmin || !!pending || !selectedChannelIds.length}
                       loading={pending === `channel-batch-${operation}`}
                     >
                       批量{channelBatchNames[operation]}
@@ -1221,6 +1251,14 @@ function ResourcePage({
             style={{ marginBottom: 16 }}
           />
         )}
+        {section === "channels" && batchProgress && <Alert type="info" title={batchProgress} style={{ marginBottom: 16 }} />}
+        {section === "channels" && channelBatch && channelBatch.summary.failed + channelBatch.summary.unconfirmed > 0 && (
+          <Alert type="warning" showIcon title="部分账户尚未完成，重试只处理以下账户。"
+            description={<div>{channelBatch.summary.results.filter(item => item.status !== "succeeded").slice(0, 10).map(item => <div key={item.id}>{item.id}：{item.message || item.code || "尚未确认"}</div>)}
+              {channelBatch.summary.failed + channelBatch.summary.unconfirmed > 10 && <div>其余 {channelBatch.summary.failed + channelBatch.summary.unconfirmed - 10} 个账户也保留待重试。</div>}</div>}
+            action={<Popconfirm title={`重试${channelBatchNames[channelBatch.action]}未完成的 ${channelBatch.summary.failed + channelBatch.summary.unconfirmed} 个账户？`} onConfirm={() => void batchChannels(channelBatch.action, true)}><Button disabled={!!pending || !superadmin}>仅重试未完成账户</Button></Popconfirm>}
+            style={{ marginBottom: 16 }} />
+        )}
         {operationError && (
           <Alert
             type="error"
@@ -1247,6 +1285,7 @@ function ResourcePage({
             dataSource={result.data}
             loading={query.isFetching}
             rowSelection={section === "channels" ? {
+              preserveSelectedRowKeys: true,
               selectedRowKeys: selectedChannelIds,
               onChange: keys => setSelectedChannelIds(keys.map(String)),
               getCheckboxProps: () => ({ disabled: !superadmin || !!pending }),
@@ -1259,10 +1298,10 @@ function ResourcePage({
               total: result.total,
               showSizeChanger: true,
               showTotal: (n) => `共 ${n} 条`,
+              disabled: !!pending,
               onChange: (n, s) => {
                 setPage(n);
                 setSize(s);
-                setSelectedChannelIds([]);
               },
             }}
             locale={{ emptyText: <Empty description="暂无匹配记录" /> }}
