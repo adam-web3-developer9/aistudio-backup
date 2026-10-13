@@ -42,7 +42,6 @@ import {
   getAdmin,
   mutation,
   batchChannelAccounts,
-  refreshChannelCredits,
   cleanupChannelAccounts,
   type ChannelBatchAction,
   type ChannelStatistics,
@@ -146,10 +145,10 @@ function ChannelAccountSummary({
     : !statistics ? "全局统计暂不可用，请刷新后重试。"
     : usable === null ? "当前模型最低额度待配置，暂无法估算可用账户和视频数量。"
     : usable === 0 && unresolved > 0
-      ? "尚有账户未查询或积分读取失败，请先刷新积分核对可用账户。"
+      ? "余额表中仍有未查询或读取失败的账户，请等待任务程序更新余额。"
     : usable === 0
       ? "当前没有积分足够且已启用的可用账户，请补充积分足够的 Miora 账户，或启用已有足额账户。"
-    : `已确认 ${usable} 个可用账户可接收任务。${unresolved > 0 ? "仍有账户未查询或读取失败，可刷新积分继续核对。" : ""}`;
+    : `已确认 ${usable} 个可用账户可接收任务。${unresolved > 0 ? "余额表中仍有未查询或读取失败的账户，任务程序会继续更新。" : ""}`;
   const statusType = failed || (!fetching && statistics && (usable === 0 || usable === null)) ? "warning" : "info";
   return (
     <div className="channel-summary">
@@ -545,12 +544,6 @@ function ResourcePage({
       setPending("");
     }
   };
-  const refreshCredits = (ids?: string[], key = "channel-credits-all") => {
-    void channelOperation(key, () => refreshChannelCredits(ids), response => ({
-      text: `积分刷新完成：检查 ${response.checked} 个，成功 ${response.succeeded} 个，失败 ${response.failed} 个。`,
-      warning: response.failed > 0,
-    }));
-  };
   const cleanChannels = (ids?: string[]) => {
     void channelOperation("channel-cleanup", () => cleanupChannelAccounts(ids), response => ({
       text: `清理完成：检查 ${response.checked} 个，归档 ${response.archived} 个，保留 ${response.retained} 个，读取失败 ${response.failed} 个。`,
@@ -898,14 +891,6 @@ function ResourcePage({
         title: "操作",
         render: (_, r) => (
           <Space wrap>
-            <Button
-              size="small"
-              disabled={!superadmin || !!pending || !!r.archivedAt}
-              loading={pending === `channel-credits-${r.id}`}
-              onClick={() => refreshCredits([r.id], `channel-credits-${r.id}`)}
-            >
-              刷新积分
-            </Button>
             <Button size="small" onClick={() => setChannelJobs(r)}>
               关联任务
             </Button>
@@ -1207,21 +1192,6 @@ function ResourcePage({
               </Space>
             </div>
             <Space wrap>
-              <Button
-                disabled={!superadmin || !!pending || !selectedChannels.some(row => !row.archivedAt)}
-                loading={pending === "channel-credits-selected"}
-                onClick={() => refreshCredits(selectedChannels.filter(row => !row.archivedAt).map(row => row.id), "channel-credits-selected")}
-              >
-                刷新选中积分
-              </Button>
-              <Button
-                icon={<ReloadOutlined />}
-                disabled={!superadmin || !!pending}
-                loading={pending === "channel-credits-all"}
-                onClick={() => refreshCredits()}
-              >
-                刷新全部积分
-              </Button>
               <Popconfirm
                 title={selectedChannelIds.length ? `清理选中的 ${selectedChannelIds.length} 个账户？` : "检查并清理全部未归档账户？"}
                 description="归档不足当前模型最低生成额度，或已确认凭据失效的账户。网络或积分读取失败时保留账户，归档后可恢复。"
@@ -1237,7 +1207,7 @@ function ResourcePage({
               </Popconfirm>
             </Space>
             <Text type="secondary" className="channel-management-note">
-              默认启用且有积分的账户优先，积分从高到低排列。批量状态操作仅处理当前页选中的适用账户；刷新全部积分与全部清理会检查所有未归档账户。
+              默认启用且有积分的账户优先，积分从高到低排列。后台只读取余额表，不实时查询渠道；顶部“刷新”用于重新读取余额表，余额由任务程序维护。
             </Text>
           </div>
         )}

@@ -21,7 +21,7 @@ export function registerChannelRoutes(app:FastifyInstance,options:{runtime:Syste
       runtime.store.audit({actorId:principal.id,action:'channel.account.batch',targetType:'channelAccount',targetId:'multiple',metadata:{action:body.action,ids,updated:accounts.length}});await options.changed?.();return {updated:accounts.length,accounts};
     });
     scoped.post('/api/admin/channels/accounts/credits/refresh',async request=>{
-      const principal=await operate(request);const body=z.object({ids:idsSchema.optional()}).strict().parse(request.body??{});if(!options.operations)throw new SystemError(503,'CHANNEL_WORKER_DISABLED','Channel account checks are unavailable');const result=await options.operations.refresh(body.ids);runtime.store.audit({actorId:principal.id,action:'channel.accounts.credits.refresh',targetType:'channelAccount',targetId:'multiple',metadata:result});return result;
+      const principal=await operate(request);const body=z.object({ids:idsSchema.optional()}).strict().parse(request.body??{});const result=store.creditSummary(body.ids);runtime.store.audit({actorId:principal.id,action:'channel.accounts.credits.readStored',targetType:'channelAccount',targetId:'multiple',metadata:result});return result;
     });
     scoped.post('/api/admin/channels/accounts/cleanup',async request=>{
       const principal=await operate(request);const body=z.object({ids:idsSchema.optional()}).strict().parse(request.body??{});if(!options.operations)throw new SystemError(503,'CHANNEL_WORKER_DISABLED','Channel account checks are unavailable');const result=await options.operations.cleanup(body.ids);runtime.store.audit({actorId:principal.id,action:'channel.accounts.cleanup',targetType:'channelAccount',targetId:'multiple',metadata:result});return result;

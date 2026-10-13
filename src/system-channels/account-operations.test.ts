@@ -94,7 +94,7 @@ test('background scheduling performs cleanup and close drains the operation',asy
   const {store}=fixture();const id=add(store);const operations=new ManagedAccountOperations(store,{minimumCredits:26.48,busy:()=>false,readCredits:async()=>credit(15.52)});operations.schedule([id]);await operations.close();expect(store.public(store.row(id)!)).toMatchObject({cleanupReason:'insufficient-credits',credits:15.52});
 });
 test('new routes enforce superadmin and trusted origin, batch atomically, and audit safe summaries',async()=>{
-  const {db,store}=fixture();const id=add(store,'search account');const operations=new ManagedAccountOperations(store,{minimumCredits:26.48,busy:()=>false,readCredits:async()=>credit(100)});
+  const {db,store}=fixture();const id=add(store,'search account');store.recordCredits(id,store.row(id)!.encrypted,{credits:100,checkedAt:new Date().toISOString()});let reads=0;const operations=new ManagedAccountOperations(store,{minimumCredits:26.48,busy:()=>false,readCredits:async()=>{reads++;return credit(100);}});
   let role='superadmin';const audits:unknown[]=[];const runtime={db,assertRequestOrigin:(req:Parameters<typeof assertSystemRequestOrigin>[0])=>assertSystemRequestOrigin(req,['http://localhost']),requireAdmin:async(_req:unknown,permission?:string)=>{if(permission==='authorize'&&role!=='superadmin')throw new SystemError(403,'SUPERADMIN_REQUIRED','Superadmin required');return {id:'fake-owner'};},store:{audit:(entry:unknown)=>audits.push(entry)}} as unknown as SystemRuntime;
   const app=Fastify();cleanup.push(()=>app.close());registerChannelRoutes(app,{runtime,store,operations});await app.ready();const headers={origin:'http://localhost',cookie:'fake=test'};
   expect((await app.inject({method:'GET',url:'/api/admin/channels/accounts?q=search',headers})).json()).toMatchObject({total:1,cleanupMinimumCredits:26.48});
@@ -102,7 +102,7 @@ test('new routes enforce superadmin and trusted origin, batch atomically, and au
   role='operator';for(const path of ['batch','credits/refresh','cleanup'])expect((await post(path,{ids:[id],...(path==='batch'?{action:'disable'}:{})})).statusCode).toBe(403);role='superadmin';
   expect((await app.inject({method:'POST',url:'/api/admin/channels/accounts/cleanup',headers:{origin:'https://evil.invalid'},payload:{ids:[id]}})).statusCode).toBe(403);
   const absent='managed-miora-'+'a'.repeat(24);expect((await post('batch',{ids:[id,absent],action:'disable'})).statusCode).toBe(404);expect(store.row(id)!.enabled).toBe(1);
-  expect((await post('batch',{ids:[id,id],action:'disable'})).json()).toMatchObject({updated:1});expect((await post('credits/refresh',{ids:[id]})).json()).toEqual({checked:1,succeeded:1,failed:0});
+  expect((await post('batch',{ids:[id,id],action:'disable'})).json()).toMatchObject({updated:1});expect((await post('credits/refresh',{ids:[id]})).json()).toEqual({checked:1,succeeded:1,failed:0});expect(reads).toBe(0);
   await post('batch',{ids:[id],action:'archive'});expect(store.public(store.row(id)!)).toMatchObject({cleanupReason:'manual'});expect((await post('batch',{ids:[id],action:'enable'})).statusCode).toBe(409);
   await post('batch',{ids:[id],action:'restore'});expect(store.public(store.row(id)!)).toMatchObject({enabled:false,cleanupReason:null,archivedAt:null});
   expect((await post('cleanup',{ids:[]})).json()).toEqual({checked:0,archived:0,retained:0,failed:0});expect(audits).toHaveLength(5);expect(JSON.stringify(audits)).not.toContain(jwt('search account'));

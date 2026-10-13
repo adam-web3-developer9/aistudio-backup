@@ -67,11 +67,6 @@ export interface ChannelBatchResult {
   updated: number;
   accounts: Record<string, unknown>[];
 }
-export interface ChannelCreditsResult {
-  checked: number;
-  succeeded: number;
-  failed: number;
-}
 export interface ChannelCleanupResult {
   checked: number;
   archived: number;
@@ -82,11 +77,6 @@ export function batchChannelAccounts(ids: string[], action: ChannelBatchAction) 
   return mutation<ChannelBatchResult>("/api/admin/channels/accounts/batch", "POST", {
     ids,
     action,
-  });
-}
-export function refreshChannelCredits(ids?: string[]) {
-  return mutation<ChannelCreditsResult>("/api/admin/channels/accounts/credits/refresh", "POST", {
-    ...(ids ? { ids } : {}),
   });
 }
 export function cleanupChannelAccounts(ids?: string[]) {

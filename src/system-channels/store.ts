@@ -56,6 +56,16 @@ export class ChannelStore {
     return {...aggregate,minimumCredits:minimum};
   }
   ids() { return (this.db.prepare('SELECT id FROM managed_channel_accounts WHERE archived_at IS NULL ORDER BY updated_at').all() as {id:string}[]).map(row=>row.id); }
+  creditSummary(ids?:readonly string[]) {
+    const selected=[...new Set(ids??this.ids())];
+    let succeeded=0;
+    for(const id of selected){
+      if(!this.row(id))throw new SystemError(404,'ACCOUNT_UNAVAILABLE','Channel account is unavailable');
+      const credit=this.db.prepare('SELECT status FROM managed_channel_credits WHERE account_id=?').get(id) as Pick<CreditRow,'status'>|undefined;
+      if(credit?.status==='ok')succeeded++;
+    }
+    return {checked:selected.length,succeeded,failed:selected.length-succeeded};
+  }
   credentials(id:string) { const row=this.row(id); if(!row)throw new SystemError(404,'ACCOUNT_UNAVAILABLE','Channel account is unavailable');return {row,tokens:this.decrypt(row)}; }
   recordCredits(id:string,encrypted:string,result:{credits:number;checkedAt:string}|{errorCode:string}):boolean {
     if(this.row(id)?.encrypted!==encrypted)return false;

@@ -271,9 +271,6 @@ test("渠道批量管理、真实积分状态和可恢复清理", async ({ page 
       if (path.endsWith("/batch")) {
         for (const row of rows) if (body.ids.includes(row.id)) row.enabled = body.action === "enable";
         result = { updated: body.ids.length, accounts: rows.filter(row => body.ids.includes(row.id)) };
-      } else if (path.endsWith("/credits/refresh")) {
-        rows[1].credits = 15.52; rows[1].creditStatus = "ok";
-        result = { checked: 3, succeeded: 2, failed: 1 };
       } else if (path.endsWith("/cleanup")) {
         rows[1].enabled = false; rows[1].archivedAt = "2026-10-12T12:01:00Z";
         rows[1].cleanupReason = "insufficient-credits";
@@ -295,16 +292,17 @@ test("渠道批量管理、真实积分状态和可恢复清理", async ({ page 
   await expect(page.getByRole("row").filter({ hasText: "一号 Miora" }).getByText("已停用", { exact: true })).toBeVisible();
   expect(operations[0]).toEqual({ path: "/api/admin/channels/accounts/batch", body: { ids: [ids[0]], action: "disable" } });
   await expect(page.getByText("已选 0 个", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /刷新全部积分$/ }).click();
-  await expect(page.getByRole("row").filter({ hasText: "二号 Miora" }).getByText("15.52", { exact: true })).toBeVisible();
-  expect(operations[1]).toEqual({ path: "/api/admin/channels/accounts/credits/refresh", body: {} });
+  await expect(page.getByRole("button", { name: "刷新积分", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "刷新选中积分", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "刷新全部积分", exact: true })).toHaveCount(0);
+  await expect(page.getByText(/后台只读取余额表，不实时查询渠道/)).toBeVisible();
   await page.getByRole("button", { name: "清理无效账户", exact: true }).click();
   await page.getByRole("button", { name: "确定", exact: true }).click();
   const archivedRow = page.getByRole("row").filter({ hasText: "二号 Miora" });
   await expect(archivedRow.getByText("已归档", { exact: true })).toBeVisible();
   await expect(archivedRow.getByText("不足最低生成额度", { exact: true })).toBeVisible();
   await expect(page.getByText(/检查 3 个，归档 1 个，保留 2 个，读取失败 1 个/).first()).toBeVisible();
-  expect(operations).toHaveLength(3);
+  expect(operations).toHaveLength(2);
   await page.screenshot({ path: "../../tmp/admin-channel-management.png", fullPage: true });
 });
 
