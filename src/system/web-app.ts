@@ -14,9 +14,8 @@ import { ChannelJobBridge, type LegacyChannelRuntime } from '../system-channels/
 import { assertVideoGatewayConfiguration, assertVideoGatewayProxyConfiguration } from '../system-channels/video-gateway.js';
 import { config } from '../config.js';
 import { registerPackageShareRoutes } from '../package-shares/routes.js';
-import type { PackageStorage } from '../package-shares/types.js';
 
-export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; videoGatewayEnabled?: boolean; packageSharesEnabled?: boolean; packageStorage?: PackageStorage | null; managedAccountCreditReader?:ManagedAccountCreditReader; trustProxy?: boolean | string[]; mediaPolicy?: Partial<MediaPolicy>; beforeReady?: (app: FastifyInstance) => void | Promise<void> }
+export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; videoGatewayEnabled?: boolean; packageSharesEnabled?: boolean; managedAccountCreditReader?:ManagedAccountCreditReader; trustProxy?: boolean | string[]; mediaPolicy?: Partial<MediaPolicy>; beforeReady?: (app: FastifyInstance) => void | Promise<void> }
 /** One Fastify service: identity, administration, drafts/media/jobs; legacy video becomes an optional channel. */
 export async function buildSystemWebApp(options:SystemWebOptions) {
   if(options.videoGatewayEnabled&&!options.channelsEnabled)throw new Error('Video gateway requires SYSTEM_CHANNELS_ENABLED=true');
@@ -39,7 +38,7 @@ export async function buildSystemWebApp(options:SystemWebOptions) {
       }
     });
     await registerSystemRoutes(app,{runtime});
-    const packageShares=registerPackageShareRoutes(app,{runtime,enabled:options.packageSharesEnabled,storage:options.packageStorage});
+    const packageShares=registerPackageShareRoutes(app,{runtime,enabled:options.packageSharesEnabled});
     const mediaPolicy=resolveMediaPolicy(options.mediaPolicy);
     app.get('/api/system/media-policy',async request=>{await runtime.authenticate(request);return {maxFileBytes:mediaPolicy.maxFileBytes,projectBytes:mediaPolicy.projectBytes,ownerBytes:mediaPolicy.ownerBytes};});
     const projects=registerProjectRoutes(app,{runtime});const blobs=new LocalPrivateBlobStore(options.mediaDirectory);registerSystemMediaRoutes(app,{runtime,projects,blobs,mediaPolicy});
