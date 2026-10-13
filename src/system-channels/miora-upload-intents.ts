@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { SystemError } from '../system/types.js';
+import { mioraDiagnostic } from '../adapters/miora-diagnostics.js';
 import type { JobOptions } from '../types.js';
 
 export type UploadItemKind = 'image' | 'video' | 'audio';
@@ -36,6 +37,7 @@ interface MioraTransferFailure {
   networkCode?: string;
   cosCode?: string;
   cosRequestId?: string;
+  providerCode?: string;
 }
 
 interface IntentRow { id:string; key_hash:string; idempotency_key:string; account_id:string; expires_at:string; consumed_job_id:string|null; created_at:string; reserved_credits:number|null; reservation_until:string|null; options_json:string|null }
@@ -251,6 +253,7 @@ export class MioraUploadIntentStore {
     if (item.status !== 'importing') throw new SystemError(409, 'UPLOAD_ITEM_NOT_IMPORTING', `Upload item ${index} is not being imported`);
     this.db.prepare('UPDATE video_gateway_upload_items SET cos_key=? WHERE intent_id=? AND idx=?').run(key, id, index);
     this.ready(intent.account_id, { ...item, cos_key: key }, true);
+    mioraDiagnostic('miora.intent.item_ready', { uploadIntentId:id, itemIndex:index, bytes:item.size });
   }
 
   importFailed(id: string, index: number, failure: MioraTransferFailure): void {
@@ -260,7 +263,9 @@ export class MioraUploadIntentStore {
         retryable:failure.retryable, ...(failure.httpStatus !== undefined ? { httpStatus:failure.httpStatus } : {}),
         ...(failure.networkCode ? { networkCode:failure.networkCode } : {}),
         ...(failure.cosCode ? { cosCode:failure.cosCode } : {}),
-        ...(failure.cosRequestId ? { cosRequestId:failure.cosRequestId } : {}) } satisfies UploadImportFailure), id, index);
+        ...(failure.cosRequestId ? { cosRequestId:failure.cosRequestId } : {}),
+        ...(failure.providerCode && /^[A-Za-z0-9_.-]{1,80}$/.test(failure.providerCode) ? { providerCode:failure.providerCode } : {}) } satisfies UploadImportFailure), id, index);
+    mioraDiagnostic('miora.intent.item_failed', { uploadIntentId:id, itemIndex:index, ...failure, outcome:'failed' });
   }
 
   consume(id: string, jobId: string): { accountId:string; jobId:string; references:Array<{key:string;kind:UploadItemKind}> } {
@@ -276,6 +281,7 @@ export class MioraUploadIntentStore {
         // Keep a conservative handoff reservation while the queued JobRunner
         // acquires its in-memory lease. The pool ledger takes over afterwards.
         .run(jobId, new Date(Date.now() + 15 * 60_000).toISOString(), id, this.keyHash);
+      mioraDiagnostic('miora.intent.consumed', { uploadIntentId:id, jobId });
       return { accountId: intent.account_id, jobId: intent.consumed_job_id ?? jobId,
         references: items.map(item => ({ key: item.cos_key, kind: item.kind })) };
     })();
@@ -312,7 +318,8 @@ export class MioraUploadIntentStore {
           ...(typeof parsed.networkCode === 'string' ? { networkCode:parsed.networkCode } : {}),
           ...(typeof parsed.cosCode === 'string' && /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(parsed.cosCode) ? { cosCode:parsed.cosCode } : {}),
           ...(typeof parsed.cosRequestId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(parsed.cosRequestId)
-            ? { cosRequestId:parsed.cosRequestId } : {})
+            ? { cosRequestId:parsed.cosRequestId } : {}),
+          ...(typeof parsed.providerCode === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(parsed.providerCode) ? { providerCode:parsed.providerCode } : {})
         };
     } catch { /* Legacy rows contain only UPLOAD_IMPORT_FAILED. */ }
     return { code:'UPLOAD_IMPORT_FAILED', reason:'INTERNAL_ERROR', stage:'internal', retryable:false };

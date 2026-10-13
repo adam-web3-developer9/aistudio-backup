@@ -1,5 +1,9 @@
 # Miora upload intents
 
+Backend diagnostics use the existing service logger, with fixed `miora.*` events and bounded asynchronous buffering. Correlate `requestId`, `apiRequestId`, `uploadIntentId`, `itemIndex` and provider `taskId`; transfer events distinguish source fetch/read/hash verification, COS grant, PUT response, retries and final outcome. This transfer uses a single streaming PUT, so there are no multipart-init/part/complete events. Provider errors retain only bounded codes and COS request IDs. Source identity hashes the origin/path and excludes the signed query; neither source/object locations, credentials nor bodies are logged.
+
+For a real failure investigation, provide UTC time window, client task ID, intent ID/item index and the safe `error` fields returned by `GET /v1/upload-intents/:id`. If intent creation failed, provide its request ID and HTTP/application code. Capture the matching service events from `journalctl -u aistudio-studio.service --utc --since ... --until ... --no-pager`; don't replay paid jobs or upload private media to reproduce a failure. Repository installation sends stdout to systemd's journal. Its actual disk budget/retention belongs to the existing host journald configuration and has not been verified in this workspace; operators can inspect it with `systemd-analyze cat-config systemd/journald.conf` and `journalctl --disk-usage`. Keep finite journal size and retention under the host's existing policy; this feature creates no second log file and does not change production configuration. `miora.diagnostics.dropped` reports local queue overflow/sink failures.
+
 The managed video gateway prepares Miora references before it creates a paid generation job.
 
 - `POST /v1/upload-intents` selects and pins one enabled Miora account.

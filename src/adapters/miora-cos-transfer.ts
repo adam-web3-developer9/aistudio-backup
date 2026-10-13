@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { fetch } from 'undici';
 import { MioraApiError, prepareCosUpload } from './miora-api.js';
 import type { MioraClient } from './miora-client.js';
+import { mioraDiagnostic, mioraSourceIdentity } from './miora-diagnostics.js';
 
 export type MioraTransferStage = 'source_fetch' | 'source_verify' | 'cos_grant' | 'cos_put' | 'internal';
 
@@ -13,6 +14,7 @@ export interface MioraTransferFailure {
   networkCode?: string;
   cosCode?: string;
   cosRequestId?: string;
+  providerCode?: string;
 }
 
 export class MioraTransferError extends Error {
@@ -88,7 +90,7 @@ function transientFailure(stage: MioraTransferStage, error: unknown): MioraTrans
     current = (current as { cause?:unknown }).cause;
   }
   if (error instanceof MioraApiError) {
-    return failureError({ code:'COS_GRANT_HTTP', stage, retryable:RETRYABLE_HTTP(error.status), httpStatus:error.status }, error);
+    return failureError({ code:'COS_GRANT_HTTP', stage, retryable:RETRYABLE_HTTP(error.status), httpStatus:error.status, ...(error.apiCode && /^[A-Za-z0-9_.-]{1,80}$/.test(error.apiCode) ? { providerCode:error.apiCode } : {}) }, error);
   }
   const code = networkCode(error);
   const recognizedCode = code && RETRYABLE_NETWORK_CODES.has(code) ? code : undefined;
@@ -99,13 +101,14 @@ function transientFailure(stage: MioraTransferStage, error: unknown): MioraTrans
 
 function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-async function retry<T>(operation: () => Promise<T>, delays: readonly number[]): Promise<T> {
+async function retry<T>(operation: (attempt: number) => Promise<T>, delays: readonly number[]): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
-    try { return await operation(); }
+    try { return await operation(attempt + 1); }
     catch (error) {
       const typed = error instanceof MioraTransferError ? error
         : failureError({ code:'INTERNAL_ERROR', stage:'internal', retryable:false }, error);
       if (!typed.failure.retryable || attempt >= delays.length) throw typed;
+      mioraDiagnostic('miora.transfer.retry', { ...typed.failure, attempt:attempt + 1, retry:attempt + 1, delayMs:delays[attempt] });
       await wait(delays[attempt]!);
     }
   }
@@ -115,8 +118,15 @@ async function fetchSource(input: { sourceUrl:string; allowedHosts:readonly stri
   let source = safeSource(input.sourceUrl, input.allowedHosts);
   for (let redirects = 0; redirects <= 3; redirects += 1) {
     let response;
+    const started = performance.now();
+    mioraDiagnostic('miora.transfer.source_fetch', { outcome:'started', attempt:redirects + 1 });
     try { response = await fetch(source, { redirect:'manual', signal:input.signal }); }
-    catch (error) { throw transientFailure('source_fetch', error); }
+    catch (error) {
+      const failure = transientFailure('source_fetch', error);
+      mioraDiagnostic('miora.transfer.source_fetch', { ...failure.failure, outcome:input.signal?.aborted ? 'cancelled' : 'failed', elapsedMs:performance.now() - started });
+      throw failure;
+    }
+    mioraDiagnostic('miora.transfer.source_fetch', { outcome:'response', httpStatus:response.status, elapsedMs:performance.now() - started });
     if (![301, 302, 303, 307, 308].includes(response.status)) {
       if (!response.ok || !response.body) throw failureError({ code:'SOURCE_FETCH_HTTP', stage:'source_fetch',
         retryable:RETRYABLE_HTTP(response.status), httpStatus:response.status });
@@ -145,13 +155,38 @@ export async function transferPublicMediaToMioraCos(input: {
   signal?: AbortSignal;
   retryDelaysMs?: readonly number[];
 }): Promise<string> {
+  const started = performance.now();
+  mioraDiagnostic('miora.transfer.started', { expectedBytes:input.size, sourceId:mioraSourceIdentity(input.sourceUrl) });
+  try {
+  const key = await transfer(input);
+  mioraDiagnostic('miora.transfer.finished', { outcome:'succeeded', elapsedMs:performance.now() - started, bytes:input.size });
+  return key;
+  } catch (error) {
+    const failure = describeMioraTransferFailure(error);
+    mioraDiagnostic('miora.transfer.finished', { ...failure, outcome:input.signal?.aborted ? 'cancelled' : 'failed', elapsedMs:performance.now() - started });
+    throw error;
+  }
+}
+
+async function transfer(input: Parameters<typeof transferPublicMediaToMioraCos>[0]): Promise<string> {
   const delays = input.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
-  const grant = await retry(async () => {
-    try { return await input.client.getCosGrant(input.signal); }
-    catch (error) { throw transientFailure('cos_grant', error); }
+  const grant = await retry(async attempt => {
+    const started = performance.now();
+    mioraDiagnostic('miora.transfer.cos_grant', { outcome:'started', attempt });
+    try {
+      const grant = await input.client.getCosGrant(input.signal);
+      mioraDiagnostic('miora.transfer.cos_grant', { outcome:'succeeded', attempt, elapsedMs:performance.now() - started });
+      return grant;
+    }
+    catch (error) {
+      const failure = transientFailure('cos_grant', error);
+      mioraDiagnostic('miora.transfer.cos_grant', { ...failure.failure, outcome:input.signal?.aborted ? 'cancelled' : 'failed', attempt, elapsedMs:performance.now() - started });
+      throw failure;
+    }
   }, delays);
   const upload = prepareCosUpload(grant, input.fileName, input.mimeType, input.size);
-  return retry(async () => {
+  return retry(async attempt => {
+    const started = performance.now();
     const response = await fetchSource(input);
     let received = 0;
     const digest = createHash('sha256');
@@ -165,21 +200,26 @@ export async function transferPublicMediaToMioraCos(input: {
           yield bytes;
         }
       } catch (error) {
-        if (error instanceof MioraTransferError) throw error;
-        throw transientFailure('source_fetch', error);
+        const failure = transientFailure('source_fetch', error);
+        mioraDiagnostic('miora.transfer.source_read', { ...failure.failure, outcome:input.signal?.aborted ? 'cancelled' : 'failed', bytes:received, expectedBytes:input.size, elapsedMs:performance.now() - started });
+        throw failure;
       }
       if (received !== input.size) throw failureError({ code:'SOURCE_ENDED_EARLY', stage:'source_verify', retryable:false });
       if (digest.digest('hex') !== input.sha256.toLowerCase()) {
         throw failureError({ code:'SOURCE_HASH_CHANGED', stage:'source_verify', retryable:false });
       }
+      mioraDiagnostic('miora.transfer.source_verify', { outcome:'succeeded', bytes:received, expectedBytes:input.size, elapsedMs:performance.now() - started, attempt });
     })();
     let uploaded;
+    mioraDiagnostic('miora.transfer.cos_put', { outcome:'started', attempt, expectedBytes:input.size });
     try {
       uploaded = await fetch(upload.url, { method:'PUT', headers:upload.headers, body:counted, signal:input.signal, duplex:'half' });
     } catch (error) {
-      if (error instanceof MioraTransferError) throw error;
-      throw transientFailure('cos_put', error);
+      const failure = transientFailure('cos_put', error);
+      mioraDiagnostic('miora.transfer.cos_put', { ...failure.failure, outcome:input.signal?.aborted ? 'cancelled' : 'failed', attempt, bytes:received, elapsedMs:performance.now() - started });
+      throw failure;
     }
+    mioraDiagnostic('miora.transfer.cos_put', { outcome:'response', httpStatus:uploaded.status, bytes:received, attempt, elapsedMs:performance.now() - started });
     if (uploaded.status !== 200) throw failureError({ code:'COS_PUT_HTTP', stage:'cos_put',
       retryable:RETRYABLE_HTTP(uploaded.status), httpStatus:uploaded.status,
       ...await cosFailureIdentifiers(uploaded) });

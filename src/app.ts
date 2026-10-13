@@ -30,6 +30,7 @@ import {
 import { MioraAdapter, mioraEstimatedVideoCredits, mioraJobBudgetMs, mioraMinimumVideoCredits } from './adapters/miora-adapter.js';
 import { mioraTokenCookies, prepareCosUpload, readMioraTokens, useMioraProxy, type MioraTokens } from './adapters/miora-api.js';
 import { MioraClient } from './adapters/miora-client.js';
+import { MioraDiagnosticSink, mioraDiagnostic, withMioraDiagnostics } from './adapters/miora-diagnostics.js';
 import { describeMioraTransferFailure, MioraCosTransferCoordinator, transferPublicMediaToMioraCos } from './adapters/miora-cos-transfer.js';
 import {
   MioraCredentials,
@@ -112,6 +113,11 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const uploadIntents = gateway && options.managedChannels ? new MioraUploadIntentStore(options.managedChannels.db, config.apiKey!) : undefined;
   const mioraTransfers = new MioraCosTransferCoordinator();
   const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
+  const mioraDiagnosticSink = new MioraDiagnosticSink(app.log);
+  app.addHook('onRequest', (request, _reply, done) => {
+    withMioraDiagnostics(mioraDiagnosticSink, { requestId:request.id }, done);
+  });
+  app.addHook('onClose', async () => { mioraDiagnosticSink.flush(); });
   /** Accounts seen at 0 credits, kept so `/v1/accounts` can report them. */
   const exhaustedAccounts = new Map<string, AccountSnapshot>();
   const assets = new AssetStore(config.dataDir, {
@@ -1094,6 +1100,9 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   }
 
   async function signedPendingItems(id: string) {
+    return withMioraDiagnostics(mioraDiagnosticSink, { uploadIntentId:id }, () => signedPendingItemsInContext(id));
+  }
+  async function signedPendingItemsInContext(id: string) {
     const description = uploadIntents!.describe(id);
     const describedItems = new Map(description.items.map(item => [item.index, item]));
     const plan = uploadIntents!.plan(id);
@@ -1116,7 +1125,8 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const importRuns = new Map<string,Promise<void>>();
   function resumePublicImports(id: string): void {
     if (importRuns.has(id)) return;
-    const run = (async () => {
+    const run = withMioraDiagnostics(mioraDiagnosticSink, { uploadIntentId:id }, async () => {
+      mioraDiagnostic('miora.intent.import_started');
       const plan = uploadIntents!.plan(id);
       if (plan.consumedJobId) return;
       const session = await sessions.get(plan.accountId);
@@ -1128,6 +1138,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
       await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
         while (cursor < pending.length) {
           const item = pending[cursor++]!;
+          await withMioraDiagnostics(mioraDiagnosticSink, { itemIndex:item.idx }, async () => {
           try {
             const key = await mioraTransfers.transfer({ accountId:plan.accountId,
               identity:`${item.sha256}:${item.size}:${item.mime_type}:${item.kind}`,
@@ -1140,9 +1151,10 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
             app.log.warn({ uploadIntentId:id, index:item.idx, ...failure }, 'Public media transfer failed');
             uploadIntents!.importFailed(id, item.idx, failure);
           }
+          });
         }
       }));
-    })().catch(error => app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed'))
+    }).catch(error => app.log.warn({ err:error, uploadIntentId:id }, 'Upload intent import recovery failed'))
       .finally(() => importRuns.delete(id));
     importRuns.set(id, run);
   }

@@ -1,9 +1,10 @@
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { fetch, type Dispatcher } from 'undici';
 import type { BrowserCookie, CreditBalance, ProviderAccount } from '../types.js';
 import { isNetworkError } from './provider-retry.js';
 import { createMioraProxyAgent } from './miora-proxy.js';
 import { createSystemProxyResolver } from './system-proxy.js';
+import { mioraDiagnostic, mioraNetworkCode, withMioraDiagnosticContext } from './miora-diagnostics.js';
 
 /**
  * Miora (miora.design) is a video/image generation aggregator that speaks a
@@ -188,11 +189,13 @@ async function requestViaMioraRoutes(
   init: { method: string; headers: Record<string, string>; body?: string },
   options: { signal?: AbortSignal; timeoutMs?: number; safeToReplay: boolean; path: string; useProxy?: boolean; beforeRequest?: () => Promise<void> }
 ): Promise<{ status: number; text: string }> {
+  return withMioraDiagnosticContext({ apiRequestId:randomUUID() }, async () => {
   // Snapshot routes for this request; concurrent requests never change each other's exit.
   const snapshot = options.useProxy ? await acquireMioraRoutes() : undefined;
   try {
     return await requestViaRouteSnapshot(url, init, options, snapshot?.routes ?? [{ name: '直连' }]);
   } finally { snapshot?.release(); }
+  });
 }
 
 async function requestViaRouteSnapshot(
@@ -202,8 +205,10 @@ async function requestViaRouteSnapshot(
   routes: MioraRoute[]
 ): Promise<{ status: number; text: string }> {
   const failures: string[] = [];
+  let attempt = 0;
   let lastError: unknown;
   for (const route of routes) {
+    attempt++;
     options.signal?.throwIfAborted();
     await options.beforeRequest?.();
     options.signal?.throwIfAborted();
@@ -212,18 +217,30 @@ async function requestViaRouteSnapshot(
     options.signal?.addEventListener('abort', onAbort, { once: true });
     const timeoutMs = options.timeoutMs ?? (options.safeToReplay ? 20_000 : undefined);
     const timer = timeoutMs === undefined ? undefined : setTimeout(() => controller.abort(), timeoutMs);
+    const started = performance.now();
+    const routeLabel = route.dispatcher ? 'proxy' : 'direct';
+    mioraDiagnostic('miora.api.attempt', { outcome:'started', path:options.path, method:init.method, route:routeLabel, attempt });
     try {
       const response = await fetch(url, { ...init, dispatcher: route.dispatcher, signal: controller.signal });
       const text = await response.text();
+      let providerCode: string | undefined;
+      try {
+        const data = JSON.parse(text) as { code?:unknown; data?:{code?:unknown} };
+        const code = data?.code ?? data?.data?.code;
+        if (typeof code === 'string' || typeof code === 'number') providerCode = String(code);
+      } catch { /* Bodies are never included in diagnostic records. */ }
+      mioraDiagnostic('miora.api.attempt', { outcome:'response', path:options.path, method:init.method, route:routeLabel, attempt, httpStatus:response.status, providerCode, elapsedMs:performance.now() - started });
       if (options.safeToReplay && (response.status === 408 || response.status === 429 || response.status >= 500)) {
         let json: unknown;
         try { json = JSON.parse(text); } catch { /* Keep the original HTTP response. */ }
         lastError = toApiError({ status: response.status, text, json }, options.path);
         failures.push(`${route.name}: HTTP ${response.status}`);
+        mioraDiagnostic('miora.api.route_retry', { path:options.path, attempt, httpStatus:response.status });
         continue;
       }
       return { status: response.status, text };
     } catch (error) {
+      mioraDiagnostic('miora.api.attempt', { outcome:options.signal?.aborted ? 'cancelled' : controller.signal.aborted ? 'timeout' : 'failed', path:options.path, method:init.method, route:routeLabel, attempt, networkCode:mioraNetworkCode(error), elapsedMs:performance.now() - started });
       if (options.signal?.aborted) throw error;
       const canFallback = options.safeToReplay
         ? controller.signal.aborted || isNetworkError(error)

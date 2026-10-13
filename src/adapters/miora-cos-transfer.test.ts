@@ -4,6 +4,7 @@ import { fetch } from 'undici';
 import { MioraApiError } from './miora-api.js';
 import { MioraCosTransferCoordinator, MioraTransferError, transferPublicMediaToMioraCos } from './miora-cos-transfer.js';
 import type { MioraClient } from './miora-client.js';
+import { MioraDiagnosticSink, withMioraDiagnostics } from './miora-diagnostics.js';
 
 vi.mock('undici', async importOriginal => ({
   ...await importOriginal<typeof import('undici')>(), fetch: vi.fn()
@@ -155,4 +156,34 @@ test('Miora transfer coordinator singleflights by account and bounds account con
   await expect(Promise.all([first, shared, queued])).resolves.toEqual(['key-a', 'key-a', 'key-b']);
   expect(runs).toBe(2);
   expect(peak).toBe(1);
+});
+
+test('Miora source read failure retains its stage, byte count and intent correlation through the PUT wrapper', async () => {
+  const records: Record<string, unknown>[] = [];
+  const sink = new MioraDiagnosticSink({ info:fields => { records.push(fields); } });
+  const client = { getCosGrant:vi.fn(async () => ({ prefix:'SECRET-prefix', bucket:'bucket', region:'ap-test',
+    token:'SECRET-token', secret_id:'SECRET-id', secret_key:'SECRET-key' })) } as unknown as MioraClient;
+  vi.mocked(fetch).mockImplementation(async (address, options) => {
+    if (String(address).startsWith('https://source.invalid/')) return { ok:true, status:200,
+      headers:new Headers({ 'content-length':'2' }), body:(async function* () {
+        yield Buffer.from('x');
+        throw new TypeError('SECRET signed source response', { cause:Object.assign(new Error('SECRET'), { code:'ECONNRESET' }) });
+      })() } as unknown as Awaited<ReturnType<typeof fetch>>;
+    try { for await (const _chunk of options!.body as AsyncIterable<Uint8Array>) { /* consume */ } }
+    catch (error) { throw new TypeError('SECRET fetch failed', { cause:error }); }
+    return { status:200 } as Awaited<ReturnType<typeof fetch>>;
+  });
+  try {
+    await expect(withMioraDiagnostics(sink, { requestId:'req-source', uploadIntentId:'upload-source', itemIndex:3 }, () =>
+      transferPublicMediaToMioraCos({ client, sourceUrl:'https://source.invalid/SECRET?signature=SECRET',
+        allowedHosts:['source.invalid'], fileName:'SECRET.png', mimeType:'image/png', size:2,
+        sha256:'0'.repeat(64), retryDelaysMs:[] }))).rejects.toMatchObject({
+          failure:{ stage:'source_fetch', code:'NETWORK_ERROR', networkCode:'ECONNRESET', retryable:true }
+        });
+    sink.flush();
+    expect(records).toContainEqual(expect.objectContaining({ event:'miora.transfer.source_read', bytes:1,
+      requestId:'req-source', uploadIntentId:'upload-source', itemIndex:3, stage:'source_fetch', networkCode:'ECONNRESET' }));
+    expect(records).toContainEqual(expect.objectContaining({ event:'miora.transfer.finished', outcome:'failed', stage:'source_fetch' }));
+    expect(JSON.stringify(records)).not.toContain('SECRET');
+  } finally { vi.restoreAllMocks(); }
 });
