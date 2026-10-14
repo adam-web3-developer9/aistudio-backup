@@ -114,6 +114,38 @@ test('Miora COS rejection retains only safe XML identifiers', async () => {
   } finally { vi.restoreAllMocks(); }
 });
 
+test('Miora COS RequestTimeout uses the existing finite direct-stream retry', async () => {
+  const bytes = Buffer.from('verified');
+  const getCosGrant = vi.fn(async () => ({ prefix:'safe-prefix', bucket:'bucket', region:'ap-test',
+    token:'token', secret_id:'id', secret_key:'key' }));
+  let sourceCalls = 0;
+  let putCalls = 0;
+  vi.mocked(fetch).mockImplementation(async (address, options) => {
+    if (String(address).startsWith('https://source.invalid/')) {
+      sourceCalls += 1;
+      return { ok:true, status:200, headers:new Headers({ 'content-length':String(bytes.length) }),
+        body:(async function* () { yield bytes; })()
+      } as unknown as Awaited<ReturnType<typeof fetch>>;
+    }
+    const received: Buffer[] = [];
+    for await (const chunk of options!.body as AsyncIterable<Uint8Array>) received.push(Buffer.from(chunk));
+    expect(Buffer.concat(received)).toEqual(bytes);
+    putCalls += 1;
+    return (putCalls === 1
+      ? { status:400, body:(async function* () { yield Buffer.from('<Error><Code>RequestTimeout</Code></Error>'); })() }
+      : { status:200 }) as unknown as Awaited<ReturnType<typeof fetch>>;
+  });
+  try {
+    await expect(transferPublicMediaToMioraCos({ client:{ getCosGrant } as unknown as MioraClient,
+      sourceUrl:'https://source.invalid/x', allowedHosts:['source.invalid'], fileName:'x.png',
+      mimeType:'image/png', size:bytes.length, sha256:createHash('sha256').update(bytes).digest('hex'),
+      retryDelaysMs:[0] })).resolves.toBe('safe-prefix/x.png');
+    expect(sourceCalls).toBe(2);
+    expect(putCalls).toBe(2);
+    expect(getCosGrant).toHaveBeenCalledTimes(2);
+  } finally { vi.restoreAllMocks(); }
+});
+
 test('Miora cloud transfer retries a transient COS grant without downloading the source first', async () => {
   const bytes = Buffer.from('x');
   const getCosGrant = vi.fn()

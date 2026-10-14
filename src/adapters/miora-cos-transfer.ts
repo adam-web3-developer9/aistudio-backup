@@ -266,9 +266,12 @@ async function transfer(input: Parameters<typeof transferPublicMediaToMioraCos>[
     }
     stage='cos_put';idle.progress();
     mioraDiagnostic('miora.transfer.cos_put', { outcome:'response', httpStatus:uploaded.status, bytes:received, attempt, elapsedMs:performance.now() - started });
-    if (uploaded.status !== 200) throw failureError({ code:'COS_PUT_HTTP', stage:'cos_put',
-      retryable:RETRYABLE_HTTP(uploaded.status), httpStatus:uploaded.status,
-      ...await cosFailureIdentifiers(uploaded,signal,idle.progress) });
+    if (uploaded.status !== 200) {
+      const identifiers = await cosFailureIdentifiers(uploaded,signal,idle.progress);
+      throw failureError({ code:'COS_PUT_HTTP', stage:'cos_put',
+        retryable:RETRYABLE_HTTP(uploaded.status) || identifiers.cosCode === 'RequestTimeout',
+        httpStatus:uploaded.status, ...identifiers });
+    }
     await uploaded.body?.cancel?.().catch(()=>{});
     return upload.key;
     } catch(error) {
