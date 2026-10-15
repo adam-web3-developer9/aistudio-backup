@@ -227,7 +227,8 @@ export class JobRunner {
           if (!lease || job.sessionId !== undefined) {
             throw new JobError(
               job.id.startsWith('job_gateway_') ? 'ACCOUNT_INSUFFICIENT_CREDITS' : 'INSUFFICIENT_CREDITS',
-              error instanceof Error ? error.message : String(error)
+              error instanceof Error ? error.message : String(error),
+              (error as { providerTerminal?: boolean })?.providerTerminal
             );
           }
 
@@ -261,10 +262,33 @@ export class JobRunner {
     await this.resume(jobId);
   }
 
+  /** An authorized gateway read can resume only an unresolved, already submitted task. */
+  async resumeGatewayQuery(jobId: string): Promise<boolean> {
+    const eligible = (job: JobRecord | undefined): job is JobRecord => !!job
+      && job.id.startsWith('job_gateway_') && job.adapterId === 'miora-v1'
+      && job.status === 'failed' && !!job.sessionId && !!job.progress?.providerJobId
+      && (job.error?.providerTerminal === false || job.error?.providerTerminal === undefined
+        && job.error?.code === 'ACCOUNT_INSUFFICIENT_CREDITS'
+        && job.error.message === 'Miora /media-generate/progress failed (10005): Insufficient AI credits');
+    const job = this.jobs.get(jobId);
+    if (!eligible(job) || this.executing.has(jobId)) return false;
+    await this.assertSubmitAllowed(job);
+    if (!eligible(this.jobs.get(jobId)) || this.executing.has(jobId)) return false;
+    this.jobs.update(jobId, { status:'running', error:undefined, finishedAt:undefined });
+    void this.resume(jobId);
+    return true;
+  }
+
   /** Continue polling a render that the previous process had already submitted. */
   private async resume(jobId: string): Promise<void> {
+    if (this.executing.has(jobId)) return;
+    this.executing.add(jobId);
     const run = () => this.resumeInContext(jobId);
-    return this.options.runInContext ? this.options.runInContext(jobId, run) : run();
+    try {
+      await (this.options.runInContext ? this.options.runInContext(jobId, run) : run());
+    } finally {
+      this.executing.delete(jobId);
+    }
   }
 
   private async resumeInContext(jobId: string): Promise<void> {
@@ -358,7 +382,7 @@ export class JobRunner {
 }
 
 class JobError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(readonly code: string, message: string, readonly providerTerminal?: boolean) {
     super(message);
   }
 }
@@ -381,6 +405,7 @@ function isClassifiedError(error: unknown): error is Error & {
   attempts?: number;
   providerCode?: number | string;
   providerMessage?: string;
+  providerTerminal?: boolean;
 } {
   return error instanceof Error
     && typeof (error as { code?: unknown }).code === 'string'
@@ -388,7 +413,8 @@ function isClassifiedError(error: unknown): error is Error & {
 }
 
 function normalizeError(error: unknown): JobErrorRecord {
-  if (error instanceof JobError) return { code: error.code, message: error.message, retryable: false };
+  if (error instanceof JobError) return { code: error.code, message: error.message, retryable: false,
+    ...(typeof error.providerTerminal === 'boolean' && { providerTerminal:error.providerTerminal }) };
   if (error instanceof InsufficientCreditsError) {
     return { code: error.code, message: error.message, retryable: false, accounts: error.accounts };
   }
@@ -407,6 +433,7 @@ function normalizeError(error: unknown): JobErrorRecord {
       code: error.code,
       message: error.message,
       retryable: error.retryable,
+      ...(typeof error.providerTerminal === 'boolean' && { providerTerminal:error.providerTerminal }),
       ...(error.attempts !== undefined && { attempts: error.attempts }),
       ...(error.providerCode !== undefined && { providerCode: error.providerCode }),
       ...(error.providerMessage !== undefined && { providerMessage: error.providerMessage })

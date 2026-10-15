@@ -140,6 +140,8 @@ export interface JobRecord extends CreateJobInput {
      * submission may succeed. False means the same input will fail again.
      */
     retryable?: boolean;
+    /** Task verdict, distinct from a failed status query or local execution timeout. */
+    providerTerminal?: boolean;
     /** How many tries the service made on the failing step before giving up. */
     attempts?: number;
     /** Hailuo's own status code / HTTP status, when there was one. */

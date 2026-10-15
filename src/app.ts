@@ -1389,7 +1389,11 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
         `Unknown job (finished jobs are kept for ${config.jobRetentionDays} days)`
       ));
     }
-    return reply.send(gateway ? projectGatewayJob(job) : job);
+    if (gateway) {
+      await runner.resumeGatewayQuery(job.id);
+      return reply.send(projectGatewayJob(jobs.get(job.id)!));
+    }
+    return reply.send(job);
   });
 
   /** Recent jobs, newest first — for finding work whose id was lost. */

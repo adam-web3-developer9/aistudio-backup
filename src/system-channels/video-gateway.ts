@@ -99,6 +99,7 @@ const errorMessages: Readonly<Record<string, string>> = {
   PROVIDER_BUSY: 'The provider is busy',
   PROVIDER_NETWORK_ERROR: 'The provider could not be reached',
   PROVIDER_RENDER_FAILED: 'The provider could not generate the video',
+  PROVIDER_QUERY_BLOCKED: 'The provider blocked the status query for an already submitted video; continue checking the same task',
   PROVIDER_JOB_NOT_FOUND: 'The provider task could not be found',
   GATEWAY_ACCOUNT_UNAVAILABLE: 'The gateway channel account is unavailable',
   GATEWAY_EXECUTION_UNAVAILABLE: 'The gateway execution owner is unavailable',
@@ -120,7 +121,10 @@ export function projectGatewayJob(job: JobRecord) {
   const videoUrl = publicVideoUrl(job.result);
   const percent = job.progress?.percent;
   const providerJobId = job.progress?.providerJobId;
+  const hasProviderJobId = typeof providerJobId === 'string' && resourceId.test(providerJobId);
   const code = job.error && Object.hasOwn(errorMessages, job.error.code) ? job.error.code : 'VIDEO_GENERATION_FAILED';
+  const knownRenderFailure = code === 'PROVIDER_RENDER_FAILED'
+    && /^system error,\s*MiniMax-H3 context ir\s*\(status_code=2000\)$/i.test(job.error?.providerMessage?.trim() ?? '');
   return {
     id: job.id, status: job.status, createdAt: job.createdAt,
     ...(job.startedAt ? { startedAt: job.startedAt } : {}),
@@ -128,12 +132,15 @@ export function projectGatewayJob(job: JobRecord) {
     ...(videoUrl ? { result: { videoUrl } } : {}),
     ...(job.progress ? { progress: {
       ...(typeof percent === 'number' && Number.isFinite(percent) ? { percent: Math.max(0, Math.min(100, percent)) } : {}),
-      ...(typeof providerJobId === 'string' && resourceId.test(providerJobId) ? { providerJobId } : {}),
+      ...(hasProviderJobId ? { providerJobId } : {}),
       message: statusMessages[job.status],
     } } : {}),
-    ...(job.error ? { error: { code, message: errorMessages[code] ?? 'Video generation failed',
+    ...(job.error ? { error: { code, message: knownRenderFailure
+      ? 'MiniMax H3 internal generation error (status_code=2000)' : errorMessages[code] ?? 'Video generation failed',
       ...(code === 'ACCOUNT_INSUFFICIENT_CREDITS' ? { scope: 'account' } : {}),
       ...(code === 'INSUFFICIENT_CREDITS' ? { scope: 'pool' } : {}),
+      ...(job.error.providerTerminal === true || job.error.providerTerminal === false && hasProviderJobId
+        ? { providerTerminal:job.error.providerTerminal } : {}),
       ...(typeof job.error.retryable === 'boolean' ? { retryable: job.error.retryable } : {}) } } : {}),
   };
 }

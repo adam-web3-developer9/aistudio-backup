@@ -23,6 +23,7 @@ import {
   MioraRenderTimeoutError,
   MioraTaskFailedError,
   MioraTaskNotFoundError,
+  isMioraProgressCreditBlocked,
   classifyMioraError
 } from './miora-retry.js';
 import { DEFAULT_RETRY_DELAYS_MS, ProviderJobError, sleep, type RetryAttemptInfo } from './provider-retry.js';
@@ -269,6 +270,19 @@ export class MioraClient {
           continue;
         }
         const failure = classifyMioraError(error);
+        if (isMioraProgressCreditBlocked(error)) {
+          const delayMs = retryDelays[Math.min(consecutiveFailures, retryDelays.length - 1)] ?? interval;
+          if (Date.now() + delayMs > deadline) {
+            await sleep(Math.max(0, deadline - Date.now()), options.signal);
+            throw new ProviderJobError(failure, consecutiveFailures + 1, 'poll', { cause: error });
+          }
+          consecutiveFailures += 1;
+          mioraDiagnostic('miora.task.poll_retry', { taskId, retry:consecutiveFailures, delayMs, code:failure.code });
+          options.onPollRetry?.({ step:'poll', attempt:consecutiveFailures,
+            maxAttempts:consecutiveFailures + 1, delayMs, failure });
+          await sleep(delayMs, options.signal);
+          continue;
+        }
         if (!failure.retryable || consecutiveFailures >= retryDelays.length) {
           throw new ProviderJobError(failure, consecutiveFailures + 1, 'poll', { cause: error });
         }

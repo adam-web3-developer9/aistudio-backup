@@ -35,6 +35,8 @@ export type ProviderFailureKind =
 
 export interface ProviderFailure {
   kind: ProviderFailureKind;
+  /** Whether the provider explicitly reported a terminal failure of the submitted task. */
+  providerTerminal?: boolean;
   /** Stable machine code reported in `job.error.code`. */
   code: string;
   /**
@@ -84,6 +86,7 @@ export class ProviderJobError extends Error {
   readonly kind: ProviderFailureKind;
   readonly providerCode?: number | string;
   readonly providerMessage?: string;
+  readonly providerTerminal?: boolean;
 
   constructor(
     readonly failure: ProviderFailure,
@@ -102,6 +105,7 @@ export class ProviderJobError extends Error {
     this.kind = failure.kind;
     this.providerCode = failure.providerCode;
     this.providerMessage = failure.providerMessage;
+    this.providerTerminal = failure.providerTerminal;
   }
 }
 

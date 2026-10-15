@@ -269,7 +269,7 @@ async function transfer(input: Parameters<typeof transferPublicMediaToMioraCos>[
     if (uploaded.status !== 200) {
       const identifiers = await cosFailureIdentifiers(uploaded,signal,idle.progress);
       throw failureError({ code:'COS_PUT_HTTP', stage:'cos_put',
-        retryable:RETRYABLE_HTTP(uploaded.status) || identifiers.cosCode === 'RequestTimeout',
+        retryable:RETRYABLE_HTTP(uploaded.status) || identifiers.cosCode === 'RequestTimeout' || identifiers.cosCode === 'UserNetworkTooSlow',
         httpStatus:uploaded.status, ...identifiers });
     }
     await uploaded.body?.cancel?.().catch(()=>{});

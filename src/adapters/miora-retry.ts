@@ -56,7 +56,14 @@ export class MioraRenderTimeoutError extends Error {
   }
 }
 
-export const classifyMioraError: FailureClassifier = (error: unknown): ProviderFailure => {
+/** The account-wide balance gate blocked a read of an already submitted task. */
+export function isMioraProgressCreditBlocked(error: unknown): boolean {
+  return error instanceof MioraApiError
+    && error.path === '/media-generate/progress'
+    && error.apiCode === '10005';
+}
+
+const classifyMioraFailure: FailureClassifier = (error: unknown): ProviderFailure => {
   if (error instanceof ProviderJobError) return error.failure;
   if (error instanceof MioraTaskNotFoundError) return failure('not_found', error.message);
   if (error instanceof MioraRenderTimeoutError) return failure('render_timeout', error.message);
@@ -86,6 +93,9 @@ export const classifyMioraError: FailureClassifier = (error: unknown): ProviderF
   if (error instanceof MioraApiError) {
     const message = error.apiMessage.replace(/\s+/g, ' ').trim();
     const detail = { providerCode: error.apiCode ?? error.status, providerMessage: message };
+    if (isMioraProgressCreditBlocked(error)) {
+      return { ...failure('network', error.message, detail), code: 'PROVIDER_QUERY_BLOCKED' };
+    }
     if (error.status === 402 || INSUFFICIENT_CREDITS_MESSAGE.test(message)) {
       return failure('insufficient_credits', error.message, detail);
     }
@@ -103,6 +113,11 @@ export const classifyMioraError: FailureClassifier = (error: unknown): ProviderF
   const message = error instanceof Error ? error.message : String(error);
   if (isNetworkError(error)) return failure('network', message);
   return failure('unknown', message || 'Unknown Miora error');
+};
+
+export const classifyMioraError: FailureClassifier = (error: unknown): ProviderFailure => {
+  const classified = classifyMioraFailure(error);
+  return { ...classified, providerTerminal: classified.providerTerminal ?? error instanceof MioraTaskFailedError };
 };
 
 /** The account cannot pay for this job — the runner should try another one. */

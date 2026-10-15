@@ -114,7 +114,12 @@ test('Miora COS rejection retains only safe XML identifiers', async () => {
   } finally { vi.restoreAllMocks(); }
 });
 
-test('Miora COS RequestTimeout uses the existing finite direct-stream retry', async () => {
+test.each([
+  ['RequestTimeout', 1, true],
+  ['UserNetworkTooSlow', 1, true],
+  ['UserNetworkTooSlow', 2, true],
+  ['InvalidArgument', 1, false]
+] as const)('Miora COS %s with %i failed PUTs preserves finite direct-stream retry (retryable=%s)', async (cosCode, failedPuts, retryable) => {
   const bytes = Buffer.from('verified');
   const getCosGrant = vi.fn(async () => ({ prefix:'safe-prefix', bucket:'bucket', region:'ap-test',
     token:'token', secret_id:'id', secret_key:'key' }));
@@ -131,18 +136,23 @@ test('Miora COS RequestTimeout uses the existing finite direct-stream retry', as
     for await (const chunk of options!.body as AsyncIterable<Uint8Array>) received.push(Buffer.from(chunk));
     expect(Buffer.concat(received)).toEqual(bytes);
     putCalls += 1;
-    return (putCalls === 1
-      ? { status:400, body:(async function* () { yield Buffer.from('<Error><Code>RequestTimeout</Code></Error>'); })() }
+    return (putCalls <= failedPuts
+      ? { status:400, body:(async function* () { yield Buffer.from(`<Error><Code>${cosCode}</Code></Error>`); })() }
       : { status:200 }) as unknown as Awaited<ReturnType<typeof fetch>>;
   });
   try {
-    await expect(transferPublicMediaToMioraCos({ client:{ getCosGrant } as unknown as MioraClient,
+    const transfer = transferPublicMediaToMioraCos({ client:{ getCosGrant } as unknown as MioraClient,
       sourceUrl:'https://source.invalid/x', allowedHosts:['source.invalid'], fileName:'x.png',
       mimeType:'image/png', size:bytes.length, sha256:createHash('sha256').update(bytes).digest('hex'),
-      retryDelaysMs:[0] })).resolves.toBe('safe-prefix/x.png');
-    expect(sourceCalls).toBe(2);
-    expect(putCalls).toBe(2);
-    expect(getCosGrant).toHaveBeenCalledTimes(2);
+      retryDelaysMs:[0] });
+    if (retryable && failedPuts === 1) await expect(transfer).resolves.toBe('safe-prefix/x.png');
+    else await expect(transfer).rejects.toMatchObject({
+      failure:{ code:'COS_PUT_HTTP', stage:'cos_put', retryable, httpStatus:400, cosCode }
+    });
+    const attempts = retryable ? 2 : 1;
+    expect(sourceCalls).toBe(attempts);
+    expect(putCalls).toBe(attempts);
+    expect(getCosGrant).toHaveBeenCalledTimes(attempts);
   } finally { vi.restoreAllMocks(); }
 });
 

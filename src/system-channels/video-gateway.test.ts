@@ -89,3 +89,19 @@ test('job projection returns only video result and safe progress and error field
   expect(() => projectGatewayJob(job({ id: 'job_system_private' }))).toThrow('unavailable');
   for (const videoUrl of ['C:\\private\\video.mp4', '/api/system/private', 'file:///video.mp4', 'https://user:secret@video.miora.design/result.mp4']) expect(projectGatewayJob(job({ result: { videoUrl } }))).not.toHaveProperty('result');
 });
+
+test('gateway exposes task verdict facts and only the confirmed internal render reason', () => {
+  expect(projectGatewayJob(job({ status:'failed', progress:{ providerJobId:'provider-accepted', updatedAt:'' },
+    error:{ code:'PROVIDER_QUERY_BLOCKED', message:key,
+    providerTerminal:false, providerMessage:key } })).error).toMatchObject({ code:'PROVIDER_QUERY_BLOCKED', providerTerminal:false });
+  expect(projectGatewayJob(job({ status:'failed', error:{ code:'ACCOUNT_INSUFFICIENT_CREDITS', message:key,
+    providerTerminal:false, retryable:false } })).error)
+    .toEqual({ code:'ACCOUNT_INSUFFICIENT_CREDITS', message:'The selected provider account has insufficient credits',
+      scope:'account', retryable:false });
+  expect(projectGatewayJob(job({ status:'failed', error:{ code:'PROVIDER_RENDER_FAILED', message:key,
+    providerTerminal:true, providerMessage:'system error, MiniMax-H3 context ir (status_code=2000)' } })).error)
+    .toMatchObject({ providerTerminal:true, message:'MiniMax H3 internal generation error (status_code=2000)' });
+  expect(projectGatewayJob(job({ error:{ code:'PROVIDER_RENDER_FAILED', message:key,
+    providerMessage:`${key} status_code=2000` } })).error)
+    .toEqual({ code:'PROVIDER_RENDER_FAILED', message:'The provider could not generate the video' });
+});

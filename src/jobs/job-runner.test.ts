@@ -118,7 +118,8 @@ describe('JobRunner credit failover', () => {
 });
 
 describe('JobRunner recovery after a restart', () => {
-  function recoverySetup(resume?: BrowserAdapter['resumeWithoutBrowser']) {
+  function recoverySetup(resume?: BrowserAdapter['resumeWithoutBrowser'], gateway = false) {
+    const adapterId = gateway ? 'miora-v1' : 'hailuo-v1';
     const jobs = new JobStore();
     const assets = {
       get: vi.fn().mockReturnValue({
@@ -127,7 +128,7 @@ describe('JobRunner recovery after a restart', () => {
       })
     } as unknown as AssetStore;
     const session = {
-      id: 'hailuo-1', adapterId: 'hailuo-v1',
+      id: 'hailuo-1', adapterId,
       cookies: [{ name: '_token', value: 'token-1', domain: '.hailuoai.com', path: '/' }],
       updatedAt: '2026-08-21T00:00:00.000Z'
     };
@@ -140,7 +141,7 @@ describe('JobRunner recovery after a restart', () => {
       return { status: 'succeeded', videoId: 'video-new' };
     });
     const adapter: BrowserAdapter = {
-      id: 'hailuo-v1',
+      id: adapterId,
       allowedCookieDomains: ['.hailuoai.com'],
       getCreditsFromCookies: vi.fn(async () => ({ totalCredits: 100, breakdown: [] })),
       estimateJobCost: () => 10,
@@ -152,12 +153,40 @@ describe('JobRunner recovery after a restart', () => {
     adapters.register(adapter);
     const accounts = new AccountPool(sessions, adapters);
     const browsers = { use: vi.fn() } as unknown as BrowserPool;
+    const beforeSubmitGuard = vi.fn();
     const runner = new JobRunner(jobs, assets, sessions, adapters, browsers, accounts, {
       timeoutMs: 1_000,
-      directTimeoutMs: 1_000
+      directTimeoutMs: 1_000,
+      ...(gateway && { beforeSubmitGuard })
     });
-    return { jobs, runner, runWithoutBrowser, accounts };
+    return { jobs, runner, runWithoutBrowser, accounts, beforeSubmitGuard };
   }
+
+  it('resumes unresolved gateway queries once on the original identity without new submissions', async () => {
+    let finish!: (result: unknown) => void;
+    const resume = vi.fn<NonNullable<BrowserAdapter['resumeWithoutBrowser']>>(
+      () => new Promise(resolve => { finish = resolve; })
+    );
+    const ctx = recoverySetup(resume, true);
+    const submitted = ctx.jobs.create({ adapterId:'miora-v1', text:'private', assetId:'asset-1', sessionId:'hailuo-1' }, 'job_gateway_resume');
+    ctx.jobs.update(submitted.id, { status:'failed', progress:{ providerJobId:'original-video', updatedAt:'' },
+      error:{ code:'PROVIDER_RENDER_FAILED', message:'terminal', providerTerminal:true } });
+    expect(await ctx.runner.resumeGatewayQuery(submitted.id)).toBe(false);
+    ctx.jobs.update(submitted.id, { error:{ code:'ACCOUNT_INSUFFICIENT_CREDITS', message:'private' } });
+    expect(await ctx.runner.resumeGatewayQuery(submitted.id)).toBe(false);
+    ctx.jobs.update(submitted.id, { error:{ code:'ACCOUNT_INSUFFICIENT_CREDITS',
+      message:'Miora /media-generate/progress failed (10005): Insufficient AI credits' } });
+    expect(await Promise.all([ctx.runner.resumeGatewayQuery(submitted.id), ctx.runner.resumeGatewayQuery(submitted.id)]))
+      .toEqual([true, false]);
+    expect(ctx.jobs.get(submitted.id)).toMatchObject({ status:'running', progress:{ providerJobId:'original-video' } });
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+    expect(resume.mock.calls[0]?.[1]).toMatchObject({ providerJobId:'original-video' });
+    expect(resume.mock.calls[0]?.[2]).toMatchObject({ allowPaidRetries:false });
+    expect(ctx.runWithoutBrowser).not.toHaveBeenCalled();
+    expect(ctx.beforeSubmitGuard).toHaveBeenCalled();
+    finish({ status:'succeeded' });
+    await vi.waitFor(() => expect(ctx.jobs.get(submitted.id)?.status).toBe('succeeded'));
+  });
 
   it('reruns queued jobs, resumes submitted ones and fails the ambiguous rest', async () => {
     const resume = vi.fn<NonNullable<BrowserAdapter['resumeWithoutBrowser']>>(

@@ -1,11 +1,47 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from 'undici';
 import { MioraClient } from './miora-client.js';
+import { classifyMioraError } from './miora-retry.js';
 
 const originalDispatcher = getGlobalDispatcher();
 afterEach(() => setGlobalDispatcher(originalDispatcher));
 
 describe('MioraClient credit errors', () => {
+  it('keeps the same task polling through progress credit gates beyond the network retry count', async () => {
+    const mock = new MockAgent(); mock.disableNetConnect(); setGlobalDispatcher(mock);
+    const origin = mock.get('https://miora.design');
+    const progress = { path:'/api/ai/media-generate/progress', method:'POST', body:JSON.stringify({ videoTaskIds:['t1'] }) };
+    origin.intercept(progress).reply(200, { code:10005, message:'Insufficient AI credits' }).times(5);
+    origin.intercept(progress).reply(200, { data:{ tasks:{ t1:{ status:'completed', resultSignUrl:'https://cdn/t1.mp4' } } } });
+    try {
+      expect(await new MioraClient({ authToken:'token' }).waitForTask('t1', {
+        timeoutMs:1_000, retryDelaysMs:[1, 1, 1]
+      })).toMatchObject({ taskId:'t1', status:'succeeded' });
+      expect(mock.pendingInterceptors()).toEqual([]);
+    } finally { await mock.close(); }
+  });
+
+  it('keeps query deadline failure distinct from submit credits and real failed task verdicts', async () => {
+    const mock = new MockAgent(); mock.disableNetConnect(); setGlobalDispatcher(mock);
+    const origin = mock.get('https://miora.design');
+    origin.intercept({ path:'/api/ai/media-generate/progress', method:'POST' })
+      .reply(200, { code:10005, message:'Insufficient AI credits' });
+    origin.intercept({ path:'/api/ai/media-generate/video', method:'POST' })
+      .reply(200, { code:10005, message:'Insufficient AI credits' });
+    origin.intercept({ path:'/api/ai/media-generate/progress', method:'POST' })
+      .reply(200, { data:{ tasks:{ t1:{ status:'failed', errorMessage:'Insufficient AI credits' } } } });
+    const client = new MioraClient({ authToken:'token' });
+    try {
+      await expect(client.waitForTask('t1', { timeoutMs:1, retryDelaysMs:[5] }))
+        .rejects.toMatchObject({ code:'PROVIDER_QUERY_BLOCKED', providerTerminal:false });
+      const rejected = await client.generateVideo({ model:'minimax-h3', prompt:'isolated', durationSeconds:4,
+        resolution:'768P', aspectRatio:'16:9' }).catch(error => error);
+      expect(classifyMioraError(rejected)).toMatchObject({ kind:'insufficient_credits', retryable:false, providerTerminal:false });
+      const terminal = await client.waitForTask('t1', { timeoutMs:1_000 }).catch(error => error);
+      expect(classifyMioraError(terminal)).toMatchObject({ kind:'insufficient_credits', providerTerminal:true });
+    } finally { await mock.close(); }
+  });
+
   it.each([
     { status: 403, body: { code: 'FORBIDDEN', message: 'Access denied' } },
     { status: 429, body: { message: 'Too many requests' } },
