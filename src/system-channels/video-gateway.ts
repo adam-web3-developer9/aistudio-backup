@@ -74,9 +74,14 @@ export class ManagedVideoGatewayRecords {
   }
   assertExecution(job: JobRecord): void {
     if (!job.id.startsWith(gatewayJobIdPrefix)) return;
-    if (!this.hasJob(job.id)) throw new SystemError(403, 'GATEWAY_EXECUTION_UNAVAILABLE', 'Gateway execution owner is unavailable');
+    this.assertQuery(job);
     const account = job.sessionId ? this.channels.row(job.sessionId) : undefined;
     if (!account?.enabled || account.archived_at) throw new SystemError(403, 'GATEWAY_ACCOUNT_UNAVAILABLE', 'Gateway channel account is unavailable');
+  }
+  /** Existing upstream tasks remain readable when their account stops accepting submissions. */
+  assertQuery(job: JobRecord): void {
+    if (!job.id.startsWith(gatewayJobIdPrefix)) return;
+    if (!this.hasJob(job.id)) throw new SystemError(403, 'GATEWAY_EXECUTION_UNAVAILABLE', 'Gateway execution owner is unavailable');
   }
 }
 
@@ -139,6 +144,7 @@ export function projectGatewayJob(job: JobRecord) {
       ? 'MiniMax H3 internal generation error (status_code=2000)' : errorMessages[code] ?? 'Video generation failed',
       ...(code === 'ACCOUNT_INSUFFICIENT_CREDITS' ? { scope: 'account' } : {}),
       ...(code === 'INSUFFICIENT_CREDITS' ? { scope: 'pool' } : {}),
+      ...(code === 'PROVIDER_QUERY_BLOCKED' ? { scope: 'task' } : {}),
       ...(job.error.providerTerminal === true || job.error.providerTerminal === false && hasProviderJobId
         ? { providerTerminal:job.error.providerTerminal } : {}),
       ...(typeof job.error.retryable === 'boolean' ? { retryable: job.error.retryable } : {}) } } : {}),

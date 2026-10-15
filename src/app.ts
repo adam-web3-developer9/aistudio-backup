@@ -949,6 +949,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const runner = new JobRunner(jobs, assets, sessions, adapters, browsers, accountPool, {
     runInContext:(jobId, run) => withMioraDiagnostics(mioraDiagnosticSink, { jobId }, run),
     beforeSubmitGuard: gateway ? job => gateway.assertExecution(job) : undefined,
+    beforeQueryGuard: gateway ? job => gateway.assertQuery(job) : undefined,
     onAccountLeaseAcquired: uploadIntents ? job => uploadIntents.releaseReservationForJob(job.id) : undefined,
     timeoutMs: config.jobTimeoutMs,
     // Wide enough for every render attempt plus the waits between them; the

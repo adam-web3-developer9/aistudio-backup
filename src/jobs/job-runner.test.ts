@@ -154,12 +154,13 @@ describe('JobRunner recovery after a restart', () => {
     const accounts = new AccountPool(sessions, adapters);
     const browsers = { use: vi.fn() } as unknown as BrowserPool;
     const beforeSubmitGuard = vi.fn();
+    const beforeQueryGuard = vi.fn();
     const runner = new JobRunner(jobs, assets, sessions, adapters, browsers, accounts, {
       timeoutMs: 1_000,
       directTimeoutMs: 1_000,
-      ...(gateway && { beforeSubmitGuard })
+      ...(gateway && { beforeSubmitGuard, beforeQueryGuard })
     });
-    return { jobs, runner, runWithoutBrowser, accounts, beforeSubmitGuard };
+    return { jobs, runner, runWithoutBrowser, accounts, beforeSubmitGuard, beforeQueryGuard };
   }
 
   it('resumes unresolved gateway queries once on the original identity without new submissions', async () => {
@@ -183,9 +184,31 @@ describe('JobRunner recovery after a restart', () => {
     expect(resume.mock.calls[0]?.[1]).toMatchObject({ providerJobId:'original-video' });
     expect(resume.mock.calls[0]?.[2]).toMatchObject({ allowPaidRetries:false });
     expect(ctx.runWithoutBrowser).not.toHaveBeenCalled();
-    expect(ctx.beforeSubmitGuard).toHaveBeenCalled();
+    expect(ctx.beforeSubmitGuard).not.toHaveBeenCalled();
+    expect(ctx.beforeQueryGuard).toHaveBeenCalled();
     finish({ status:'succeeded' });
     await vi.waitFor(() => expect(ctx.jobs.get(submitted.id)?.status).toBe('succeeded'));
+  });
+
+  it('keeps gateway queries independent of account submission eligibility', async () => {
+    const resume = vi.fn<NonNullable<BrowserAdapter['resumeWithoutBrowser']>>(async () => {
+      throw Object.assign(new Error('private account credentials unavailable'), { code:'AUTH_FAILED', retryable:true });
+    });
+    const ctx = recoverySetup(resume, true);
+    ctx.beforeSubmitGuard.mockImplementation(() => {
+      throw Object.assign(new Error('Gateway channel account is unavailable'), { statusCode:403, code:'GATEWAY_ACCOUNT_UNAVAILABLE' });
+    });
+    const submitted = ctx.jobs.create({ adapterId:'miora-v1', text:'private', assetId:'asset-1', sessionId:'hailuo-1' }, 'job_gateway_disabled_account');
+    ctx.jobs.update(submitted.id, { status:'failed', progress:{ providerJobId:'original-video', updatedAt:'' },
+      error:{ code:'GATEWAY_ACCOUNT_UNAVAILABLE', message:'Gateway channel account is unavailable' } });
+    expect(await ctx.runner.resumeGatewayQuery(submitted.id)).toBe(true);
+    await vi.waitFor(() => expect(ctx.jobs.get(submitted.id)?.status).toBe('failed'));
+    expect(ctx.jobs.get(submitted.id)).toMatchObject({ sessionId:'hailuo-1', progress:{ providerJobId:'original-video' },
+      error:{ code:'PROVIDER_QUERY_BLOCKED', retryable:true, providerTerminal:false } });
+    expect(ctx.beforeQueryGuard).toHaveBeenCalledOnce();
+    expect(ctx.beforeSubmitGuard).not.toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledOnce();
+    expect(ctx.runWithoutBrowser).not.toHaveBeenCalled();
   });
 
   it('reruns queued jobs, resumes submitted ones and fails the ambiguous rest', async () => {

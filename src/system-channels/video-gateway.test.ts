@@ -63,12 +63,16 @@ test('persistent resource ownership isolates system jobs and keys, with a live a
   expect(() => rotated.ownJob(job().id)).toThrow('unavailable');
   expect(() => rotated.ownAsset('asset-private')).toThrow('unavailable');
   expect(() => rotated.assertExecution(job())).toThrow('owner');
+  expect(() => rotated.assertQuery(job())).toThrow('owner');
   expect(() => records.assertExecution(job({ id: 'job_system_private' }))).not.toThrow();
   expect(() => records.assertExecution(job({ sessionId: 'missing' }))).toThrow('account');
+  expect(() => records.assertQuery(job({ sessionId: 'missing' }))).not.toThrow();
   channels.update('managed-miora-test', { enabled: false });
   expect(() => records.assertExecution(job())).toThrow('account');
+  expect(() => records.assertQuery(job())).not.toThrow();
   channels.update('managed-miora-test', { enabled: true, archived: true });
   expect(() => records.assertExecution(job())).toThrow('account');
+  expect(() => records.assertQuery(job())).not.toThrow();
   expect(JSON.stringify(db.prepare('SELECT * FROM video_gateway_jobs').all())).not.toContain(key);
 });
 
@@ -93,7 +97,7 @@ test('job projection returns only video result and safe progress and error field
 test('gateway exposes task verdict facts and only the confirmed internal render reason', () => {
   expect(projectGatewayJob(job({ status:'failed', progress:{ providerJobId:'provider-accepted', updatedAt:'' },
     error:{ code:'PROVIDER_QUERY_BLOCKED', message:key,
-    providerTerminal:false, providerMessage:key } })).error).toMatchObject({ code:'PROVIDER_QUERY_BLOCKED', providerTerminal:false });
+    providerTerminal:false, retryable:true, providerMessage:key } })).error).toMatchObject({ code:'PROVIDER_QUERY_BLOCKED', scope:'task', retryable:true, providerTerminal:false });
   expect(projectGatewayJob(job({ status:'failed', error:{ code:'ACCOUNT_INSUFFICIENT_CREDITS', message:key,
     providerTerminal:false, retryable:false } })).error)
     .toEqual({ code:'ACCOUNT_INSUFFICIENT_CREDITS', message:'The selected provider account has insufficient credits',

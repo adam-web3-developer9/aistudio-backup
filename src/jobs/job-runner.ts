@@ -18,6 +18,8 @@ export interface JobRunnerOptions {
   onJobSettled?: (job: JobRecord) => void;
   /** Independent submit guard for explicitly authorized video-gateway work. */
   beforeSubmitGuard?: (job: JobRecord) => Promise<void> | void;
+  /** Persistent gateway ownership check for polling an already submitted task. */
+  beforeQueryGuard?: (job: JobRecord) => Promise<void> | void;
   /** Transfers any durable pre-dispatch reservation after AccountPool owns it. */
   onAccountLeaseAcquired?: (job: JobRecord) => Promise<void> | void;
 }
@@ -268,11 +270,12 @@ export class JobRunner {
       && job.id.startsWith('job_gateway_') && job.adapterId === 'miora-v1'
       && job.status === 'failed' && !!job.sessionId && !!job.progress?.providerJobId
       && (job.error?.providerTerminal === false || job.error?.providerTerminal === undefined
-        && job.error?.code === 'ACCOUNT_INSUFFICIENT_CREDITS'
-        && job.error.message === 'Miora /media-generate/progress failed (10005): Insufficient AI credits');
+        && (job.error?.code === 'GATEWAY_ACCOUNT_UNAVAILABLE' || job.error?.code === 'ACCOUNT_INSUFFICIENT_CREDITS'
+          && job.error.message === 'Miora /media-generate/progress failed (10005): Insufficient AI credits'));
     const job = this.jobs.get(jobId);
     if (!eligible(job) || this.executing.has(jobId)) return false;
-    await this.assertSubmitAllowed(job);
+    if (!this.options.beforeQueryGuard) throw new JobError('EXECUTION_OWNER_REQUIRED', 'Video gateway query owner is unavailable');
+    await this.options.beforeQueryGuard(job);
     if (!eligible(this.jobs.get(jobId)) || this.executing.has(jobId)) return false;
     this.jobs.update(jobId, { status:'running', error:undefined, finishedAt:undefined });
     void this.resume(jobId);
@@ -350,9 +353,11 @@ export class JobRunner {
         lease = undefined;
         void error.pending.finally(() => timedOutLease.release()).catch(() => undefined);
       }
+      const normalized = normalizeError(error);
+      const queryBlocked = job.id.startsWith('job_gateway_') && normalized.providerTerminal !== true;
       this.jobs.update(jobId, {
         status: 'failed',
-        error: normalizeError(error),
+        error: queryBlocked ? { ...normalized, code:'PROVIDER_QUERY_BLOCKED', retryable:true, providerTerminal:false } : normalized,
         finishedAt: new Date().toISOString()
       });
     } finally {
