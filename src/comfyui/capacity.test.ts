@@ -146,9 +146,16 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     await service.tick();
     vi.mocked(Date.now).mockReturnValue(startedAt + 30_001);
     await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT',
+      action_started_at: null, action_sent: 0, next_action_at: startedAt + 60_001 });
+    platform.getInstanceStatus.mockClear();
     await service.tick();
+    vi.mocked(Date.now).mockReturnValue(startedAt + 60_000);
+    await service.tick();
+    expect(platform.getInstanceStatus).not.toHaveBeenCalled();
     expect(platform.openInstance).toHaveBeenCalledTimes(1);
-    expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT' });
+    expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT',
+      next_action_at: startedAt + 60_001 });
   });
 
   it('does not spend bootTimeout while waiting for capacity and grants a fresh boot window on success', async () => {
