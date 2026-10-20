@@ -89,6 +89,7 @@ export class AigateClient {
       }
       const result: AigateInstance['services'][number] = { host: service.host };
       for (const key of ['port', 'instancePort'] as const) {
+        if (key === 'instancePort' && service[key] === 'null') continue;
         const port = parsePort(service[key]);
         if (port !== undefined) result[key] = port;
       }

@@ -13,6 +13,32 @@ function setup(body: unknown = { code: 0, data: instance, ok: true }, status = 2
 afterEach(() => vi.useRealTimers());
 
 describe('AigateClient', () => {
+  it('accepts the literal null external port returned for live HTTP services', async () => {
+    const { client } = setup({ code: 0, ok: true, data: {
+      ...instance, areaName: '华东一区',
+      instanceUtilList: [
+        { host: 'ssh.example', port: 22, instancePort: '48595', protocol: 'TCP', httpType: '1' },
+        ...[8080, 8088, 8188, 8888].map(port => ({ host: 'comfy.example', port, instancePort: 'null', protocol: 'HTTP', httpType: '1' })),
+      ],
+    } });
+    const actual = await client.getInstance(instanceId);
+    expect(actual).toMatchObject({ id: instanceId, status: '2', areaName: '华东一区' });
+    expect(actual.services[0]?.instancePort).toBe(48595);
+    expect(actual.services.slice(1)).toEqual([8080, 8088, 8188, 8888].map(port => ({ host: 'comfy.example', port, protocol: 'HTTP', httpType: '1' })));
+  });
+
+  it.each([
+    { port: 'null', instancePort: '48595' },
+    { port: 8188, instancePort: 'invalid' },
+    { port: 8188, instancePort: '0' },
+    { port: 8188, instancePort: '65536' },
+  ])('still rejects invalid numeric port metadata %#', async ports => {
+    const { client } = setup({ code: 0, ok: true, data: {
+      ...instance, instanceUtilList: [{ host: 'comfy.example', ...ports }],
+    } });
+    await expect(client.getInstance(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+  });
+
   it('does not request at construction and preserves int64 IDs and the official service fields', async () => {
     const { client, fetchMock } = setup({ code: 0, ok: true, data: {
       ...instance,
