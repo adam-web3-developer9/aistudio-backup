@@ -142,7 +142,7 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     submit();
     await service.tick();
     expect(store.instance('1')).toMatchObject({ state: 'starting', action_sent: 1, error_code: 'COMFY_' + code,
-      capacity_started_at: null, next_action_at: null });
+      capacity_started_at: null, next_action_at: startedAt + 30_000 });
     await service.tick();
     vi.mocked(Date.now).mockReturnValue(startedAt + 30_001);
     await service.tick();
@@ -206,14 +206,83 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     expect(store.instance('1')!.state).toBe('waiting_capacity');
     vi.mocked(Date.now).mockReturnValue(startedAt + 21_600_000);
     await service.tick();
-    expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: 'COMFY_CAPACITY_WAIT_TIMEOUT' });
+    expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_CAPACITY_WAIT_TIMEOUT',
+      capacity_started_at: null, action_started_at: null, action_sent: 0, next_action_at: startedAt + 21_630_000 });
+    expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_QUEUE_TIMEOUT' });
     expect(platform.openInstance).toHaveBeenCalledTimes(2);
+    vi.mocked(Date.now).mockReturnValue(startedAt + 21_629_999);
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledTimes(2);
+    const next = submit('after-capacity-timeout');
+    platform.getInstanceStatus.mockResolvedValue('2');
+    vi.mocked(Date.now).mockReturnValue(startedAt + 21_630_000);
+    await service.tick();
+    expect(service.get(next.id).stage).toBe('awaiting_upload');
+    expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: next.id, next_action_at: null, error_code: null });
+    expect(platform.openInstance).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['running', 'pending'] as const)('recovers an upload slot after foreign %s work clears without losing its job', async queueState => {
+    const { service, submit, statuses, store, client, platform } = fixture();
+    statuses.set('1', '2');
+    const job = submit('upload-busy');
+    await service.tick();
+    expect(service.get(job.id).stage).toBe('awaiting_upload');
+    client.queue.mockResolvedValue({ running: [], pending: [], [queueState]: [{ promptId: 'foreign' }] });
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id,
+      error_code: 'COMFY_EXTERNAL_OCCUPANCY', next_action_at: startedAt + 30_000 });
+    expect(service.get(job.id).stage).toBe('awaiting_upload');
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'waiting_instance', progress: {
+      message: '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交',
+      nextRetryAt: new Date(startedAt + 30_000).toISOString(),
+    } });
+    const checks = client.queue.mock.calls.length;
+    vi.mocked(Date.now).mockReturnValue(startedAt + 29_999);
+    await service.tick();
+    expect(client.queue).toHaveBeenCalledTimes(checks);
+    expect(client.submit).not.toHaveBeenCalled();
+    client.queue.mockResolvedValue({ running: [], pending: [] });
+    vi.mocked(Date.now).mockReturnValue(startedAt + 30_000);
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id, next_action_at: null, error_code: null });
+    service.completeInputs(job.id, { image: { name: 'frame.png', subfolder: job.id, type: 'input' } });
+    await service.tick();
+    expect(service.get(job.id).stage).toBe('running');
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 
   it('extends the queue deadline to the default six hours when optional capacity settings are absent', () => {
     const { configuration, submit } = fixture();
     delete configuration.capacityPollIntervalMs; delete configuration.capacityWaitTimeoutMs;
     expect(submit().deadline).toBeGreaterThanOrEqual(startedAt + 21_600_000);
+  });
+
+  it.each(['INSTANCE_NOT_FOUND', 'NETWORK_ERROR'])('rechecks instance lookup failure %s after backoff without losing queued work', async code => {
+    const { service, submit, platform, statuses, store, client } = fixture();
+    statuses.set('1', '2');
+    platform.getInstanceStatus.mockRejectedValueOnce({ code });
+    const job = submit('lookup-backoff');
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: null,
+      error_code: 'COMFY_' + code, next_action_at: startedAt + 30_000 });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'queued', stage: 'waiting_instance', progress: {
+      message: 'GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（COMFY_' + code + '）',
+      nextRetryAt: new Date(startedAt + 30_000).toISOString(),
+    } });
+    vi.mocked(Date.now).mockReturnValue(startedAt + 29_999);
+    await service.tick();
+    expect(platform.getInstanceStatus).toHaveBeenCalledTimes(1);
+    expect(client.submit).not.toHaveBeenCalled();
+    vi.mocked(Date.now).mockReturnValue(startedAt + 30_000);
+    await service.tick();
+    expect(platform.getInstanceStatus).toHaveBeenCalledTimes(2);
+    expect(service.get(job.id).stage).toBe('awaiting_upload');
+    expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id, error_code: null, next_action_at: null });
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 
   it('loads persistent capacity defaults from a real configuration file', async () => {
@@ -265,6 +334,7 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     }
     expect(service.requestResultAvailability(job.id)).toMatchObject({ stage: 'succeeded', result_wake_requested: 1 });
     expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'running', stage: 'preparing_result' });
+    client.health.mockRejectedValueOnce(new Error('Instance is powered off'));
     await service.tick();
     expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
     await service.tick();
@@ -384,15 +454,16 @@ describe('capacity scheduling with SQLite and mock clients', () => {
       await service.tick();
       await service.tick();
       await service.tick();
-      expect(idlePolicySetter).toHaveBeenCalled();
+      expect(idlePolicySetter).toHaveBeenCalledTimes(1);
       expect(store.instance('1')).toMatchObject({ job_id: null, idle_policy_applied_at: null, error_code: 'COMFY_BUSINESS_REJECTED' });
       expect(service.get(job.id)).toMatchObject({ stage: 'queued', instance_id: null });
       for (const operation of [client.submit, client.upload, client.download, assets.read, results.save, platform.closeInstance]) expect(operation).not.toHaveBeenCalled();
       expect(platform.openInstance).toHaveBeenCalledTimes(lifecycle === 'already-ready' ? 0 : 1);
       idlePolicySetter.mockResolvedValue(undefined);
+      vi.mocked(Date.now).mockReturnValue(store.instance('1')!.next_action_at!);
       await service.tick();
       expect(service.get(job.id).stage).toBe('awaiting_upload');
-      expect(store.instance('1')).toMatchObject({ idle_policy_applied_at: startedAt, error_code: null });
+      expect(store.instance('1')).toMatchObject({ idle_policy_applied_at: Date.now(), error_code: null });
       service.completeInputs(job.id, { image: { name: 'frame.png', subfolder: job.id, type: 'input' } });
       await service.tick();
       expect(client.submit).toHaveBeenCalledTimes(1);

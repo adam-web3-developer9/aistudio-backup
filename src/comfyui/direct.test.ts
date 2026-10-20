@@ -134,6 +134,116 @@ describe('direct transfer with SQLite and mock clients', () => {
     for (const operation of [assets.get, assets.read, client.upload, client.download, results.save, results.read]) expect(operation).not.toHaveBeenCalled();
   });
 
+  it.each([true, false])('checks an existing result independently of external occupancy when health succeeds=%s', async healthy => {
+    const { service, store, client, platform, assets, results, submit, receipt, succeed } = fixture();
+    const job = submit();
+    await service.tick();
+    service.completeInputs(job.id, receipt(job.id));
+    await service.tick();
+    succeed();
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1 });
+    const result = service.get(job.id).result;
+    const videoUrl = service.publicJob(service.get(job.id)).result!.videoUrl;
+    expect(store.instance('1')!.job_id).toBeNull();
+    const reserved = healthy ? undefined : submit('next');
+    if (reserved) await service.tick();
+    const promptId = reserved ? service.get(reserved.id).prompt_id : null;
+    const checkedAt = Date.now() - 3_600_000;
+    store.updateJob(job.id, { result_checked_at: checkedAt });
+    store.updateInstance('1', { state: 'offline', error_code: 'EXTERNAL_OCCUPANCY', next_action_at: Date.now() + 30_000 });
+    client.queue.mockResolvedValue({ running: [{ promptId: 'foreign-prompt' }], pending: [] });
+    client.health.mockClear();
+    if (!healthy) client.health.mockRejectedValue(new ComfyError('NETWORK_ERROR', 'Fixture health unavailable', true));
+    const claim = vi.spyOn(store, 'claim');
+    expect(service.requestResultAvailability(job.id)).toMatchObject({
+      stage: 'succeeded', result_pending: 1, result_wake_requested: 1, result
+    });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'preparing_result' });
+    await service.tick();
+    expect(client.health).toHaveBeenCalledTimes(1);
+    expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1,
+      result_wake_requested: healthy ? 0 : 1, result });
+    if (healthy) {
+      expect(service.publicJob(service.get(job.id))).toMatchObject({
+        status: 'succeeded', stage: 'succeeded', result: { videoUrl }
+      });
+      expect(service.get(job.id).result_checked_at).toBeGreaterThan(checkedAt);
+    } else {
+      expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'running', stage: 'preparing_result' });
+      expect(service.get(job.id).result_checked_at).toBe(checkedAt);
+      expect(store.instance('1')!.job_id).toBe(reserved!.id);
+      expect(service.get(reserved!.id)).toMatchObject({ stage: 'awaiting_upload', prompt_id: promptId, direct_inputs: null });
+    }
+    expect(store.instance('1')!.state).toBe('offline');
+    expect(claim).not.toHaveBeenCalled();
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    for (const operation of [assets.get, assets.read, client.upload, client.download, results.save, results.read,
+      platform.openInstance, platform.closeInstance]) expect(operation).not.toHaveBeenCalled();
+  });
+
+  it('returns the existing healthy result without opening when cloud status is stale and stopped', async () => {
+    const { service, store, client, platform, configuration, assets, results, submit, receipt, succeed } = fixture();
+    const job = submit();
+    await service.tick();
+    service.completeInputs(job.id, receipt(job.id));
+    await service.tick();
+    succeed();
+    await service.tick();
+    const result = service.get(job.id).result;
+    const videoUrl = service.publicJob(service.get(job.id)).result!.videoUrl;
+    expect(store.instance('1')!.job_id).toBeNull();
+    configuration.autoOpen = true;
+    platform.getInstanceStatus.mockClear().mockResolvedValue('22');
+    client.health.mockClear();
+    store.updateInstance('1', { state: 'offline', next_action_at: null });
+    store.updateJob(job.id, { result_checked_at: Date.now() - 3_600_000 });
+    expect(service.requestResultAvailability(job.id)).toMatchObject({ result_wake_requested: 1 });
+    await service.tick();
+    expect(client.health).toHaveBeenCalledTimes(1);
+    expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1, result_wake_requested: 0, result });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({
+      status: 'succeeded', stage: 'succeeded', result: { videoUrl }
+    });
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: null });
+    await service.tick();
+    expect(client.health).toHaveBeenCalledTimes(1);
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    for (const operation of [assets.get, assets.read, client.upload, client.download, results.save, results.read,
+      platform.openInstance, platform.closeInstance]) expect(operation).not.toHaveBeenCalled();
+  });
+
+  it('waits for an externally busy queue and rechecks after offline backoff without submitting', async () => {
+    const { service, store, client, platform, submit } = fixture();
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    client.queue.mockResolvedValue({ running: [{ promptId: 'foreign-prompt' }], pending: [] });
+    const job = submit();
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: null });
+    const retryAt = store.instance('1')!.next_action_at!;
+    expect(retryAt).toBeGreaterThan(now);
+    expect(service.get(job.id)).toMatchObject({ stage: 'queued', instance_id: null, prompt_id: job.prompt_id });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'waiting_instance', progress: {
+      phase: 'waiting_instance', nextRetryAt: new Date(retryAt).toISOString(),
+      message: '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交'
+    } });
+    client.queue.mockClear();
+    await service.tick();
+    expect(client.queue).not.toHaveBeenCalled();
+    vi.mocked(Date.now).mockReturnValue(retryAt);
+    client.queue.mockResolvedValue({ running: [], pending: [] });
+    await service.tick();
+    expect(client.queue).toHaveBeenCalledTimes(1);
+    expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id });
+    expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1', prompt_id: job.prompt_id });
+    expect(client.submit).not.toHaveBeenCalled();
+    expect(client.upload).not.toHaveBeenCalled();
+    expect(client.download).not.toHaveBeenCalled();
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
   it('rejects direct mode when every compatible instance requires native authentication', () => {
     const { submit, platform, client } = fixture(undefined, true);
     expect(submit).toThrow(expect.objectContaining({ code: 'COMFY_DIRECT_UNAVAILABLE' }));
@@ -303,10 +413,12 @@ describe('direct transfer with SQLite and mock clients', () => {
     service.acknowledgeCollected(job.id);
     vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 3_600_000);
     platform.getInstanceStatus.mockResolvedValue('22');
+    client.health.mockClear();
     expect(service.requestResultAvailability(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 0, result_wake_requested: 0, result });
     await service.tick();
     expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'succeeded', stage: 'succeeded' });
     expect(store.instance('1')!.job_id).toBeNull();
+    expect(client.health).not.toHaveBeenCalled();
     expect(client.submit).toHaveBeenCalledTimes(1);
     expect(platform.openInstance).not.toHaveBeenCalled();
     expect(platform.closeInstance).not.toHaveBeenCalled();
@@ -314,10 +426,11 @@ describe('direct transfer with SQLite and mock clients', () => {
 });
 
 describe('direct upload reservation recovery after external GPU shutdown', () => {
-  async function reservedUpload() {
+  async function reservedUpload(jobTimeoutMs = 60_000) {
     const startedAt = 1_800_000_000_000;
     vi.spyOn(Date, 'now').mockReturnValue(startedAt);
     const context = fixture();
+    context.configuration.jobTimeoutMs = jobTimeoutMs;
     const job = context.submit();
     await context.service.tick();
     expect(context.service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1' });
@@ -438,19 +551,63 @@ describe('direct upload reservation recovery after external GPU shutdown', () =>
     expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 
-  it('quarantines a recovery boot timeout without repeating open or losing the original reserved slot', async () => {
-    const { service, store, platform, client, job, startedAt } = await reservedUpload();
+  it.each(['awaiting_upload', 'preparing', 'submitting'] as const)('migrates a legacy quarantine to offline without losing a %s reservation', async stage => {
+    const first = fixture();
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const job = first.submit();
+    await first.service.tick();
+    if (stage !== 'awaiting_upload') first.service.completeInputs(job.id, first.receipt(job.id));
+    if (stage === 'submitting') {
+      first.client.submit.mockRejectedValueOnce(new ComfyError('SUBMISSION_UNKNOWN', 'Fixture acknowledgement lost', true));
+      await first.service.tick();
+      expect(first.client.submit).toHaveBeenCalledTimes(1);
+    }
+    const original = first.service.get(job.id);
+    expect(original.stage).toBe(stage);
+    first.store.updateInstance('1', { state: 'quarantined', error_code: 'EXTERNAL_OCCUPANCY', next_action_at: now + 30_000 });
+    await first.service.close();
+    first.db.close();
+    const restarted = fixture(first.filename);
+    restarted.client.history.mockResolvedValue({ state: 'missing', outputs: [] });
+    await restarted.service.tick();
+    expect(restarted.store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id });
+    expect(restarted.store.instance('1')!.next_action_at).toBeGreaterThan(now);
+    expect(restarted.service.get(job.id)).toMatchObject({ stage, instance_id: '1',
+      prompt_id: original.prompt_id, direct_inputs: original.direct_inputs, provider_confirmed: original.provider_confirmed });
+    expect(restarted.client.submit).not.toHaveBeenCalled();
+    expect(restarted.client.upload).not.toHaveBeenCalled();
+    expect(restarted.platform.openInstance).not.toHaveBeenCalled();
+    expect(restarted.platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('backs off a recovery boot timeout and rechecks without losing the original reserved slot', async () => {
+    const { service, store, platform, client, job, startedAt } = await reservedUpload(120_000);
     await service.tick();
     expect(platform.openInstance).toHaveBeenCalledTimes(1);
     platform.getInstanceStatus.mockResolvedValue('11');
     vi.mocked(Date.now).mockReturnValue(startedAt + 30_001);
     await service.tick();
-    expect(store.instance('1')).toMatchObject({ state: 'quarantined', job_id: job.id, error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT' });
-    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'instance_unavailable' });
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id, error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT' });
+    const retryAt = store.instance('1')!.next_action_at!;
+    expect(retryAt).toBeGreaterThan(Date.now());
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'waiting_instance', progress: {
+      phase: 'waiting_instance', nextRetryAt: new Date(retryAt).toISOString(),
+      message: 'GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（COMFY_INSTANCE_ACTION_TIMEOUT）'
+    } });
     expect(service.publicJob(service.get(job.id))).not.toHaveProperty('upload');
     await service.tick();
     expect(platform.openInstance).toHaveBeenCalledTimes(1);
     expect(client.submit).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+    platform.getInstanceStatus.mockResolvedValue('2');
+    vi.mocked(Date.now).mockReturnValue(retryAt);
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id });
+    expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', direct_inputs: null, prompt_id: job.prompt_id });
+    expect(service.publicJob(service.get(job.id))).toHaveProperty('upload');
+    expect(client.submit).not.toHaveBeenCalled();
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
     expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 });

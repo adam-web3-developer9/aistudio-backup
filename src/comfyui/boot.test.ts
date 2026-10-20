@@ -63,7 +63,10 @@ test('opening is sent once and tasks wait for platform running plus ComfyUI heal
   client.health.mockRejectedValueOnce(new Error('Models still loading'));
   await service.tick();
   expect(client.submit).not.toHaveBeenCalled();
-  expect(store.instance('1')?.state).toBe('starting');
+  expect(store.instance('1')).toMatchObject({ state: 'starting', error_code: 'COMFY_OPERATION_FAILED' });
+  await service.tick();
+  expect(client.health).toHaveBeenCalledTimes(1);
+  vi.spyOn(Date, 'now').mockReturnValue(store.instance('1')!.next_action_at!);
   await service.tick();
   expect(service.get(job.id).stage).toBe('running');
   expect(platform.openInstance).toHaveBeenCalledTimes(1);
@@ -83,8 +86,8 @@ test('an opening timeout is reconciled by reads, never by blindly repeating the 
   await service.tick();
   expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT',
     action_started_at: null, action_sent: 0, next_action_at: Date.now() + 30_000 });
-  expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'queued', stage: 'queued', progress: {
-    message: '任务已入队，GPU实例上次启动超时，正在退避后重新检查；不会重复提交生成任务',
+  expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'queued', stage: 'waiting_instance', progress: {
+    message: 'GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（COMFY_INSTANCE_ACTION_TIMEOUT）',
     nextRetryAt: new Date(Date.now() + 30_000).toISOString(),
   } });
   platform.getInstanceStatus.mockClear();
@@ -117,7 +120,7 @@ test.each([
 });
 
 test('a running platform after opening backoff must pass health and queue checks before accepting work', async () => {
-  vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+  const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
   const { service, platform, store, client, submit } = fixture(true);
   const job = submit();
   store.updateInstance('1', { state: 'offline', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT', next_action_at: Date.now() });
@@ -129,6 +132,10 @@ test('a running platform after opening backoff must pass health and queue checks
   expect(client.submit).not.toHaveBeenCalled();
   expect(service.get(job.id).stage).toBe('queued');
   await service.tick();
+  expect(client.health).toHaveBeenCalledTimes(1);
+  expect(store.instance('1')).toMatchObject({ state: 'offline', next_action_at: Date.now() + 30_000 });
+  now.mockReturnValue(1_800_000_030_000);
+  await service.tick();
   expect(client.health).toHaveBeenCalledTimes(2);
   expect(client.queue).toHaveBeenCalledTimes(1);
   expect(client.queue.mock.invocationCallOrder[0]).toBeLessThan(client.submit.mock.invocationCallOrder[0]!);
@@ -137,7 +144,8 @@ test('a running platform after opening backoff must pass health and queue checks
   expect(platform.openInstance).not.toHaveBeenCalled();
 });
 
-test.each(['running', 'pending'] as const)('foreign %s work after opening backoff remains quarantined', async queueState => {
+test.each(['running', 'pending'] as const)('foreign %s work after opening backoff is retried without preemption', async queueState => {
+  const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
   const { service, platform, store, client, submit } = fixture(true);
   const job = submit();
   store.updateInstance('1', { state: 'offline', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT', next_action_at: Date.now() - 1 });
@@ -145,13 +153,34 @@ test.each(['running', 'pending'] as const)('foreign %s work after opening backof
   client.queue.mockResolvedValue({ running: [], pending: [], [queueState]: [{ promptId: 'foreign-job' }] });
   await service.tick();
   await service.tick();
-  expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: 'COMFY_EXTERNAL_OCCUPANCY' });
+  expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_EXTERNAL_OCCUPANCY',
+    job_id: null, next_action_at: Date.now() + 30_000 });
   expect(client.health).toHaveBeenCalledTimes(1);
   expect(client.queue).toHaveBeenCalledTimes(1);
   expect(platform.getInstanceStatus).toHaveBeenCalledTimes(1);
   expect(platform.openInstance).not.toHaveBeenCalled();
   expect(client.submit).not.toHaveBeenCalled();
   expect(service.get(job.id).stage).toBe('queued');
+  expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'waiting_instance', progress: {
+    message: '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交',
+    nextRetryAt: new Date(Date.now() + 30_000).toISOString(),
+  } });
+  now.mockReturnValue(1_800_000_029_999);
+  await service.tick();
+  expect(client.queue).toHaveBeenCalledTimes(1);
+  now.mockReturnValue(1_800_000_030_000);
+  await service.tick();
+  expect(store.instance('1')).toMatchObject({ state: 'offline', next_action_at: Date.now() + 30_000 });
+  expect(client.submit).not.toHaveBeenCalled();
+  expect(platform.closeInstance).not.toHaveBeenCalled();
+  client.queue.mockResolvedValue({ running: [], pending: [] });
+  now.mockReturnValue(1_800_000_060_000);
+  await service.tick();
+  expect(service.get(job.id).stage).toBe('running');
+  expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id, next_action_at: null, error_code: null });
+  expect(client.submit).toHaveBeenCalledTimes(1);
+  expect(platform.openInstance).not.toHaveBeenCalled();
+  expect(platform.closeInstance).not.toHaveBeenCalled();
 });
 
 test('status 11 after opening backoff never blindly opens or claims work', async () => {
@@ -169,16 +198,17 @@ test('status 11 after opening backoff never blindly opens or claims work', async
   expect(service.get(job.id).stage).toBe('queued');
 });
 
-test('a historical action-timeout quarantine first becomes offline with a fresh durable backoff', async () => {
+test.each(['COMFY_INSTANCE_ACTION_TIMEOUT', 'COMFY_EXTERNAL_OCCUPANCY', 'COMFY_REGION_MISMATCH',
+  'COMFY_CAPACITY_WAIT_TIMEOUT', 'COMFY_REMOTE_UNCONFIRMED'])('a historical %s quarantine becomes offline with a fresh durable backoff', async errorCode => {
   const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
   const { service, platform, store, client, submit, db } = fixture(true);
   submit();
-  store.updateInstance('1', { state: 'quarantined', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT',
+  store.updateInstance('1', { state: 'quarantined', error_code: errorCode,
     action_started_at: Date.now() - 60_001, action_sent: 1 });
   await service.tick();
   expect(db.prepare('SELECT state, action_started_at, action_sent, next_action_at, error_code FROM comfy_instances WHERE id=?').get('1'))
     .toEqual({ state: 'offline', action_started_at: null, action_sent: 0, next_action_at: Date.now() + 30_000,
-      error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT' });
+      error_code: errorCode });
   now.mockReturnValue(1_800_000_029_999);
   await service.tick();
   expect(platform.getInstanceStatus).not.toHaveBeenCalled();
@@ -189,7 +219,7 @@ test('a historical action-timeout quarantine first becomes offline with a fresh 
 test.each([
   ['quarantined', 'other error'], ['quarantined', 'draining'], ['quarantined', 'pending result'], ['quarantined', 'bound job'],
   ['starting', 'draining'], ['starting', 'pending result'], ['starting', 'bound job'], ['closing', 'draining'],
-] as const)('%s with %s cannot automatically unlock an action timeout', async (state, blocker) => {
+] as const)('%s with %s retains its allocation safeguards while deferring recovery', async (state, blocker) => {
   vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
   const { service, platform, store, client, submit, db } = fixture(true);
   const job = submit();
@@ -202,7 +232,10 @@ test.each([
   platform.getInstanceStatus.mockResolvedValue(state === 'closing' ? '11' : '22');
   await service.tick();
   await service.tick();
-  expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: errorCode, next_action_at: null });
+  expect(store.instance('1')).toMatchObject({ state: state === 'closing' ? 'closing' : 'offline', error_code: errorCode,
+    next_action_at: Date.now() + 30_000, draining: blocker === 'draining' ? 1 : 0,
+    job_id: blocker === 'bound job' ? job.id : null });
+  if (blocker === 'pending result') expect(store.get(job.id)).toMatchObject({ result_pending: 1, instance_id: '1' });
   expect(platform.openInstance).not.toHaveBeenCalled();
   expect(platform.closeInstance).not.toHaveBeenCalled();
   expect(client.submit).not.toHaveBeenCalled();
@@ -247,22 +280,43 @@ test('draining during startup still converges to a closable ready state without 
   expect(platform.closeInstance).toHaveBeenCalledTimes(1);
 });
 
-test('closing rechecks the real instance queue and refuses to interrupt foreign work', async () => {
+test.each(['running', 'pending'] as const)('closing defers for foreign %s work and resumes after it finishes', async queueState => {
+  const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
   const { service, platform, client, store } = fixture();
   platform.getInstanceStatus.mockResolvedValue('2');
   service.control('1', 'close');
-  client.queue.mockResolvedValue({ running: [{ promptId: 'foreign' }], pending: [] });
+  client.queue.mockResolvedValue({ running: [], pending: [], [queueState]: [{ promptId: 'foreign' }] });
   await service.tick();
   expect(platform.closeInstance).not.toHaveBeenCalled();
-  expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: 'COMFY_EXTERNAL_OCCUPANCY' });
+  expect(store.instance('1')).toMatchObject({ state: 'closing', draining: 1, action_sent: 0,
+    error_code: 'COMFY_EXTERNAL_OCCUPANCY', next_action_at: Date.now() + 30_000 });
+  now.mockReturnValue(1_800_000_029_999);
+  await service.tick();
+  expect(client.queue).toHaveBeenCalledTimes(1);
+  expect(platform.getInstanceStatus).toHaveBeenCalledTimes(1);
+  now.mockReturnValue(1_800_000_030_000);
+  await service.tick();
+  expect(store.instance('1')).toMatchObject({ state: 'closing', next_action_at: Date.now() + 30_000 });
+  expect(platform.closeInstance).not.toHaveBeenCalled();
+  client.queue.mockResolvedValue({ running: [], pending: [] });
+  now.mockReturnValue(1_800_000_060_000);
+  await service.tick();
+  expect(platform.closeInstance).toHaveBeenCalledExactlyOnceWith('1');
+  expect(store.instance('1')).toMatchObject({ state: 'closing', draining: 1, action_sent: 1 });
+  platform.getInstanceStatus.mockResolvedValue('26');
+  await service.tick();
+  expect(store.instance('1')).toMatchObject({ state: 'offline', draining: 1 });
+  expect(client.submit).not.toHaveBeenCalled();
 });
 
-test('unexpected external work quarantines the instance instead of sharing its generation slot', async () => {
+test('unexpected external work defers the instance instead of sharing its generation slot', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
   const { service, platform, client, store, submit } = fixture(true);
   platform.getInstanceStatus.mockResolvedValue('2');
   client.queue.mockResolvedValue({ running: [{ promptId: 'foreign-job' }], pending: [] });
   submit();
   await service.tick();
-  expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: 'COMFY_EXTERNAL_OCCUPANCY' });
+  expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_EXTERNAL_OCCUPANCY',
+    job_id: null, next_action_at: Date.now() + 30_000 });
   expect(client.submit).not.toHaveBeenCalled();
 });

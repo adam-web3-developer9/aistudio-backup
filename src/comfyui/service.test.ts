@@ -324,7 +324,8 @@ describe('ComfyService pool safety', () => {
     expect(second.client.history).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])('quarantines unresolved timed-out work without freeing its slot or closing the instance (ack lost: %s)', async (ackLost) => {
+  it.each([false, true])('defers unresolved timed-out work without freeing its slot or closing the instance (ack lost: %s)', async (ackLost) => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
     const { service, submit, store, db, client, platform } = fixture();
     if (ackLost) {
       client.submit.mockRejectedValueOnce(new ComfyError('SUBMISSION_UNKNOWN', 'Ack lost', true));
@@ -340,10 +341,99 @@ describe('ComfyService pool safety', () => {
     }
     db.prepare('UPDATE comfy_jobs SET deadline=? WHERE id=?').run(Date.now() - 1, job.id);
     await service.tick();
-    expect(store.instance('1')).toMatchObject({ state: 'quarantined', job_id: job.id });
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id,
+      error_code: 'COMFY_REMOTE_UNCONFIRMED', next_action_at: Date.now() + 30_000 });
     expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
     expect(() => service.control('1', 'close')).toThrow();
     expect(client.submit).toHaveBeenCalledTimes(1);
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('observes only the original timed-out task until its late success (ack lost: %s)', async ackLost => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    const { service, submit, store, db, client, platform, results } = fixture();
+    if (ackLost) client.submit.mockRejectedValueOnce(new ComfyError('SUBMISSION_UNKNOWN', 'Ack lost', true));
+    const job = submit('late-unknown-success');
+    await service.tick();
+    client.history.mockResolvedValue({ state: 'missing', outputs: [] });
+    db.prepare('UPDATE comfy_jobs SET deadline=? WHERE id=?').run(Date.now() - 1, job.id);
+    await service.tick();
+    const waiting = submit('waiting-for-unknown');
+    expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED', prompt_id: job.prompt_id });
+    const observations = client.history.mock.calls.length;
+    now.mockReturnValue(1_800_000_029_999);
+    await service.tick();
+    expect(client.history).toHaveBeenCalledTimes(observations);
+    now.mockReturnValue(1_800_000_030_000);
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id, next_action_at: Date.now() + 30_000 });
+    expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
+    expect(service.get(waiting.id).stage).toBe('queued');
+    client.history.mockResolvedValue({ state: 'running', outputs: [] });
+    now.mockReturnValue(1_800_000_060_000);
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id, next_action_at: Date.now() + 30_000 });
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    expect(client.history.mock.calls.every(([promptId]) => promptId === job.prompt_id)).toBe(true);
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+    client.history.mockResolvedValue({ state: 'succeeded', outputs: [{ nodeId: '1', filename: 'late.mp4', subfolder: job.id, type: 'output' }] });
+    now.mockReturnValue(1_800_000_090_000);
+    await service.tick();
+    await vi.waitFor(() => expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', error_code: null, result_pending: 0 }));
+    expect(results.save).toHaveBeenCalledTimes(1);
+    expect(results.save.mock.calls[0]?.[0]).toBe(job.id);
+    expect(client.submit.mock.calls.filter(([request]) => request.promptId === job.prompt_id)).toHaveLength(1);
+    expect(store.instance('1')?.job_id).not.toBe(job.id);
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('migrates a legacy unknown-task quarantine across restart and collects its late result without resubmission', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    const filename = diskDatabase();
+    const first = fixture(1, filename);
+    first.client.submit.mockRejectedValueOnce(new ComfyError('SUBMISSION_UNKNOWN', 'Ack lost', true));
+    const job = first.submit('legacy-unknown');
+    await first.service.tick();
+    first.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED', deadline: Date.now() - 1 });
+    first.store.updateInstance('1', { state: 'quarantined', error_code: 'COMFY_REMOTE_UNCONFIRMED', next_action_at: null });
+    await first.service.close();
+    first.db.close();
+    const restarted = fixture(1, filename);
+    restarted.client.history.mockResolvedValue({ state: 'succeeded', outputs: [{ nodeId: '1', filename: 'late.mp4', subfolder: job.id, type: 'output' }] });
+    await restarted.service.tick();
+    expect(restarted.store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id, next_action_at: Date.now() + 30_000 });
+    expect(restarted.client.history).not.toHaveBeenCalled();
+    now.mockReturnValue(1_800_000_030_000);
+    await restarted.service.tick();
+    await vi.waitFor(() => expect(restarted.service.get(job.id).stage).toBe('succeeded'));
+    expect(restarted.client.history).toHaveBeenCalledWith(job.prompt_id);
+    expect(restarted.client.submit).not.toHaveBeenCalled();
+    expect(restarted.results.save).toHaveBeenCalledTimes(1);
+    expect(restarted.store.instance('1')?.job_id).toBeNull();
+    expect(restarted.platform.openInstance).not.toHaveBeenCalled();
+    expect(restarted.platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('releases the original unknown-task slot only after its remote failure is confirmed', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    const { service, submit, store, db, client, platform } = fixture();
+    client.submit.mockRejectedValueOnce(new ComfyError('SUBMISSION_UNKNOWN', 'Ack lost', true));
+    client.history.mockResolvedValue({ state: 'missing', outputs: [] });
+    const job = submit('late-unknown-failure');
+    await service.tick();
+    db.prepare('UPDATE comfy_jobs SET deadline=? WHERE id=?').run(Date.now() - 1, job.id);
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id, next_action_at: Date.now() + 30_000 });
+    client.history.mockResolvedValue({ state: 'failed', outputs: [] });
+    now.mockReturnValue(1_800_000_030_000);
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_RENDER_FAILED' });
+    expect(store.instance('1')?.job_id).toBeNull();
+    expect(client.history).toHaveBeenLastCalledWith(job.prompt_id);
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    expect(platform.openInstance).not.toHaveBeenCalled();
     expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 
