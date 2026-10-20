@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,7 +6,9 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ComfyError } from './comfy-client.js';
 import { ComfyService, type ComfyServiceOptions } from './service.js';
-import { ComfyStore, type ComfyInput } from './store.js';
+import { ComfyStore, type ComfyInput, type FrozenComfyInput } from './store.js';
+
+vi.mock('node:crypto', async (importOriginal) => ({ ...await importOriginal<typeof import('node:crypto')>() }));
 
 type DataClient = ReturnType<ComfyServiceOptions['client']>;
 const databases: Database.Database[] = [];
@@ -24,7 +27,7 @@ function diskDatabase(): string {
   return path.join(directory, 'pool.sqlite');
 }
 
-function fixture(count = 1, filename = ':memory:') {
+function fixture(count = 1, filename = ':memory:', workflowId = 'example') {
   const db = new Database(filename);
   databases.push(db);
   const store = new ComfyStore(db);
@@ -52,12 +55,12 @@ function fixture(count = 1, filename = ':memory:') {
     client: (instance) => clients[Number(instance.id) - 1]!,
     configuration: {
       autoOpen: false, pollIntervalMs: 1_000, bootTimeoutMs: 30_000, jobTimeoutMs: 60_000,
-      instances: clients.map((_client, index) => ({ id: String(index + 1), baseUrl: `https://instance-${index + 1}.invalid`, workflowIds: ['example'] })),
-      workflows: [{ id: 'example', version: '1', graph: { '1': { class_type: 'Example', inputs: { text: '', filename_prefix: 'example' } } }, bindings: { text: { nodeId: '1', input: 'text', kind: 'value', required: true }, outputPrefix: { nodeId: '1', input: 'filename_prefix', kind: 'output-prefix', required: true } }, outputNodeIds: ['1'] }]
+      instances: clients.map((_client, index) => ({ id: String(index + 1), baseUrl: `https://instance-${index + 1}.invalid`, workflowIds: [workflowId] })),
+      workflows: [{ id: workflowId, version: '1', graph: { '1': { class_type: 'Example', inputs: { text: '', filename_prefix: 'example' } }, '2': { class_type: 'RandomNoise', inputs: { noise_seed: 42 } }, '3': { class_type: 'OtherNoise', inputs: { noise_seed: 99 } } }, bindings: { text: { nodeId: '1', input: 'text', kind: 'value', required: true }, outputPrefix: { nodeId: '1', input: 'filename_prefix', kind: 'output-prefix', required: true } }, outputNodeIds: ['1'] }]
     }
   });
   services.push(service);
-  const submit = (key: string) => service.submit({ adapterId: 'comfyui-v1', requestKey: key, workflowId: 'example', values: { text: key }, media: {} } satisfies ComfyInput).job;
+  const submit = (key: string) => service.submit({ adapterId: 'comfyui-v1', requestKey: key, workflowId, values: { text: key }, media: {} } satisfies ComfyInput).job;
   return { db, store, clients, client: clients[0]!, platform, results, service, submit };
 }
 
@@ -74,6 +77,79 @@ afterEach(async () => {
 });
 
 describe('ComfyService pool safety', () => {
+  it('freezes a fresh crypto-safe RandomNoise seed per H3 job without mutating the shared graph', async () => {
+    const randomInt = vi.spyOn(crypto, 'randomInt').mockImplementationOnce(() => 0).mockImplementationOnce(() => 123_456);
+    const { service, submit, client, store } = fixture(1, ':memory:', 'minimax-h3-9plus3');
+    const configuration = structuredClone(service.options.configuration);
+    const first = submit('seed-first');
+    const second = submit('seed-second');
+    const profiles = [first, second].map(job => (JSON.parse(store.get(job.id)!.input) as FrozenComfyInput).profile);
+    const seeds = profiles.map(profile => (profile.graph['2'] as { inputs: { noise_seed: number } }).inputs.noise_seed);
+    expect(first.id).not.toBe(second.id);
+    expect(seeds).toEqual([0, 123_456]);
+    for (const seed of seeds) {
+      expect(Number.isSafeInteger(seed)).toBe(true);
+      expect(seed).toBeGreaterThanOrEqual(0);
+    }
+    expect(randomInt).toHaveBeenCalledTimes(2);
+    for (const [minimum, maximum] of randomInt.mock.calls) {
+      expect(minimum).toBe(0);
+      expect(Number.isSafeInteger(maximum)).toBe(true);
+      expect(maximum).toBeGreaterThan(123_456);
+      expect(maximum).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+    }
+    for (const profile of profiles) {
+      expect({ ...profile.graph, '2': configuration.workflows[0]!.graph['2'] }).toEqual(configuration.workflows[0]!.graph);
+    }
+    expect(service.options.configuration).toEqual(configuration);
+    await service.tick();
+    expect(client.submit.mock.calls[0]?.[0].graph['2']).toEqual(profiles[0]!.graph['2']);
+    expect((JSON.parse(store.get(first.id)!.input) as FrozenComfyInput).profile).toEqual(profiles[0]);
+    expect(service.options.configuration).toEqual(configuration);
+  });
+
+  it('preserves the original H3 profile and seed for the same request key across SQLite restart', async () => {
+    const randomInt = vi.spyOn(crypto, 'randomInt').mockImplementation(() => 123_456);
+    const filename = diskDatabase();
+    const first = fixture(1, filename, 'minimax-h3-9plus3');
+    const job = first.submit('seed-restart');
+    expect(first.submit('seed-restart')).toEqual(job);
+    await first.service.close();
+    first.db.close();
+    const restarted = fixture(1, filename, 'minimax-h3-9plus3');
+    const currentProfile = restarted.service.options.configuration.workflows[0]!;
+    currentProfile.version = '2';
+    currentProfile.graph['2'] = { class_type: 'RandomNoise', inputs: { noise_seed: 999 } };
+    currentProfile.graph['3'] = { class_type: 'OtherNoise', inputs: { noise_seed: 888 } };
+    const configuration = structuredClone(restarted.service.options.configuration);
+    expect(restarted.service.get(job.id)).toEqual(job);
+    const duplicate = restarted.submit('seed-restart');
+    expect(duplicate).toEqual(job);
+    expect(duplicate.input).toBe(job.input);
+    expect(randomInt).toHaveBeenCalledTimes(1);
+    await restarted.service.tick();
+    const frozen = JSON.parse(job.input) as FrozenComfyInput;
+    expect(restarted.client.submit.mock.calls[0]?.[0].graph['2']).toEqual(frozen.profile.graph['2']);
+    expect(restarted.client.submit.mock.calls[0]?.[0].graph['3']).toEqual(frozen.profile.graph['3']);
+    expect(restarted.store.get(job.id)?.input).toBe(job.input);
+    expect(restarted.service.options.configuration).toEqual(configuration);
+  });
+
+  it('does not randomize RandomNoise seeds for other workflows', async () => {
+    const randomInt = vi.spyOn(crypto, 'randomInt');
+    const { service, submit, client } = fixture(1, ':memory:', 'minimax-h3-9plus3-other');
+    const configuration = structuredClone(service.options.configuration);
+    const first = submit('other-seed-first');
+    const second = submit('other-seed-second');
+    for (const job of [first, second]) {
+      expect((JSON.parse(job.input) as FrozenComfyInput).profile).toEqual(configuration.workflows[0]);
+    }
+    await service.tick();
+    expect(client.submit.mock.calls[0]?.[0].graph['2']).toEqual(configuration.workflows[0]!.graph['2']);
+    expect(randomInt).not.toHaveBeenCalled();
+    expect(service.options.configuration).toEqual(configuration);
+  });
+
   it('preserves a late submission acknowledgement after cancellation without publishing its result', async () => {
     const { service, submit, client, store, results } = fixture();
     const accepted = deferred<{ promptId: string }>();

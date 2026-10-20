@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { SystemError } from '../system/types.js';
 import type { AssetRecord } from '../types.js';
@@ -102,7 +102,16 @@ export class ComfyService {
     const generated = Object.fromEntries(Object.entries(profile.bindings).filter(([, binding]) => binding.kind === 'output-prefix').map(([name]) => [name, 'hailuo-validation']));
     try { compileWorkflow(profile, { ...input.values, ...Object.fromEntries(Object.keys(supplied).map(name => [name, 'explicit-upload'])), ...generated }); }
     catch { throw new SystemError(400, 'COMFY_BINDING_INVALID', 'Workflow input does not match its registered bindings'); }
-    return this.store.submit(this.options.owner, { ...input, profile }, this.options.configuration.capacityWaitTimeoutMs ?? 21_600_000);
+    const frozenProfile = structuredClone(profile);
+    if (profile.id === 'minimax-h3-9plus3') {
+      for (const value of Object.values(frozenProfile.graph)) {
+        const node = value as { class_type: string; inputs: Record<string, unknown> };
+        if (node.class_type === 'RandomNoise' && typeof node.inputs.noise_seed === 'number') {
+          node.inputs.noise_seed = randomInt(0, 281_474_976_710_655);
+        }
+      }
+    }
+    return this.store.submit(this.options.owner, { ...input, profile: frozenProfile }, this.options.configuration.capacityWaitTimeoutMs ?? 21_600_000);
   }
   get(id: string): ComfyJob {
     const job = this.store.get(id);
