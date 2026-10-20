@@ -112,14 +112,17 @@ export class ComfyService {
   publicJob(job: ComfyJob) {
     const input = JSON.parse(job.input) as FrozenComfyInput;
     const candidates = this.store.instances().filter(instance => !instance.draining && this.options.configuration.instances.some(candidate => candidate.id === instance.id && candidate.workflowIds.includes(input.workflowId)));
-    const starting = job.stage === 'queued' ? candidates.find(instance => instance.state === 'starting') : undefined;
-    const waiting = candidates.filter(instance => instance.state === 'waiting_capacity');
-    const capacityWaiting = job.stage === 'queued' && !starting && waiting.length > 0;
+    const assigned = job.instance_id ? this.store.instance(job.instance_id) : undefined;
+    const uploadRecovery = ['awaiting_upload', 'preparing'].includes(job.stage) && input.transport === 'direct';
+    const starting = job.stage === 'queued' ? candidates.find(instance => instance.state === 'starting') : uploadRecovery && assigned?.state === 'starting' ? assigned : undefined;
+    const waiting = (uploadRecovery && assigned ? [assigned] : candidates).filter(instance => instance.state === 'waiting_capacity');
+    const capacityWaiting = (job.stage === 'queued' || uploadRecovery) && !starting && waiting.length > 0;
     const configuration = this.options.configuration.instances.find(instance => instance.id === (job.instance_id ?? starting?.id ?? waiting[0]?.id));
     const wakingResult = !!job.result_wake_requested && job.stage === 'succeeded';
-    const stage = job.cancel_requested ? 'cancelled' : wakingResult ? 'preparing_result' : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
+    const stage = job.cancel_requested ? 'cancelled' : wakingResult ? 'preparing_result' : uploadRecovery && assigned?.state === 'quarantined' ? 'instance_unavailable' : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
     const events = this.store.events.recent(job.id, 12);
-    const message = stageMessages[stage]!;
+    const message = uploadRecovery && starting ? '原GPU实例已离线，正在唤醒原实例；保留原任务和已上传素材' :
+      uploadRecovery && assigned?.state === 'quarantined' ? `原GPU实例暂不可用，等待恢复（${assigned.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` : stageMessages[stage]!;
     return {
       id: job.id, adapterId: 'comfyui-v1', status: wakingResult && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
       createdAt: new Date(job.created_at).toISOString(),
@@ -134,7 +137,7 @@ export class ComfyService {
       },
       events,
       ...(job.result && stage === 'succeeded' ? { result: { videoUrl: input.transport === 'direct' ? (JSON.parse(job.result) as { videoUrl: string }).videoUrl : `/v1/jobs/${job.id}/result` } } : {}),
-      ...(stage === 'awaiting_upload' && configuration && input.transport === 'direct' ? { upload: {
+      ...(stage === 'awaiting_upload' && assigned?.state === 'busy' && configuration && input.transport === 'direct' ? { upload: {
         baseUrl: configuration.baseUrl, subfolder: job.id,
         files: Object.entries(input.directMedia ?? {}).map(([binding, media]) => ({ binding, ...media })),
       } } : {}),
@@ -247,8 +250,10 @@ export class ComfyService {
         if (job.cancel_requested || job.deadline <= Date.now()) {
           this.store.updateJob(job.id, { stage: job.cancel_requested ? 'cancelled' : 'failed', error_code: job.cancel_requested ? 'COMFY_CANCELLED' : 'COMFY_UPLOAD_TIMEOUT' });
           this.store.releaseSlot(job.id);
-        }
-      } else if (job.stage === 'preparing') await this.prepare(job, client);
+        } else if (job.stage === 'awaiting_upload') await this.ensureUploadReady(configuration, client);
+      } else if (job.stage === 'preparing') {
+        if ((JSON.parse(job.input) as FrozenComfyInput).transport !== 'direct' || await this.ensureUploadReady(configuration, client)) await this.prepare(job, client);
+      }
       else if (job.deadline > Date.now()) await this.observe(job, client);
       else {
         this.store.updateJob(job.id, { stage: job.cancel_requested ? 'cancelled' : 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
@@ -346,6 +351,57 @@ export class ComfyService {
       if (frozen.transport === 'direct') this.store.updateJob(next.id, { stage: 'awaiting_upload' });
       else await this.prepare(this.store.get(next.id)!, client);
     }
+  }
+  private async ensureUploadReady(configuration: InstanceConfiguration, client: DataClient): Promise<boolean> {
+    let instance = this.store.instance(configuration.id)!;
+    if (instance.state === 'quarantined') return false;
+    if (instance.state === 'waiting_capacity') {
+      if (instance.capacity_started_at !== null && Date.now() - instance.capacity_started_at >= (this.options.configuration.capacityWaitTimeoutMs ?? 21_600_000)) {
+        this.store.updateInstance(instance.id, { state: 'quarantined', error_code: 'COMFY_CAPACITY_WAIT_TIMEOUT' });
+        return false;
+      }
+      if ((instance.next_action_at ?? 0) > Date.now()) return false;
+    }
+    const status = await this.options.platform.getInstanceStatus(instance.id);
+    this.assertWorker();
+    instance = this.store.instance(configuration.id)!;
+    if (status !== '2') {
+      if (instance.state !== 'starting') {
+        this.store.updateInstance(instance.id, { state: 'starting', action_started_at: Date.now(), action_sent: 0,
+          idle_policy_applied_at: null, error_code: 'COMFY_UPLOAD_INSTANCE_OFFLINE' });
+        instance = this.store.instance(instance.id)!;
+      }
+      if (!instance.action_sent && ['22', '26'].includes(status)) {
+        this.store.updateInstance(instance.id, { action_sent: 1, error_code: null });
+        try { await this.options.platform.openInstance(instance.id); }
+        catch (error) {
+          this.assertWorker();
+          if ((error as { code?: string })?.code !== 'CAPACITY_UNAVAILABLE') throw error;
+          this.store.updateInstance(instance.id, { state: 'waiting_capacity', action_started_at: null, action_sent: 0,
+            capacity_started_at: instance.capacity_started_at ?? Date.now(), next_action_at: Date.now() + (this.options.configuration.capacityPollIntervalMs ?? 30_000),
+            error_code: 'COMFY_CAPACITY_UNAVAILABLE' }, diagnosticDetails(error));
+          return false;
+        }
+      }
+      this.checkActionTimeout(instance.id);
+      return false;
+    }
+    if (instance.state === 'busy' && instance.idle_policy_applied_at) return true;
+    await client.health();
+    const queue = await client.queue();
+    this.assertWorker();
+    if (queue.running.length || queue.pending.length) {
+      this.store.updateInstance(instance.id, { state: 'quarantined', error_code: 'COMFY_EXTERNAL_OCCUPANCY' });
+      return false;
+    }
+    if (!instance.idle_policy_applied_at && this.options.platform.setGpuIdleShutdown) {
+      await this.options.platform.setGpuIdleShutdown(instance.id);
+      this.assertWorker();
+      this.store.updateInstance(instance.id, { idle_policy_applied_at: Date.now() });
+    }
+    this.store.updateInstance(instance.id, { state: 'busy', action_started_at: null, action_sent: 0,
+      capacity_started_at: null, next_action_at: null, error_code: null });
+    return true;
   }
   private checkActionTimeout(id: string): void {
     const instance = this.store.instance(id)!;

@@ -312,3 +312,145 @@ describe('direct transfer with SQLite and mock clients', () => {
     expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 });
+
+describe('direct upload reservation recovery after external GPU shutdown', () => {
+  async function reservedUpload() {
+    const startedAt = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(startedAt);
+    const context = fixture();
+    const job = context.submit();
+    await context.service.tick();
+    expect(context.service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1' });
+    context.store.updateInstance('1', { idle_policy_applied_at: startedAt });
+    context.platform.getInstanceStatus.mockClear().mockResolvedValue('22');
+    context.platform.openInstance.mockResolvedValue(undefined);
+    context.client.health.mockClear();
+    return { ...context, job, startedAt };
+  }
+
+  it('opens the occupied original instance only once while stopped or booting and preserves the upload reservation', async () => {
+    const { service, store, platform, client, job, startedAt } = await reservedUpload();
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
+    expect(store.instance('1')).toMatchObject({ state: 'starting', job_id: job.id,
+      action_started_at: startedAt, action_sent: 1, idle_policy_applied_at: null });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'booting', progress: { phase: 'booting' } });
+    expect(service.publicJob(service.get(job.id))).not.toHaveProperty('upload');
+    await service.tick();
+    platform.getInstanceStatus.mockResolvedValue('11');
+    await service.tick();
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
+    expect(service.get(job.id)).toMatchObject({ id: job.id, instance_id: '1', prompt_id: job.prompt_id,
+      stage: 'awaiting_upload', direct_inputs: null, provider_confirmed: 0 });
+    expect(client.health).not.toHaveBeenCalled();
+    expect(client.submit).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('persists the accepted open across a SQLite restart and does not resend it for status 26 or 11', async () => {
+    const first = await reservedUpload();
+    await first.service.tick();
+    expect(first.platform.openInstance).toHaveBeenCalledTimes(1);
+    await first.service.close();
+    first.db.close();
+    const restarted = fixture(first.filename);
+    restarted.platform.getInstanceStatus.mockResolvedValue('26');
+    await restarted.service.tick();
+    restarted.platform.getInstanceStatus.mockResolvedValue('11');
+    await restarted.service.tick();
+    expect(restarted.platform.openInstance).not.toHaveBeenCalled();
+    expect(restarted.store.instance('1')).toMatchObject({ state: 'starting', job_id: first.job.id,
+      action_sent: 1, action_started_at: first.startedAt });
+    expect(restarted.service.get(first.job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1',
+      prompt_id: first.job.prompt_id, direct_inputs: null });
+    expect(restarted.client.submit).not.toHaveBeenCalled();
+  });
+
+  it('restores health and idle policy before returning to busy, then confirms and submits the original job exactly once', async () => {
+    const { service, store, platform, client, job, receipt, startedAt } = await reservedUpload();
+    const setter = vi.fn<NonNullable<ComfyServiceOptions['platform']['setGpuIdleShutdown']>>().mockResolvedValue(undefined);
+    service.options.platform.setGpuIdleShutdown = setter;
+    await service.tick();
+    expect(setter).not.toHaveBeenCalled();
+    platform.getInstanceStatus.mockResolvedValue('11');
+    await service.tick();
+    platform.getInstanceStatus.mockResolvedValue('2');
+    vi.mocked(Date.now).mockReturnValue(startedAt + 1_000);
+    await service.tick();
+    expect(client.health).toHaveBeenCalledTimes(1);
+    expect(setter).toHaveBeenCalledExactlyOnceWith('1');
+    expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id,
+      action_started_at: null, idle_policy_applied_at: startedAt + 1_000 });
+    expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', direct_inputs: null, prompt_id: job.prompt_id });
+    expect(client.submit).not.toHaveBeenCalled();
+    await service.tick();
+    expect(client.health).toHaveBeenCalledTimes(1);
+    expect(setter).toHaveBeenCalledTimes(1);
+    service.completeInputs(job.id, receipt(job.id));
+    await service.tick();
+    service.completeInputs(job.id, receipt(job.id));
+    await service.tick();
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    expect(client.submit.mock.calls[0]![0]).toMatchObject({ attemptId: job.id, promptId: job.prompt_id });
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists occupied capacity backoff across restart and retries only when next_action_at is due', async () => {
+    const first = await reservedUpload();
+    first.configuration.capacityPollIntervalMs = 10_000;
+    first.platform.openInstance.mockRejectedValueOnce({ code: 'CAPACITY_UNAVAILABLE' });
+    await first.service.tick();
+    expect(first.store.instance('1')).toMatchObject({ state: 'waiting_capacity', job_id: first.job.id,
+      next_action_at: first.startedAt + 10_000, action_started_at: null, action_sent: 0 });
+    expect(first.service.publicJob(first.service.get(first.job.id))).toMatchObject({ stage: 'waiting_capacity',
+      progress: { nextRetryAt: new Date(first.startedAt + 10_000).toISOString() } });
+    expect(first.service.publicJob(first.service.get(first.job.id))).not.toHaveProperty('upload');
+    await first.service.close();
+    first.db.close();
+    const restarted = fixture(first.filename);
+    restarted.configuration.capacityPollIntervalMs = 10_000;
+    restarted.platform.getInstanceStatus.mockResolvedValue('22');
+    restarted.platform.openInstance.mockResolvedValue(undefined);
+    vi.mocked(Date.now).mockReturnValue(first.startedAt + 9_999);
+    await restarted.service.tick();
+    expect(restarted.platform.openInstance).not.toHaveBeenCalled();
+    vi.mocked(Date.now).mockReturnValue(first.startedAt + 10_000);
+    await restarted.service.tick();
+    expect(restarted.platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
+    await restarted.service.tick();
+    expect(restarted.platform.openInstance).toHaveBeenCalledTimes(1);
+    expect(restarted.store.instance('1')).toMatchObject({ state: 'starting', job_id: first.job.id, action_sent: 1 });
+    expect(restarted.service.get(first.job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1', prompt_id: first.job.prompt_id });
+    expect(restarted.client.submit).not.toHaveBeenCalled();
+  });
+
+  it('releases a cancelled upload reservation without waking the externally stopped instance', async () => {
+    const { service, store, platform, client, job } = await reservedUpload();
+    service.cancel(job.id);
+    await service.tick();
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'cancelled', cancel_requested: 1 });
+    expect(store.instance('1')!.job_id).toBeNull();
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    expect(platform.getInstanceStatus).not.toHaveBeenCalled();
+    expect(client.submit).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('quarantines a recovery boot timeout without repeating open or losing the original reserved slot', async () => {
+    const { service, store, platform, client, job, startedAt } = await reservedUpload();
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
+    platform.getInstanceStatus.mockResolvedValue('11');
+    vi.mocked(Date.now).mockReturnValue(startedAt + 30_001);
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'quarantined', job_id: job.id, error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT' });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'instance_unavailable' });
+    expect(service.publicJob(service.get(job.id))).not.toHaveProperty('upload');
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
+    expect(client.submit).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+});

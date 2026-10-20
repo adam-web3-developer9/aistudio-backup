@@ -48,6 +48,8 @@ AIGATE_ACCESS_TOKEN=实际AIGate平台令牌
 
 ## 日志与客户端状态
 
+- 等待客户端直传时仍核对原实例状态；平台闲时关机后唤醒已绑定实例，保留原任务、上传目录及回执，不改派、不重新生成。开机请求先持久化，缺卡按到期时间重试；恢复前隐藏上传清单，展示booting或waiting_capacity，隔离时展示instance_unavailable。平台HTTP服务的可选instancePort字符串"null"视为未分配外部端口，实际port与其他非法端口值仍严格校验。
+
 - SQL `comfy_events` 持久保存接受任务、实例分配、缺卡轮询、开机请求、闲时关机策略设置、素材确认、提交回执、生成终态、结果收取确认与槽位释放等状态变化；重启后仍可按原作业追溯。相同状态的空轮询不反复刷事件。
 - Fastify 同时输出结构化 `comfyEvent`，可在部署服务器通过 `journalctl -u aistudio-studio.service` 查看；SQL事件以sequence稳定分页。
 - `GET /v1/jobs/:id` 带最近12条事件，以及中文 `progress.message`、细分phase、真实实例区域/GPU、候卡下次重试时间、等待起点、任务时限和经过时间。终态耗时固定，不随查询不断增长。
