@@ -155,10 +155,19 @@ export class ComfyService {
       ...(job.error_code ? { error: { code: job.error_code, message: `${stageMessages[job.cancel_requested ? 'cancelled' : 'failed']}（${job.error_code}）`, retryable: false } } : {}),
     };
   }
-  requestResultAvailability(id: string): ComfyJob {
+  async requestResultAvailability(id: string): Promise<ComfyJob> {
     const job = this.get(id);
-    if (job.stage === 'succeeded' && job.result_pending && (job.result_checked_at ?? 0) < Date.now() - 30_000 &&
-      (JSON.parse(job.input) as FrozenComfyInput).transport === 'direct') this.store.updateJob(id, { result_wake_requested: 1 });
+    if (job.stage === 'succeeded' && job.result_pending && (job.result_wake_requested || (job.result_checked_at ?? 0) < Date.now() - 30_000) &&
+      (JSON.parse(job.input) as FrozenComfyInput).transport === 'direct') {
+      const configuration = this.options.configuration.instances.find(instance => instance.id === job.instance_id);
+      if (!configuration) throw new SystemError(409, 'COMFY_INSTANCE_UNKNOWN', 'Original instance configuration is unavailable');
+      try {
+        await this.options.client(configuration).health();
+        if (this.get(id).result_pending) this.store.updateJob(id, { result_wake_requested: 0, result_checked_at: Date.now() });
+      } catch (error) {
+        if (this.get(id).result_pending) this.store.updateJob(id, { result_wake_requested: 1 }, diagnosticDetails(error));
+      }
+    }
     return this.get(id);
   }
   completeInputs(id: string, inputs: Record<string, { name: string; subfolder: string; type: 'input' }>): ComfyJob {

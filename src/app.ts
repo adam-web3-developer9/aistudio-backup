@@ -1399,7 +1399,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   app.get('/v1/jobs/:id', async (request, reply) => {
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send(zodError(params.error));
-    if (comfy?.store.get(params.data.id)) return reply.send(comfy.publicJob(comfy.requestResultAvailability(params.data.id)));
+    if (comfy?.store.get(params.data.id)) return reply.send(comfy.publicJob(await comfy.requestResultAvailability(params.data.id)));
     const job = jobs.get(params.data.id);
     if (!job || gateway && !gateway.hasJob(job.id)) {
       return reply.code(404).send(errorBody(

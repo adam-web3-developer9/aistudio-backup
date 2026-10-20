@@ -156,12 +156,16 @@ describe('direct transfer with SQLite and mock clients', () => {
     client.health.mockClear();
     if (!healthy) client.health.mockRejectedValue(new ComfyError('NETWORK_ERROR', 'Fixture health unavailable', true));
     const claim = vi.spyOn(store, 'claim');
-    expect(service.requestResultAvailability(job.id)).toMatchObject({
-      stage: 'succeeded', result_pending: 1, result_wake_requested: 1, result
+    const available = await service.requestResultAvailability(job.id);
+    expect(available).toMatchObject({
+      stage: 'succeeded', result_pending: 1, result_wake_requested: healthy ? 0 : 1, result
     });
-    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'preparing_result' });
-    await service.tick();
     expect(client.health).toHaveBeenCalledTimes(1);
+    expect(service.publicJob(available)).toMatchObject(healthy ? {
+      status: 'succeeded', stage: 'succeeded', result: { videoUrl }
+    } : { status: 'running', stage: 'preparing_result' });
+    await service.tick();
+    expect(client.health).toHaveBeenCalledTimes(healthy ? 1 : 2);
     expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1,
       result_wake_requested: healthy ? 0 : 1, result });
     if (healthy) {
@@ -198,7 +202,9 @@ describe('direct transfer with SQLite and mock clients', () => {
     client.health.mockClear();
     store.updateInstance('1', { state: 'offline', next_action_at: null });
     store.updateJob(job.id, { result_checked_at: Date.now() - 3_600_000 });
-    expect(service.requestResultAvailability(job.id)).toMatchObject({ result_wake_requested: 1 });
+    const available = await service.requestResultAvailability(job.id);
+    expect(available).toMatchObject({ result_wake_requested: 0 });
+    expect(service.publicJob(available)).toMatchObject({ status: 'succeeded', stage: 'succeeded', result: { videoUrl } });
     await service.tick();
     expect(client.health).toHaveBeenCalledTimes(1);
     expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1, result_wake_requested: 0, result });
@@ -208,6 +214,45 @@ describe('direct transfer with SQLite and mock clients', () => {
     expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: null });
     await service.tick();
     expect(client.health).toHaveBeenCalledTimes(1);
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    for (const operation of [assets.get, assets.read, client.upload, client.download, results.save, results.read,
+      platform.openInstance, platform.closeInstance]) expect(operation).not.toHaveBeenCalled();
+  });
+
+  it('returns the original result immediately on every sixty-second availability poll without a worker tick', async () => {
+    const { service, store, client, platform, configuration, assets, results, submit, receipt, succeed } = fixture();
+    const startedAt = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(startedAt);
+    const job = submit();
+    await service.tick();
+    service.completeInputs(job.id, receipt(job.id));
+    await service.tick();
+    succeed();
+    await service.tick();
+    const result = service.get(job.id).result;
+    const videoUrl = service.publicJob(service.get(job.id)).result!.videoUrl;
+    configuration.autoOpen = true;
+    store.updateInstance('1', { state: 'offline', next_action_at: null });
+    client.health.mockClear();
+    client.queue.mockClear().mockResolvedValue({ running: [{ promptId: 'foreign-prompt' }], pending: [] });
+    platform.getInstanceStatus.mockClear().mockResolvedValue('22');
+    for (const poll of [1, 2, 3]) {
+      const now = startedAt + poll * 60_000;
+      vi.mocked(Date.now).mockReturnValue(now);
+      const available = await service.requestResultAvailability(job.id);
+      expect(available).toMatchObject({ stage: 'succeeded', result_pending: 1, result_wake_requested: 0,
+        result_checked_at: now, result });
+      expect(service.publicJob(available)).toMatchObject({ status: 'succeeded', stage: 'succeeded', result: { videoUrl } });
+      expect(client.health).toHaveBeenCalledTimes(poll);
+    }
+    store.updateJob(job.id, { result_wake_requested: 1 });
+    const available = await service.requestResultAvailability(job.id);
+    expect(available).toMatchObject({ result_wake_requested: 0, result });
+    expect(service.publicJob(available)).toMatchObject({ status: 'succeeded', stage: 'succeeded', result: { videoUrl } });
+    expect(client.health).toHaveBeenCalledTimes(4);
+    expect(client.queue).not.toHaveBeenCalled();
+    expect(platform.getInstanceStatus).not.toHaveBeenCalled();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: null });
     expect(client.submit).toHaveBeenCalledTimes(1);
     for (const operation of [assets.get, assets.read, client.upload, client.download, results.save, results.read,
       platform.openInstance, platform.closeInstance]) expect(operation).not.toHaveBeenCalled();
@@ -414,7 +459,7 @@ describe('direct transfer with SQLite and mock clients', () => {
     vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 3_600_000);
     platform.getInstanceStatus.mockResolvedValue('22');
     client.health.mockClear();
-    expect(service.requestResultAvailability(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 0, result_wake_requested: 0, result });
+    expect(await service.requestResultAvailability(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 0, result_wake_requested: 0, result });
     await service.tick();
     expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'succeeded', stage: 'succeeded' });
     expect(store.instance('1')!.job_id).toBeNull();

@@ -332,9 +332,10 @@ describe('capacity scheduling with SQLite and mock clients', () => {
       expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1, result_wake_requested: 0, result: resultBeforeShutdown });
       expect(store.instance('1')).toMatchObject({ state: 'ready', job_id: null });
     }
-    expect(service.requestResultAvailability(job.id)).toMatchObject({ stage: 'succeeded', result_wake_requested: 1 });
+    client.health.mockRejectedValueOnce(new Error('Instance is powered off'))
+      .mockRejectedValueOnce(new Error('Instance is powered off'));
+    expect(await service.requestResultAvailability(job.id)).toMatchObject({ stage: 'succeeded', result_wake_requested: 1 });
     expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'running', stage: 'preparing_result' });
-    client.health.mockRejectedValueOnce(new Error('Instance is powered off'));
     await service.tick();
     expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
     await service.tick();
