@@ -80,6 +80,21 @@ afterEach(async () => {
 });
 
 describe('direct transfer with SQLite and mock clients', () => {
+  it('persists ComfyError.details.upstreamCode in the failed job event', async () => {
+    const { service, submit, receipt, client, db } = fixture();
+    const job = submit();
+    await service.tick();
+    service.completeInputs(job.id, receipt(job.id));
+    client.submit.mockRejectedValueOnce(new ComfyError('PROMPT_REJECTED', 'Fixture rejection', false,
+      { upstreamCode: 'TEST_UPSTREAM_REJECTED' }));
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_PROMPT_REJECTED' });
+    const event = db.prepare('SELECT details FROM comfy_events WHERE job_id=? AND code=? ORDER BY sequence DESC LIMIT 1')
+      .get(job.id, 'COMFY_PROMPT_REJECTED') as { details: string } | undefined;
+    expect(event).toBeDefined();
+    expect(JSON.parse(event!.details)).toMatchObject({ upstreamCode: 'TEST_UPSTREAM_REJECTED' });
+  });
+
   it('reserves an upload manifest, submits the exact graph once, and never relays media', async () => {
     const context = fixture();
     const { service, store, client, input, submit, receipt, assets, results } = context;

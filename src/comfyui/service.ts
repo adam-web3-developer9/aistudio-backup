@@ -33,9 +33,9 @@ function codeOf(error: unknown): string {
   return typeof code === 'string' && /^[A-Z_]{1,94}$/.test(code) ? code.startsWith('COMFY_') ? code : `COMFY_${code}` : 'COMFY_OPERATION_FAILED';
 }
 function diagnosticDetails(error: unknown): ComfyEventDetails {
-  const value = error as { errCode?: unknown; details?: { httpStatus?: unknown; nodeId?: unknown; errorType?: unknown } } | null;
+  const value = error as { errCode?: unknown; details?: { upstreamCode?: unknown; httpStatus?: unknown; nodeId?: unknown; errorType?: unknown } } | null;
   const details: ComfyEventDetails = {};
-  for (const [key, item] of Object.entries({ upstreamCode: value?.errCode, nodeId: value?.details?.nodeId, errorType: value?.details?.errorType })) {
+  for (const [key, item] of Object.entries({ upstreamCode: value?.errCode ?? value?.details?.upstreamCode, nodeId: value?.details?.nodeId, errorType: value?.details?.errorType })) {
     if (typeof item === 'string' && /^[A-Za-z0-9_.:-]{1,100}$/.test(item)) Object.assign(details, { [key]: item });
   }
   const status = value?.details?.httpStatus;
