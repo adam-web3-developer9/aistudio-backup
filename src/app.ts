@@ -1,4 +1,7 @@
 import path from 'node:path';
+import { createComfyService, type ComfyRuntimeOptions } from './comfyui/runtime.js';
+import { comfyEventQuerySchema, comfyInputsSchema, comfyJobSchema } from './comfyui/routes.js';
+import { validMediaSignature } from './system-media/routes.js';
 import { randomUUID } from 'node:crypto';
 import { ManagedSessionStore } from './system-channels/session-store.js';
 import type { ChannelStore } from './system-channels/store.js';
@@ -113,11 +116,12 @@ const MIN_RETAINED_HAILUO_CREDITS = 28;
 /** Old desktop clients omit upload-intent options; reserve the provider's maximum H3 duration. */
 const MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS = 15;
 
-export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; managedAccountCreditReader?:ManagedAccountCreditReader; managedAccountArchived?:(id:string,reason:ManagedArchiveReason)=>void; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
+export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; comfyui?: ComfyRuntimeOptions; managedAccountCreditReader?:ManagedAccountCreditReader; managedAccountArchived?:(id:string,reason:ManagedArchiveReason)=>void; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
   if (options.managedGateway && !options.managedChannels) throw new Error('Managed video gateway requires managed channels');
   assertVideoGatewayConfiguration(options.managedGateway === true, config.apiKey);
   assertVideoGatewayProxyConfiguration(options.managedGateway === true, config.mioraProxyUrl);
   const gateway = options.managedGateway && options.managedChannels ? new ManagedVideoGatewayRecords(options.managedChannels, config.apiKey!) : undefined;
+  if (options.comfyui && !gateway) throw new Error('ComfyUI requires the authenticated managed video gateway');
   const uploadIntents = gateway && options.managedChannels ? new MioraUploadIntentStore(options.managedChannels.db, config.apiKey!) : undefined;
   const mioraTransfers = new MioraCosTransferCoordinator();
   const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
@@ -130,6 +134,16 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const assets = new AssetStore(config.dataDir, {
     onError: (error, fileName) => app.log.warn({ err: error, fileName }, 'Skipped unreadable upload')
   });
+  const comfy = options.comfyui ? createComfyService({ ...options.comfyui, db: options.managedChannels!.db,
+    dataDirectory: config.dataDir, apiKey: config.apiKey!, assets, ownsAsset: id => gateway!.hasAsset(id),
+    eventSink: event => app.log.info({ comfyEvent: event }, 'ComfyUI pool event') }) : undefined;
+  if (comfy) app.log.info({ component: 'comfyui', autoOpen: comfy.options.configuration.autoOpen,
+    instances: comfy.options.configuration.instances.map(instance => ({ id: instance.id, areaName: instance.areaName, gpuModel: instance.gpuModel })),
+    workflows: comfy.options.configuration.workflows.map(profile => ({ id: profile.id, version: profile.version })),
+    capacityPollIntervalMs: comfy.options.configuration.capacityPollIntervalMs ?? 30_000,
+    capacityWaitTimeoutMs: comfy.options.configuration.capacityWaitTimeoutMs ?? 21_600_000,
+  }, 'ComfyUI pool enabled');
+  if (comfy) app.addHook('onReady', async () => { comfy.start(); });
   const sessions = options.managedChannels ? new ManagedSessionStore(config.dataDir, options.managedChannels) : new SessionStore(config.dataDir);
   const jobs = new JobStore({
     dataDir: config.dataDir,
@@ -1065,6 +1079,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
 
   app.get('/health', async () => ({
     status: 'ok',
+    ...(comfy ? { comfyuiEnabled: true } : {}),
     ...(options.managedChannels ? { service: 'system', channelsEnabled: true, videoGatewayEnabled: !!gateway } : {}),
     browsers: browsers.stats(),
     adapters: adapters.list()
@@ -1076,13 +1091,14 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
 
   app.post('/v1/assets', async (request, reply) => {
     const file = await request.file();
-    if (!file) return reply.code(400).send(errorBody('FILE_REQUIRED', 'Upload one image or video file'));
-    if (!supportedAssetTypes.has(file.mimetype)) {
-      return reply.code(415).send(errorBody('UNSUPPORTED_FILE_TYPE', 'Use PNG, JPEG, WebP, GIF, MP4, MOV or WebM'));
+    if (!file) return reply.code(400).send(errorBody('FILE_REQUIRED', comfy ? 'Upload one image, video or supported audio file' : 'Upload one image or video file'));
+    const comfyAudio = !!comfy && ['audio/mpeg', 'audio/wav'].includes(file.mimetype);
+    if (!supportedAssetTypes.has(file.mimetype) && !comfyAudio) {
+      return reply.code(415).send(errorBody('UNSUPPORTED_FILE_TYPE', comfy ? 'Use PNG, JPEG, WebP, GIF, MP4, MOV, WebM, MP3 or WAV' : 'Use PNG, JPEG, WebP, GIF, MP4, MOV or WebM'));
     }
 
     const buffer = await file.toBuffer();
-    if (!matchesAssetSignature(buffer, file.mimetype)) {
+    if (!(comfyAudio ? validMediaSignature(file.mimetype, buffer) : matchesAssetSignature(buffer, file.mimetype))) {
       return reply.code(415).send(errorBody('FILE_SIGNATURE_MISMATCH', 'File content does not match MIME type'));
     }
     const asset = await assets.save({
@@ -1383,6 +1399,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   app.get('/v1/jobs/:id', async (request, reply) => {
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send(zodError(params.error));
+    if (comfy?.store.get(params.data.id)) return reply.send(comfy.publicJob(comfy.requestResultAvailability(params.data.id)));
     const job = jobs.get(params.data.id);
     if (!job || gateway && !gateway.hasJob(job.id)) {
       return reply.code(404).send(errorBody(
@@ -1402,9 +1419,48 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     const query = listJobsQuerySchema.safeParse(request.query);
     if (!query.success) return reply.code(400).send(zodError(query.error));
     const status = query.data.status as JobStatus | undefined;
-    const all = jobs.list({ status }).filter(job => !gateway || gateway.hasJob(job.id));
-    return reply.send({ total: all.length, jobs: all.slice(0, query.data.limit).map(job => gateway ? projectGatewayJob(job) : job) });
+    const legacy = jobs.list({ status }).filter(job => !gateway || gateway.hasJob(job.id)).map(job => gateway ? projectGatewayJob(job) : job);
+    const workflow = comfy?.store.list(comfy.options.owner, status).map(job => comfy.publicJob(job)) ?? [];
+    const all = [...legacy, ...workflow].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return reply.send({ total: all.length, jobs: all.slice(0, query.data.limit) });
   });
+
+if (comfy) {
+app.get('/v1/jobs/:id/events', async (request, reply) => {
+const job = comfy.get((request.params as { id: string }).id);
+const parsed = comfyEventQuerySchema.safeParse(request.query);
+if (!parsed.success) return reply.code(400).send(errorBody('INVALID_INPUT', 'Invalid event cursor'));
+const events = comfy.store.events.list({ jobId: job.id, ...parsed.data });
+return reply.send({ events, nextAfter: events.at(-1)?.sequence ?? parsed.data.after });
+});
+app.post('/v1/jobs/:id/inputs', async (request, reply) => {
+const parsed = comfyInputsSchema.safeParse(request.body);
+if (!parsed.success) return reply.code(400).send(errorBody('INVALID_INPUT', 'Invalid upload acknowledgement'));
+return reply.send(comfy.publicJob(comfy.completeInputs((request.params as { id: string }).id, parsed.data.inputs)));
+});
+app.post('/v1/jobs/:id/collected', async (request, reply) => {
+return reply.send(comfy.publicJob(comfy.acknowledgeCollected((request.params as { id: string }).id)));
+});
+app.get('/v1/jobs/:id/result', async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const job = comfy.get(id);
+      if (job.stage !== 'succeeded' || job.cancel_requested || !job.result) return reply.code(409).send(errorBody('COMFY_RESULT_UNAVAILABLE', 'Result is not durably available'));
+      if ((JSON.parse(job.input) as { transport?: string }).transport === 'direct') return reply.code(409).send(errorBody('COMFY_DIRECT_RESULT', 'Download result.videoUrl directly from the registered GPU instance'));
+      const result = JSON.parse(job.result) as { hash: string; size: number };
+      const stream = await comfy.options.results.read(result);
+      if (!stream) return reply.code(404).send(errorBody('COMFY_RESULT_UNAVAILABLE', 'Result is unavailable'));
+      return reply.type('video/mp4').header('Content-Length', result.size).header('Cache-Control', 'private, no-store').header('X-Content-Type-Options', 'nosniff').send(stream);
+    });
+    app.post('/v1/jobs/:id/cancel', async (request, reply) => {
+      const job = comfy.cancel((request.params as { id: string }).id);
+      return reply.send({ ...comfy.publicJob(job), remoteStopped: false });
+    });
+    app.post('/v1/jobs/:id/reconcile', async (request, reply) => {
+      const { id } = request.params as { id: string };
+      await comfy.reconcile(id);
+      return reply.send(comfy.publicJob(comfy.get(id)));
+    });
+  }
 
   // Existing routes/wire shape; only Miora input boundaries gain token streaming.
   await app.register(async mioraRequests => {
@@ -1486,6 +1542,14 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     });
 
     mioraRequests.post('/v1/jobs', async (request, reply) => {
+      if ((request.body as { adapterId?: unknown } | null)?.adapterId === 'comfyui-v1') {
+        if (!comfy) return reply.code(503).send(errorBody('COMFY_POOL_DISABLED', 'ComfyUI pool is not configured'));
+        const input = comfyJobSchema.safeParse(request.body);
+        if (!input.success) return reply.code(400).send(zodError(input.error));
+        const accepted = comfy.submit(input.data);
+        return reply.code(accepted.created ? 202 : 200).send({ jobId: accepted.job.id,
+          status: comfy.publicJob(accepted.job).status, statusUrl: `/v1/jobs/${accepted.job.id}` });
+      }
       const parsed = createJobSchema.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
 
@@ -1616,6 +1680,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
 
   app.addHook('onClose', async () => {
     try {
+    await comfy?.close();
     mioraTransfers.close();
     await Promise.allSettled(importRuns.values());
     tokenWatcher.stop();
@@ -1632,7 +1697,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     await jobs.flush();
     } finally { mioraDiagnosticSink.flush(); }
   });
-  app.decorate('channelRuntime', { jobs, runner, assets, accountPool, sessions, accountOperations:managedAccountOperations });
+  app.decorate('channelRuntime', { jobs, runner, assets, accountPool, sessions, accountOperations:managedAccountOperations, comfy });
   return app;
 }
 

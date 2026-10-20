@@ -1,0 +1,414 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { loadComfyConfiguration } from './configuration.js';
+import { ComfyService, type ComfyServiceOptions } from './service.js';
+import { ComfyStore, type ComfyInput } from './store.js';
+
+type DataClient = ReturnType<ComfyServiceOptions['client']>;
+type Configuration = ComfyServiceOptions['configuration'];
+const resources: Array<{ service: ComfyService; db: Database.Database }> = [];
+const directories: string[] = [];
+const startedAt = 1_800_000_000_000;
+
+function fixture(overrides: Partial<Configuration> = {}, filename?: string, enableIdlePolicy = false) {
+  if (!filename) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'comfy-capacity-test-'));
+    directories.push(directory);
+    filename = path.join(directory, 'pool.sqlite');
+  }
+  const db = new Database(filename);
+  const store = new ComfyStore(db);
+  const configuration: Configuration = {
+    autoOpen: true, pollIntervalMs: 1_000, bootTimeoutMs: 30_000, jobTimeoutMs: 60_000,
+    capacityPollIntervalMs: 30_000, capacityWaitTimeoutMs: 21_600_000,
+    instances: [{ id: '1', baseUrl: 'https://native-1.invalid', areaName: '华东一区', gpuModel: '5090', headers: {}, workflowIds: ['capacity'] }],
+    workflows: [{ id: 'capacity', version: '1', graph: {
+      '1': { class_type: 'LoadImage', inputs: { image: '' } },
+      '2': { class_type: 'Render', inputs: { image: ['1', 0], text: '', filename_prefix: '' } }
+    }, bindings: { image: { nodeId: '1', input: 'image', kind: 'media', required: true },
+      text: { nodeId: '2', input: 'text', kind: 'value', required: true },
+      output: { nodeId: '2', input: 'filename_prefix', kind: 'output-prefix', required: true } }, outputNodeIds: ['2'] }],
+    ...overrides
+  };
+  const clients = Object.fromEntries(configuration.instances.map(instance => [instance.id, {
+    health: vi.fn<DataClient['health']>().mockResolvedValue(undefined),
+    queue: vi.fn<DataClient['queue']>().mockResolvedValue({ running: [], pending: [] }),
+    upload: vi.fn<DataClient['upload']>(),
+    submit: vi.fn<DataClient['submit']>().mockImplementation(async ({ promptId }) => ({ promptId })),
+    history: vi.fn<DataClient['history']>().mockResolvedValue({ state: 'running', outputs: [] }),
+    findAttempt: vi.fn<DataClient['findAttempt']>().mockResolvedValue(undefined),
+    download: vi.fn<DataClient['download']>()
+  }]));
+  const statuses = new Map(configuration.instances.map(instance => [instance.id, '22']));
+  const idlePolicySetter = vi.fn<NonNullable<ComfyServiceOptions['platform']['setGpuIdleShutdown']>>().mockResolvedValue(undefined);
+  const platform = {
+    getInstanceStatus: vi.fn<ComfyServiceOptions['platform']['getInstanceStatus']>().mockImplementation(async id => statuses.get(id)!),
+    openInstance: vi.fn<ComfyServiceOptions['platform']['openInstance']>().mockImplementation(async id => { statuses.set(id, '2'); }),
+    closeInstance: vi.fn<ComfyServiceOptions['platform']['closeInstance']>(),
+    ...(enableIdlePolicy ? { setGpuIdleShutdown: idlePolicySetter } : {})
+  };
+  const assets = { get: vi.fn<ComfyServiceOptions['assets']['get']>(), read: vi.fn<ComfyServiceOptions['assets']['read']>() };
+  const results = { save: vi.fn<ComfyServiceOptions['results']['save']>(), read: vi.fn<ComfyServiceOptions['results']['read']>() };
+  const service = new ComfyService({ store, configuration, platform, assets, results,
+    client: instance => clients[instance.id]!, ownsAsset: () => false, owner: 'owner' });
+  resources.push({ service, db });
+  const input = (key = 'capacity'): ComfyInput => ({ adapterId: 'comfyui-v1', requestKey: key,
+    workflowId: 'capacity', transport: 'direct', media: {}, values: { text: key }, directMedia: {
+      image: { filename: 'frame.png', contentType: 'image/png', sha256: 'a'.repeat(64) }
+    } });
+  const submit = (key = 'capacity') => service.submit(input(key)).job;
+  return { filename, db, store, configuration, service, clients, client: clients['1']!, platform, statuses, assets, results, input, submit, idlePolicySetter };
+}
+
+beforeEach(() => { vi.spyOn(Date, 'now').mockReturnValue(startedAt); });
+afterEach(async () => {
+  for (const { service, db } of resources.splice(0)) { if (db.open) { await service.close(); db.close(); } }
+  vi.restoreAllMocks();
+  for (const directory of directories.splice(0)) {
+    const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(directory));
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || !path.basename(directory).startsWith('comfy-capacity-test-')) throw new Error('Unsafe test cleanup');
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+describe('capacity scheduling with SQLite and mock clients', () => {
+  it('persists capacity backoff across restart without reserving a job slot or opening early', async () => {
+    const first = fixture();
+    first.platform.openInstance.mockRejectedValue({ code: 'CAPACITY_UNAVAILABLE' });
+    const job = first.submit();
+    await first.service.tick();
+    expect(first.store.instance('1')).toMatchObject({ state: 'waiting_capacity', job_id: null,
+      capacity_started_at: startedAt, next_action_at: startedAt + 30_000, action_started_at: null, action_sent: 0 });
+    expect(first.service.publicJob(first.service.get(job.id))).toMatchObject({ status: 'queued', stage: 'waiting_capacity' });
+    await first.service.close();
+    first.db.close();
+    const restarted = fixture({}, first.filename);
+    vi.mocked(Date.now).mockReturnValue(startedAt + 29_999);
+    await restarted.service.tick();
+    expect(restarted.platform.openInstance).not.toHaveBeenCalled();
+    expect(restarted.platform.getInstanceStatus).not.toHaveBeenCalled();
+    vi.mocked(Date.now).mockReturnValue(startedAt + 30_000);
+    restarted.platform.openInstance.mockRejectedValue({ code: 'CAPACITY_UNAVAILABLE' });
+    await restarted.service.tick();
+    expect(restarted.platform.openInstance).toHaveBeenCalledTimes(1);
+    expect(restarted.store.instance('1')).toMatchObject({ state: 'waiting_capacity', job_id: null,
+      capacity_started_at: startedAt, next_action_at: startedAt + 60_000 });
+    expect(restarted.service.get(job.id).stage).toBe('queued');
+    expect(restarted.client.submit).not.toHaveBeenCalled();
+  });
+
+  it.each(['5090', '4090'] as const)('tries another region with %s after the preferred region has no capacity', async availableGpu => {
+    const instances: Configuration['instances'] = [
+      { id: '1', baseUrl: 'https://native-1.invalid', areaName: '华东二区', gpuModel: '4090', workflowIds: ['capacity'] },
+      { id: '2', baseUrl: 'https://native-2.invalid', areaName: '华东一区', gpuModel: '5090', workflowIds: ['capacity'] },
+      { id: '3', baseUrl: 'https://native-3.invalid', areaName: '华东二区', gpuModel: '5090', workflowIds: ['capacity'] }
+    ];
+    const { service, platform, statuses, store, submit } = fixture({ instances });
+    const availableId = availableGpu === '5090' ? '3' : '1';
+    platform.openInstance.mockImplementation(async id => {
+      if (id !== availableId) throw { code: 'CAPACITY_UNAVAILABLE' };
+      statuses.set(id, '2');
+    });
+    const job = submit();
+    await service.tick();
+    expect(platform.openInstance.mock.calls.map(([id]) => id)).toEqual(availableGpu === '5090' ? ['2', '3'] : ['2', '3', '1']);
+    expect(store.instance('2')!.state).toBe('waiting_capacity');
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ instance_id: availableId, stage: 'awaiting_upload' });
+    expect(store.instance(availableId)!.job_id).toBe(job.id);
+    expect(store.instance('2')!.job_id).toBeNull();
+  });
+
+  it('prefers a ready 5090 even when a ready 4090 is configured first', async () => {
+    const instances: Configuration['instances'] = [
+      { id: '1', baseUrl: 'https://native-1.invalid', areaName: '华东一区', gpuModel: '4090', workflowIds: ['capacity'] },
+      { id: '2', baseUrl: 'https://native-2.invalid', areaName: '华东二区', gpuModel: '5090', workflowIds: ['capacity'] }
+    ];
+    const { service, statuses, store, submit, platform } = fixture({ instances });
+    statuses.set('1', '2'); statuses.set('2', '2');
+    const job = submit();
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ instance_id: '2', stage: 'awaiting_upload' });
+    expect(store.instance('1')!.job_id).toBeNull();
+    expect(platform.openInstance).not.toHaveBeenCalled();
+  });
+
+  it.each(['NETWORK_ERROR', 'TIMEOUT', 'BUSINESS_REJECTED'])('never repeats an uncertain or rejected open (%s)', async code => {
+    const { service, platform, store, submit } = fixture();
+    platform.openInstance.mockRejectedValue({ code });
+    submit();
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'starting', action_sent: 1, error_code: 'COMFY_' + code,
+      capacity_started_at: null, next_action_at: null });
+    await service.tick();
+    vi.mocked(Date.now).mockReturnValue(startedAt + 30_001);
+    await service.tick();
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
+    expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT' });
+  });
+
+  it('does not spend bootTimeout while waiting for capacity and grants a fresh boot window on success', async () => {
+    const { service, platform, store, submit, statuses } = fixture({ capacityPollIntervalMs: 90_000 });
+    platform.openInstance.mockRejectedValueOnce({ code: 'CAPACITY_UNAVAILABLE' });
+    const job = submit();
+    await service.tick();
+    vi.mocked(Date.now).mockReturnValue(startedAt + 60_001);
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'waiting_capacity', action_started_at: null });
+    expect(service.get(job.id).stage).toBe('queued');
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
+    vi.mocked(Date.now).mockReturnValue(startedAt + 90_000);
+    platform.openInstance.mockImplementationOnce(async () => { statuses.set('1', '11'); });
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'starting', action_started_at: startedAt + 90_000 });
+    vi.mocked(Date.now).mockReturnValue(startedAt + 119_999);
+    await service.tick();
+    expect(store.instance('1')!.state).toBe('starting');
+    statuses.set('1', '2');
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', deadline: startedAt + 179_999 });
+    expect(store.instance('1')).toMatchObject({ capacity_started_at: null, next_action_at: null });
+  });
+
+  it('extends queue deadlines by configured capacity wait and resets them to jobTimeout after assignment', async () => {
+    const { service, submit, platform, statuses } = fixture({ capacityWaitTimeoutMs: 43_200_000 });
+    platform.openInstance.mockRejectedValueOnce({ code: 'CAPACITY_UNAVAILABLE' });
+    const job = submit();
+    expect(job.deadline).toBe(startedAt + 43_200_000);
+    await service.tick();
+    vi.mocked(Date.now).mockReturnValue(startedAt + 7_200_000);
+    statuses.set('1', '2');
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', deadline: startedAt + 7_260_000 });
+  });
+
+  it('uses default 30-second backoff and six-hour timeout when optional capacity fields are omitted', async () => {
+    const { configuration, service, platform, store, submit } = fixture({ jobTimeoutMs: 43_200_000 });
+    delete configuration.capacityPollIntervalMs; delete configuration.capacityWaitTimeoutMs;
+    platform.openInstance.mockRejectedValue({ code: 'CAPACITY_UNAVAILABLE' });
+    const job = submit();
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'waiting_capacity', next_action_at: startedAt + 30_000 });
+    expect(job.stage).toBe('queued');
+    vi.mocked(Date.now).mockReturnValue(startedAt + 21_600_000 - 1);
+    await service.tick();
+    expect(store.instance('1')!.state).toBe('waiting_capacity');
+    vi.mocked(Date.now).mockReturnValue(startedAt + 21_600_000);
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'quarantined', error_code: 'COMFY_CAPACITY_WAIT_TIMEOUT' });
+    expect(platform.openInstance).toHaveBeenCalledTimes(2);
+  });
+
+  it('extends the queue deadline to the default six hours when optional capacity settings are absent', () => {
+    const { configuration, submit } = fixture();
+    delete configuration.capacityPollIntervalMs; delete configuration.capacityWaitTimeoutMs;
+    expect(submit().deadline).toBeGreaterThanOrEqual(startedAt + 21_600_000);
+  });
+
+  it('loads persistent capacity defaults from a real configuration file', async () => {
+    const { configuration, filename } = fixture();
+    const directory = path.dirname(filename);
+    writeFileSync(path.join(directory, 'graph.json'), JSON.stringify(configuration.workflows[0]!.graph));
+    const configFile = path.join(directory, 'pool.json');
+    writeFileSync(configFile, JSON.stringify({ instances: configuration.instances.map(({ headers: _headers, ...instance }) => instance),
+      workflows: configuration.workflows.map(({ graph: _graph, ...profile }) => ({ ...profile, file: 'graph.json' })) }));
+    const loaded = await loadComfyConfiguration(configFile, {});
+    expect(loaded).toMatchObject({ capacityPollIntervalMs: 30_000, capacityWaitTimeoutMs: 21_600_000, capacityErrorCodes: [] });
+  });
+
+  it('reopens a SQL-ready instance externally powered off before a new job arrives', async () => {
+    const { service, submit, platform, statuses, store } = fixture();
+    store.updateInstance('1', { state: 'ready' });
+    const job = submit();
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
+    expect(store.instance('1')).toMatchObject({ state: 'starting', job_id: null });
+    statuses.set('1', '2');
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1' });
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('wakes an externally stopped instance solely to collect its original pending direct result', async () => {
+    const { service, submit, platform, statuses, store, client, assets, results, db } = fixture();
+    statuses.set('1', '2');
+    const job = submit();
+    await service.tick();
+    service.completeInputs(job.id, { image: { name: 'frame.png', subfolder: job.id, type: 'input' } });
+    await service.tick();
+    client.history.mockResolvedValue({ state: 'succeeded', outputs: [
+      { filename: 'original.mp4', subfolder: job.id, type: 'output', nodeId: '2' }
+    ] });
+    await service.tick();
+    const resultBeforeShutdown = service.get(job.id).result;
+    expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1 });
+    expect(store.instance('1')!.job_id).toBeNull();
+    expect(() => service.control('1', 'close')).toThrow(expect.objectContaining({ statusCode: 409 }));
+    statuses.set('1', '22');
+    for (const elapsed of [1_800_001, 3_600_001, 5_400_001]) {
+      vi.mocked(Date.now).mockReturnValue(startedAt + elapsed);
+      await service.tick();
+      expect(platform.openInstance).not.toHaveBeenCalled();
+      expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1, result_wake_requested: 0, result: resultBeforeShutdown });
+      expect(store.instance('1')).toMatchObject({ state: 'ready', job_id: null });
+    }
+    expect(service.requestResultAvailability(job.id)).toMatchObject({ stage: 'succeeded', result_wake_requested: 1 });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'running', stage: 'preparing_result' });
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
+    await service.tick();
+    expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1, result_wake_requested: 0, result: resultBeforeShutdown });
+    expect(store.instance('1')).toMatchObject({ state: 'ready', job_id: null });
+    expect(client.submit).toHaveBeenCalledTimes(1);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM comfy_jobs').get()).toEqual({ count: 1 });
+    service.acknowledgeCollected(job.id);
+    expect(service.get(job.id).result_pending).toBe(0);
+    for (const operation of [platform.closeInstance, assets.read, client.upload, client.download, results.save]) expect(operation).not.toHaveBeenCalled();
+  });
+
+  it.each(['already-ready', 'newly-opened'])(
+    'applies idle shutdown once before allocating or generating on an %s instance', async lifecycle => {
+      const { service, submit, platform, statuses, store, idlePolicySetter, client } = fixture({}, undefined, true);
+      if (lifecycle === 'already-ready') {
+        statuses.set('1', '2');
+        store.updateInstance('1', { state: 'ready' });
+      }
+      const job = submit();
+      await service.tick();
+      if (lifecycle === 'newly-opened') {
+        expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
+        expect(idlePolicySetter).not.toHaveBeenCalled();
+        expect(service.get(job.id).stage).toBe('queued');
+        await service.tick();
+      }
+      expect(idlePolicySetter).toHaveBeenCalledExactlyOnceWith('1');
+      expect(store.instance('1')).toMatchObject({ state: 'busy', idle_policy_applied_at: startedAt });
+      expect(service.get(job.id).stage).toBe('awaiting_upload');
+      await service.tick();
+      await service.tick();
+      expect(idlePolicySetter).toHaveBeenCalledTimes(1);
+      service.completeInputs(job.id, { image: { name: 'frame.png', subfolder: job.id, type: 'input' } });
+      await service.tick();
+      await service.tick();
+      expect(client.submit).toHaveBeenCalledTimes(1);
+      expect(idlePolicySetter.mock.invocationCallOrder[0]!).toBeLessThan(client.submit.mock.invocationCallOrder[0]!);
+      expect(idlePolicySetter).toHaveBeenCalledTimes(1);
+      expect(platform.closeInstance).not.toHaveBeenCalled();
+    }
+  );
+
+  it('sets the policy on an explicitly opened instance without inventing a generation job', async () => {
+    const { service, store, platform, idlePolicySetter, client, db } = fixture({}, undefined, true);
+    service.control('1', 'open');
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
+    expect(idlePolicySetter).not.toHaveBeenCalled();
+    await service.tick();
+    await service.tick();
+    expect(idlePolicySetter).toHaveBeenCalledExactlyOnceWith('1');
+    expect(store.instance('1')).toMatchObject({ state: 'ready', idle_policy_applied_at: startedAt, job_id: null });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM comfy_jobs').get()).toEqual({ count: 0 });
+    expect(client.submit).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('reapplies the policy after external shutdown and reopening, but not during continued polling', async () => {
+    const { service, submit, statuses, store, platform, idlePolicySetter } = fixture({}, undefined, true);
+    statuses.set('1', '2');
+    const first = submit('before-idle-shutdown');
+    await service.tick();
+    expect(idlePolicySetter).toHaveBeenCalledTimes(1);
+    service.cancel(first.id);
+    await service.tick();
+    expect(store.instance('1')!.job_id).toBeNull();
+    statuses.set('1', '22');
+    vi.mocked(Date.now).mockReturnValue(startedAt + 1_800_001);
+    await service.tick();
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    const second = submit('after-idle-shutdown');
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
+    expect(store.instance('1')).toMatchObject({ state: 'starting', idle_policy_applied_at: null });
+    expect(idlePolicySetter).toHaveBeenCalledTimes(1);
+    await service.tick();
+    expect(idlePolicySetter).toHaveBeenCalledTimes(2);
+    expect(store.instance('1')!.idle_policy_applied_at).toBe(startedAt + 1_800_001);
+    expect(service.get(second.id).stage).toBe('awaiting_upload');
+    await service.tick();
+    await service.tick();
+    expect(idlePolicySetter).toHaveBeenCalledTimes(2);
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it('persists successful policy application across service and SQLite connection restarts', async () => {
+    const first = fixture({}, undefined, true);
+    first.statuses.set('1', '2');
+    const job = first.submit('before-restart');
+    await first.service.tick();
+    expect(first.idlePolicySetter).toHaveBeenCalledTimes(1);
+    first.service.cancel(job.id);
+    await first.service.tick();
+    await first.service.close();
+    first.db.close();
+    const restarted = fixture({}, first.filename, true);
+    restarted.statuses.set('1', '2');
+    const next = restarted.submit('after-restart');
+    await restarted.service.tick();
+    expect(restarted.service.get(next.id).stage).toBe('awaiting_upload');
+    expect(restarted.store.instance('1')!.idle_policy_applied_at).toBe(startedAt);
+    expect(restarted.idlePolicySetter).not.toHaveBeenCalled();
+    expect(restarted.platform.openInstance).not.toHaveBeenCalled();
+    expect(restarted.platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it.each(['already-ready', 'newly-opened'])(
+    'blocks allocation and generation when the idle setter fails on an %s instance without closing it', async lifecycle => {
+      const { service, submit, platform, statuses, store, idlePolicySetter, client, assets, results } = fixture({}, undefined, true);
+      if (lifecycle === 'already-ready') {
+        statuses.set('1', '2');
+        store.updateInstance('1', { state: 'ready' });
+      }
+      idlePolicySetter.mockRejectedValue({ code: 'BUSINESS_REJECTED' });
+      const job = submit();
+      await service.tick();
+      await service.tick();
+      await service.tick();
+      expect(idlePolicySetter).toHaveBeenCalled();
+      expect(store.instance('1')).toMatchObject({ job_id: null, idle_policy_applied_at: null, error_code: 'COMFY_BUSINESS_REJECTED' });
+      expect(service.get(job.id)).toMatchObject({ stage: 'queued', instance_id: null });
+      for (const operation of [client.submit, client.upload, client.download, assets.read, results.save, platform.closeInstance]) expect(operation).not.toHaveBeenCalled();
+      expect(platform.openInstance).toHaveBeenCalledTimes(lifecycle === 'already-ready' ? 0 : 1);
+      idlePolicySetter.mockResolvedValue(undefined);
+      await service.tick();
+      expect(service.get(job.id).stage).toBe('awaiting_upload');
+      expect(store.instance('1')).toMatchObject({ idle_policy_applied_at: startedAt, error_code: null });
+      service.completeInputs(job.id, { image: { name: 'frame.png', subfolder: job.id, type: 'input' } });
+      await service.tick();
+      expect(client.submit).toHaveBeenCalledTimes(1);
+      expect(platform.closeInstance).not.toHaveBeenCalled();
+    }
+  );
+
+  it('keeps the idle setter optional for legacy mock platforms', async () => {
+    const { service, submit, statuses, platform, idlePolicySetter } = fixture();
+    expect(platform.setGpuIdleShutdown).toBeUndefined();
+    statuses.set('1', '2');
+    const job = submit();
+    await service.tick();
+    expect(service.get(job.id).stage).toBe('awaiting_upload');
+    expect(idlePolicySetter).not.toHaveBeenCalled();
+  });
+
+  it('never implements programmatic idle-close after the external idle-shutdown interval', async () => {
+    const { service, store, platform } = fixture();
+    store.updateInstance('1', { state: 'ready' });
+    vi.mocked(Date.now).mockReturnValue(startedAt + 1_800_001);
+    await service.tick();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+    expect(store.instance('1')!.state).not.toBe('closing');
+  });
+});

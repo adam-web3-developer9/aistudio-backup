@@ -1,0 +1,62 @@
+{
+  "autoOpen": true,
+  "pollIntervalMs": 5000,
+  "bootTimeoutMs": 600000,
+  "jobTimeoutMs": 7200000,
+  "capacityPollIntervalMs": 30000,
+  "capacityWaitTimeoutMs": 21600000,
+  "capacityErrorCodes": [],
+  "instances": [
+    {
+      "id": "REPLACE_WITH_FIRST_NUMERIC_INSTANCE_ID",
+      "areaName": "华东一区",
+      "gpuModel": "5090",
+      "baseUrl": "https://REPLACE_WITH_FIRST_VERIFIED_COMFY_HOST",
+      "headersEnv": {},
+      "workflowIds": ["minimax-h3-9plus3"]
+    },
+    {
+      "id": "REPLACE_WITH_SECOND_NUMERIC_INSTANCE_ID",
+      "areaName": "华东二区",
+      "gpuModel": "5090",
+      "baseUrl": "https://REPLACE_WITH_SECOND_VERIFIED_COMFY_HOST",
+      "headersEnv": {},
+      "workflowIds": ["minimax-h3-9plus3"]
+    },
+    {
+      "id": "REPLACE_WITH_THIRD_NUMERIC_INSTANCE_ID",
+      "areaName": "华东一区",
+      "gpuModel": "4090",
+      "baseUrl": "https://REPLACE_WITH_THIRD_VERIFIED_COMFY_HOST",
+      "headersEnv": {},
+      "workflowIds": ["minimax-h3-9plus3"]
+    }
+  ],
+  "workflows": [
+    {
+      "id": "minimax-h3-9plus3",
+      "version": "official-1.1",
+      "file": "./minimax-h3-9plus3.api.json",
+      "bindings": {
+        "prompt": { "nodeId": "4", "input": "text", "required": true },
+        "width": { "nodeId": "1", "input": "value", "required": true },
+        "height": { "nodeId": "2", "input": "value", "required": true },
+        "duration": { "nodeId": "3", "input": "value", "required": true },
+        "outputPrefix": { "nodeId": "39", "input": "filename_prefix", "kind": "output-prefix" },
+        "image1": { "nodeId": "6", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image2": { "nodeId": "7", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image3": { "nodeId": "8", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image4": { "nodeId": "9", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image5": { "nodeId": "10", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image6": { "nodeId": "11", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image7": { "nodeId": "12", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image8": { "nodeId": "13", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "image9": { "nodeId": "14", "input": "image", "kind": "media", "omitWhenMissing": true },
+        "audio1": { "nodeId": "15", "input": "audio", "kind": "media", "omitWhenMissing": true },
+        "audio2": { "nodeId": "16", "input": "audio", "kind": "media", "omitWhenMissing": true },
+        "audio3": { "nodeId": "17", "input": "audio", "kind": "media", "omitWhenMissing": true }
+      },
+      "outputNodeIds": ["39"]
+    }
+  ]
+}

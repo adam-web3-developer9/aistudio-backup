@@ -1,0 +1,62 @@
+{
+  "autoOpen": false,
+  "pollIntervalMs": 5000,
+  "bootTimeoutMs": 600000,
+  "jobTimeoutMs": 7200000,
+  "capacityPollIntervalMs": 30000,
+  "capacityWaitTimeoutMs": 21600000,
+  "capacityErrorCodes": [],
+  "instances": [
+    {
+      "id": "REPLACE_WITH_NUMERIC_INSTANCE_ID",
+      "areaName": "华东一区",
+      "gpuModel": "5090",
+      "baseUrl": "https://REPLACE_WITH_VERIFIED_COMFY_HOST/api",
+      "headersEnv": {},
+      "workflowIds": ["official-9-plus-3"]
+    },
+    {
+      "id": "REPLACE_WITH_SECOND_NUMERIC_INSTANCE_ID",
+      "areaName": "华东二区",
+      "gpuModel": "5090",
+      "baseUrl": "https://REPLACE_WITH_SECOND_VERIFIED_COMFY_HOST/api",
+      "headersEnv": {},
+      "workflowIds": ["official-9-plus-3"]
+    },
+    {
+      "id": "REPLACE_WITH_THIRD_NUMERIC_INSTANCE_ID",
+      "areaName": "华东一区",
+      "gpuModel": "4090",
+      "baseUrl": "https://REPLACE_WITH_THIRD_VERIFIED_COMFY_HOST/api",
+      "headersEnv": {},
+      "workflowIds": ["official-9-plus-3"]
+    }
+  ],
+  "workflows": [
+    {
+      "id": "official-9-plus-3",
+      "version": "REPLACE_WITH_TESTED_VERSION_OR_HASH",
+      "file": "./official-9-plus-3.api.json",
+      "bindings": {
+        "prompt": {
+          "nodeId": "REPLACE_WITH_PROMPT_NODE_ID",
+          "input": "text",
+          "required": true,
+          "kind": "value"
+        },
+        "image1": {
+          "nodeId": "REPLACE_WITH_IMAGE_NODE_ID",
+          "input": "image",
+          "required": true,
+          "kind": "media"
+        },
+        "outputPrefix": {
+          "nodeId": "REPLACE_WITH_VIDEO_OUTPUT_NODE_ID",
+          "input": "filename_prefix",
+          "kind": "output-prefix"
+        }
+      },
+      "outputNodeIds": ["REPLACE_WITH_VIDEO_OUTPUT_NODE_ID"]
+    }
+  ]
+}

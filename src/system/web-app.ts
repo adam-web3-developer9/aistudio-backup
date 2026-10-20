@@ -1,4 +1,7 @@
 import path from 'node:path';
+import type { ComfyRuntimeOptions } from '../comfyui/runtime.js';
+import type { ComfyService } from '../comfyui/service.js';
+import { registerComfyAdminRoutes } from '../comfyui/routes.js';
 import { readFile, realpath } from 'node:fs/promises';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { createSystemRuntime, registerSystemRoutes, systemLoggerOptions, type SystemRuntimeOptions } from './index.js';
@@ -14,16 +17,17 @@ import { assertVideoGatewayConfiguration, assertVideoGatewayProxyConfiguration }
 import { config } from '../config.js';
 import { registerPackageShareRoutes } from '../package-shares/routes.js';
 
-export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; videoGatewayEnabled?: boolean; packageSharesEnabled?: boolean; managedAccountCreditReader?:ManagedAccountCreditReader; trustProxy?: boolean | string[]; mediaPolicy?: Partial<MediaPolicy>; beforeReady?: (app: FastifyInstance) => void | Promise<void> }
+export interface SystemWebOptions extends SystemRuntimeOptions { mediaDirectory: string; adminDirectory?: string; credentialKey?: string; channelsEnabled?: boolean; videoGatewayEnabled?: boolean; comfyui?: ComfyRuntimeOptions; packageSharesEnabled?: boolean; managedAccountCreditReader?:ManagedAccountCreditReader; trustProxy?: boolean | string[]; mediaPolicy?: Partial<MediaPolicy>; beforeReady?: (app: FastifyInstance) => void | Promise<void> }
 /** One Fastify service: identity, administration, drafts/media/jobs; legacy video becomes an optional channel. */
 export async function buildSystemWebApp(options:SystemWebOptions) {
   if(options.videoGatewayEnabled&&!options.channelsEnabled)throw new Error('Video gateway requires SYSTEM_CHANNELS_ENABLED=true');
+  if(options.comfyui&&!options.videoGatewayEnabled)throw new Error('ComfyUI requires SYSTEM_VIDEO_GATEWAY_ENABLED=true');
   assertVideoGatewayConfiguration(options.videoGatewayEnabled===true,config.apiKey);
   assertVideoGatewayProxyConfiguration(options.videoGatewayEnabled===true,config.mioraProxyUrl);
   const runtime=await createSystemRuntime(options);let app:FastifyInstance | undefined;
   try {
     const channels=new ChannelStore(runtime.db,options.credentialKey);
-    if(options.channelsEnabled){if(!options.credentialKey)throw new Error('Channel worker requires CHANNEL_CREDENTIAL_KEY');const {buildApp}=await import('../app.js');app=await buildApp({managedChannels:channels,managedGateway:options.videoGatewayEnabled,managedAccountCreditReader:options.managedAccountCreditReader,managedAccountArchived:(id,reason)=>runtime.store.audit({actorId:null,action:'channel.account.autoArchive',targetType:'channelAccount',targetId:id,metadata:{reason}}),trustProxy:options.trustProxy,warmup:false});}
+    if(options.channelsEnabled){if(!options.credentialKey)throw new Error('Channel worker requires CHANNEL_CREDENTIAL_KEY');const {buildApp}=await import('../app.js');app=await buildApp({managedChannels:channels,managedGateway:options.videoGatewayEnabled,comfyui:options.comfyui,managedAccountCreditReader:options.managedAccountCreditReader,managedAccountArchived:(id,reason)=>runtime.store.audit({actorId:null,action:'channel.account.autoArchive',targetType:'channelAccount',targetId:id,metadata:{reason}}),trustProxy:options.trustProxy,warmup:false});}
     else app=Fastify({logger:systemLoggerOptions,bodyLimit:2*1024*1024,trustProxy:options.trustProxy??false});
     app.setErrorHandler<Error & {statusCode?:number}>((error,_request,reply)=>{if(error instanceof SystemError)return reply.code(error.statusCode).send({code:error.code,message:error.message});return reply.code(error.statusCode&&error.statusCode<500?error.statusCode:500).send({code:'REQUEST_FAILED',message:'Request failed'});});
     app.addHook('onRequest',async(request,reply)=>{
@@ -40,6 +44,8 @@ export async function buildSystemWebApp(options:SystemWebOptions) {
     const projects=registerProjectRoutes(app,{runtime});const blobs=new LocalPrivateBlobStore(options.mediaDirectory);registerSystemMediaRoutes(app,{runtime,projects,blobs,mediaPolicy});
     const jobs=registerSystemJobRoutes(app,{runtime,projects,onServerJob:(id,principal)=>bridge.submit(id,principal)});
     const legacy=options.channelsEnabled?(app as unknown as {channelRuntime:LegacyChannelRuntime&{accountOperations?:ManagedAccountOperations}}).channelRuntime:undefined;
+    const comfy=(legacy as (typeof legacy & {comfy?:ComfyService}))?.comfy;
+    if(comfy)registerComfyAdminRoutes(app,runtime,comfy);
     const bridge=new ChannelJobBridge({runtime,channels,jobs,legacy,blobs,mediaPolicy});
     app.post('/api/system/projects/:projectId/jobs/:jobId/reconcile',async(request,reply)=>{const params=request.params as {projectId:string;jobId:string};const principal=await runtime.authenticate(request);jobs.access(params.projectId,params.jobId,principal,true);return bridge.reconcile(params.jobId,principal);});
     app.addHook('onClose',async()=>bridge.close());
