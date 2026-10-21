@@ -313,7 +313,7 @@
         0
       ],
       "scheduler": "simple",
-      "steps": 20,
+      "steps": 24,
       "denoise": 1
     },
     "_meta": {

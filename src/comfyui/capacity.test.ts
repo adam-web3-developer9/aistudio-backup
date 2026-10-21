@@ -75,6 +75,53 @@ afterEach(async () => {
 });
 
 describe('capacity scheduling with SQLite and mock clients', () => {
+  it.each([
+    [['华东一区'], '华东一区 / 5090'],
+    [['华东一区', '华东二区'], '华东一区 / 5090、华东二区 / 5090'],
+    [['华东一区', '华东一区'], '华东一区 / 5090']
+  ] as const)('describes all waiting regions without implying a single assigned instance: %j', (areas, targets) => {
+    const instances: Configuration['instances'] = areas.map((areaName, index) => ({
+      id: String(index + 1), baseUrl: `https://native-${index + 1}.invalid`, areaName, gpuModel: '5090', workflowIds: ['capacity']
+    }));
+    const { service, store, submit, platform, clients } = fixture({ instances });
+    const job = submit();
+    for (const instance of instances) store.updateInstance(instance.id, { state: 'waiting_capacity',
+      capacity_started_at: startedAt, next_action_at: startedAt + 30_000 });
+    const projected = service.publicJob(service.get(job.id));
+    expect(projected).toMatchObject({ stage: 'waiting_capacity', status: 'queued', progress: {
+      message: `已登记实例开机暂缺可分配GPU，正在轮询候卡（${targets}）；尚未开始生成`,
+      nextRetryAt: new Date(startedAt + 30_000).toISOString(), waitingSince: new Date(startedAt).toISOString()
+    } });
+    expect(projected.progress).not.toHaveProperty('instance');
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    for (const client of Object.values(clients)) expect(client.submit).not.toHaveBeenCalled();
+  });
+
+  it('shows the starting region instead of stale capacity text from another region', () => {
+    const instances: Configuration['instances'] = [
+      { id: '1', baseUrl: 'https://native-1.invalid', areaName: '华东一区', gpuModel: '5090', workflowIds: ['capacity'] },
+      { id: '2', baseUrl: 'https://native-2.invalid', areaName: '华东二区', gpuModel: '5090', workflowIds: ['capacity'] }
+    ];
+    const { service, store, submit } = fixture({ instances });
+    const job = submit();
+    store.updateInstance('1', { state: 'waiting_capacity', capacity_started_at: startedAt, next_action_at: startedAt + 30_000 });
+    store.updateInstance('2', { state: 'starting' });
+    expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'booting', progress: {
+      message: '正在启动GPU实例并等待ComfyUI就绪', instance: { id: '2', areaName: '华东二区', gpuModel: '5090' }
+    } });
+  });
+
+  it('does not describe a cancelled job as waiting for GPU capacity', () => {
+    const { service, store, submit } = fixture();
+    const job = submit();
+    store.updateInstance('1', { state: 'waiting_capacity', capacity_started_at: startedAt, next_action_at: startedAt + 30_000 });
+    store.updateJob(job.id, { cancel_requested: 1 });
+    const projected = service.publicJob(service.get(job.id));
+    expect(projected.stage).toBe('cancelled');
+    expect(projected.progress.message).not.toContain('轮询候卡');
+    expect(projected.progress.message).toContain('取消');
+  });
+
   it('persists capacity backoff across restart without reserving a job slot or opening early', async () => {
     const first = fixture();
     first.platform.openInstance.mockRejectedValue({ code: 'CAPACITY_UNAVAILABLE' });

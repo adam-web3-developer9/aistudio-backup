@@ -131,7 +131,11 @@ export class ComfyService {
     const wakingResult = !!job.result_wake_requested && job.stage === 'succeeded';
     const stage = job.cancel_requested ? 'cancelled' : wakingResult ? 'preparing_result' : recovering ? 'waiting_instance' : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
     const events = this.store.events.recent(job.id, 12);
+    const waitingTargets = [...new Set(waiting.map(instance => this.options.configuration.instances.find(candidate => candidate.id === instance.id))
+      .map(instance => [instance?.areaName, instance?.gpuModel].filter(Boolean).join(' / ')).filter(Boolean))];
     const message = uploadRecovery && starting ? '原GPU实例已离线，正在唤醒原实例；保留原任务和已上传素材' :
+      capacityWaiting && !job.cancel_requested ? uploadRecovery && assigned ? '原GPU实例开机暂缺可分配GPU，正在轮询恢复；保留原任务和已上传素材' :
+        `已登记实例开机暂缺可分配GPU，正在轮询候卡${waitingTargets.length ? `（${waitingTargets.join('、')}）` : ''}；尚未开始生成` :
       recovering ? recovering.error_code === 'COMFY_EXTERNAL_OCCUPANCY' ? '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交' : `GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（${recovering.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` : stageMessages[stage]!;
     return {
       id: job.id, adapterId: 'comfyui-v1', status: wakingResult && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
@@ -140,7 +144,7 @@ export class ComfyService {
       ...(job.finished_at ? { finishedAt: new Date(job.finished_at).toISOString() } : {}),
       progress: { message, phase: stage, ...(job.provider_confirmed ? { providerJobId: job.prompt_id } : {}),
         elapsedMs: Math.max(0, (job.finished_at ?? Date.now()) - job.created_at), deadlineAt: new Date(job.deadline).toISOString(),
-        ...(configuration ? { instance: { id: configuration.id, areaName: configuration.areaName, gpuModel: configuration.gpuModel } } : {}),
+        ...(configuration && (!capacityWaiting || job.instance_id) ? { instance: { id: configuration.id, areaName: configuration.areaName, gpuModel: configuration.gpuModel } } : {}),
         ...(capacityWaiting ? { nextRetryAt: new Date(Math.min(...waiting.map(instance => instance.next_action_at ?? Date.now()))).toISOString(),
           waitingSince: new Date(Math.min(...waiting.map(instance => instance.capacity_started_at ?? job.created_at))).toISOString() } : {}),
         ...(recovering ? { nextRetryAt: new Date(recovering.next_action_at ?? Date.now()).toISOString() } : {}),

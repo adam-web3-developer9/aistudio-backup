@@ -562,7 +562,8 @@ describe('direct upload reservation recovery after external GPU shutdown', () =>
     expect(first.store.instance('1')).toMatchObject({ state: 'waiting_capacity', job_id: first.job.id,
       next_action_at: first.startedAt + 10_000, action_started_at: null, action_sent: 0 });
     expect(first.service.publicJob(first.service.get(first.job.id))).toMatchObject({ stage: 'waiting_capacity',
-      progress: { nextRetryAt: new Date(first.startedAt + 10_000).toISOString() } });
+      progress: { message: '原GPU实例开机暂缺可分配GPU，正在轮询恢复；保留原任务和已上传素材',
+        instance: { id: '1' }, nextRetryAt: new Date(first.startedAt + 10_000).toISOString() } });
     expect(first.service.publicJob(first.service.get(first.job.id))).not.toHaveProperty('upload');
     await first.service.close();
     first.db.close();
