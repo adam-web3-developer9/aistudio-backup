@@ -9,12 +9,16 @@ import type { ComfyResultStore } from './result-store.js';
 import { ComfyStore, publicStatus, type ComfyInput, type ComfyJob, type FrozenComfyInput } from './store.js';
 import { compileWorkflow } from './workflow.js';
 import type { ComfyEventDetails } from './events.js';
+import { schedulerPolicy } from './scheduler.js';
+import { ComfyLifecycle } from './lifecycle.js';
+import { comfyPoolMetrics } from './metrics.js';
 
 type InstanceConfiguration = ComfyPoolConfiguration['instances'][number];
 type DataClient = Pick<ComfyClient, 'health' | 'queue' | 'upload' | 'submit' | 'history' | 'findAttempt' | 'download'>;
 export interface ComfyServiceOptions {
   store: ComfyStore; configuration: ComfyPoolConfiguration;
-  platform: Pick<AigateClient, 'getInstanceStatus' | 'openInstance' | 'closeInstance'> & Partial<Pick<AigateClient, 'getInstance' | 'setGpuIdleShutdown'>>;
+  platform: Pick<AigateClient, 'getInstanceStatus' | 'openInstance' | 'closeInstance'> & Partial<Pick<AigateClient,
+    'getInstance' | 'setGpuIdleShutdown' | 'clearGpuIdleShutdown' | 'skuList' | 'createInstance' | 'releaseInstance' | 'pageInstances'>>;
   client: (instance: InstanceConfiguration) => DataClient;
   assets: { get(id: string): AssetRecord | undefined; read(id: string): Promise<Buffer | undefined> };
   results: Pick<ComfyResultStore, 'save' | 'read'>;
@@ -45,15 +49,21 @@ function diagnosticDetails(error: unknown): ComfyEventDetails {
 
 export class ComfyService {
   readonly store: ComfyStore;
+  readonly lifecycle: ComfyLifecycle;
   private readonly worker = randomUUID();
   private readonly closing = new AbortController();
   private readonly collecting = new Map<string, Promise<void>>();
+  private readonly processing = new Map<string, Promise<void>>();
+  private opening: Promise<void> = Promise.resolve();
+  private readonly clearedPolicies = new Set<string>();
   private timer?: ReturnType<typeof setInterval>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private active?: Promise<void>;
 
   constructor(readonly options: ComfyServiceOptions) {
     this.store = options.store;
+    this.lifecycle = new ComfyLifecycle({ store: this.store, configuration: options.configuration, platform: options.platform,
+      client: options.client, assertWorker: () => this.assertWorker() });
     this.store.registerInstances(options.configuration.instances.map(instance => instance.id));
     const registered = new Set(options.configuration.instances.map(instance => instance.id));
     if (this.store.instances().some(instance => !registered.has(instance.id) && (instance.job_id || this.store.pendingResults(instance.id).length))) {
@@ -73,11 +83,42 @@ export class ComfyService {
     if (this.timer) clearInterval(this.timer);
     if (this.heartbeat) clearInterval(this.heartbeat);
     await Promise.allSettled(this.active ? [this.active] : []);
+    await Promise.allSettled(this.processing.values());
+    await this.lifecycle.close();
     await Promise.allSettled(this.collecting.values());
     this.store.releaseWorker(this.worker);
   }
   private assertWorker(): void {
     if (this.closing.signal.aborted || !this.store.ownsWorker(this.worker)) throw new Error('ComfyUI worker lease is unavailable');
+  }
+  metrics() { return comfyPoolMetrics(this.store, this.options.configuration); }
+  async inspectResource(key: string): Promise<void> {
+    const resource = this.store.resource(key);
+    if (!resource) throw new SystemError(404, 'COMFY_RESOURCE_UNKNOWN', 'Resource is not owned by this pool');
+    if (!resource.instance_id) throw new SystemError(409, 'COMFY_CREATION_UNCONFIRMED', 'Creation returned no confirmed instance ID');
+    if (!this.options.platform.getInstance) throw new SystemError(503, 'COMFY_RESOURCE_INSPECTION_UNAVAILABLE', 'Instance inspection is unavailable');
+    if (!this.store.acquireWorker(this.worker, Date.now())) throw new SystemError(409, 'COMFY_WORKER_BUSY', 'Another worker owns this pool');
+    await this.lifecycle.inspect(key);
+  }
+  async stopUnregisteredResource(key: string): Promise<void> {
+    if (this.lifecycle.isBusy()) throw new SystemError(409, 'COMFY_WORKER_BUSY', 'Resource maintenance is in progress');
+    const resource = this.store.resource(key);
+    if (!resource) throw new SystemError(404, 'COMFY_RESOURCE_UNKNOWN', 'Resource is not owned by this pool');
+    if (!resource.instance_id || resource.configuration || !this.options.platform.getInstance
+      || !['creating', 'blocked'].includes(resource.state) || this.store.hasUnresolvedWork(resource.instance_id)
+      || this.options.configuration.instances.some(instance => instance.id === resource.instance_id)) {
+      throw new SystemError(409, 'COMFY_RESOURCE_STOP_UNSAFE', 'Only confirmed unregistered resources without work may be stopped');
+    }
+    if (resource.error_code === 'COMFY_RESOURCE_STOP_REQUESTED') throw new SystemError(409, 'COMFY_RESOURCE_STOP_UNCONFIRMED', 'The previous stop request is still unconfirmed');
+    if (!this.store.acquireWorker(this.worker, Date.now())) throw new SystemError(409, 'COMFY_WORKER_BUSY', 'Another worker owns this pool');
+    await this.lifecycle.stopUnregistered(key);
+  }
+  private async configureIdlePolicy(id: string): Promise<void> {
+    if (!this.options.configuration.scheduler || this.clearedPolicies.has(id)) return;
+    if (!this.options.platform.clearGpuIdleShutdown) throw new SystemError(503, 'COMFY_IDLE_POLICY_UNAVAILABLE', 'Cannot safely disable the platform idle shutdown policy');
+    await this.options.platform.clearGpuIdleShutdown(id);
+    this.assertWorker();
+    this.clearedPolicies.add(id);
   }
   submit(input: ComfyInput): { job: ComfyJob; created: boolean } {
     const prior = this.store.byRequest(this.options.owner, input.requestKey);
@@ -232,31 +273,61 @@ export class ComfyService {
   }
   tick(): Promise<void> {
     if (this.closing.signal.aborted) return Promise.resolve();
-    if (this.active) return this.active;
     if (!this.store.acquireWorker(this.worker, Date.now())) return Promise.resolve();
-    this.active = this.runTick().catch(() => {}).finally(() => { this.active = undefined; });
-    return this.active;
+    const operation = this.runTick().catch(() => {});
+    this.active = operation;
+    void operation.finally(() => { if (this.active === operation) this.active = undefined; });
+    return operation;
   }
   private async runTick(): Promise<void> {
     for (const job of this.store.queued()) {
       if (job.owner !== this.options.owner) this.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_OWNER_UNAVAILABLE' });
       else if (job.deadline <= Date.now()) this.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_QUEUE_TIMEOUT' });
     }
+    const maintenance = this.options.configuration.scheduler ? this.lifecycle.tick() : Promise.resolve();
     const instances = [...this.options.configuration.instances].sort((left, right) => (left.gpuModel === '4090' ? 1 : 0) - (right.gpuModel === '4090' ? 1 : 0));
+    const operations: Promise<void>[] = [];
     for (const instance of instances) {
-      try { await this.processInstance(instance); }
-      catch (error) {
+      if (this.processing.has(instance.id)) continue;
+      const operation = this.processInstance(instance).catch(error => {
         if (this.store.ownsWorker(this.worker) && !this.closing.signal.aborted) {
           this.store.updateInstance(instance.id, { error_code: codeOf(error), next_action_at: Date.now() + (this.options.configuration.capacityPollIntervalMs ?? 30_000) }, diagnosticDetails(error));
           this.checkActionTimeout(instance.id);
         }
-      }
+      }).finally(() => { this.processing.delete(instance.id); });
+      this.processing.set(instance.id, operation);
+      operations.push(operation);
     }
+    await Promise.all([...operations, maintenance]);
   }
   private async processInstance(configuration: InstanceConfiguration): Promise<void> {
     this.assertWorker();
     let instance = this.store.instance(configuration.id)!;
     const client = this.options.client(configuration);
+    if (instance.job_id) {
+      const job = this.store.get(instance.job_id)!;
+      const policy = schedulerPolicy(this.options.configuration);
+      if (['awaiting_upload', 'preparing'].includes(job.stage) && !job.provider_confirmed && job.cancel_requested) {
+        this.store.updateJob(job.id, { stage: 'cancelled', error_code: 'COMFY_CANCELLED' });
+        this.store.releaseSlot(job.id);
+        instance = this.store.instance(configuration.id)!;
+      } else if (job.stage === 'preparing' && job.deadline <= Date.now()) {
+        this.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_PREPARATION_TIMEOUT' });
+        this.store.releaseSlot(job.id);
+        instance = this.store.instance(configuration.id)!;
+      } else if (job.stage === 'awaiting_upload' && !job.cancel_requested && !job.direct_inputs && (job.deadline <= Date.now() || this.options.configuration.scheduler &&
+        Date.now() - (job.reservation_started_at ?? job.updated_at) >= policy.uploadReservationTimeoutMs)) {
+        if (job.deadline > Date.now() && job.upload_reservations < policy.maxUploadReservations && this.store.requeueUpload(job.id, policy.uploadRetryDelayMs)) {
+          instance = this.store.instance(configuration.id)!;
+        } else {
+          this.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_UPLOAD_TIMEOUT' });
+          this.store.releaseSlot(job.id);
+          instance = this.store.instance(configuration.id)!;
+        }
+      } else if (['submitting', 'running'].includes(job.stage) && job.deadline <= Date.now()) {
+        this.store.updateJob(job.id, { stage: job.cancel_requested ? 'cancelled' : 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
+      }
+    }
     if (instance.state === 'quarantined') {
       this.store.updateInstance(instance.id, { state: 'offline', action_started_at: null, action_sent: 0, capacity_started_at: null,
         next_action_at: Date.now() + (this.options.configuration.capacityPollIntervalMs ?? 30_000) });
@@ -298,6 +369,12 @@ export class ComfyService {
         if ((JSON.parse(job.input) as FrozenComfyInput).transport !== 'direct' || await this.ensureUploadReady(configuration, client)) await this.prepare(job, client);
       }
       else {
+        if (this.options.configuration.scheduler) {
+          const status = await this.options.platform.getInstanceStatus(instance.id);
+          this.assertWorker();
+          if (status !== '2') { await this.ensureUploadReady(configuration, client); return; }
+          await this.configureIdlePolicy(instance.id);
+        }
         await this.observe(job, client);
         if (this.store.instance(instance.id)?.job_id && job.deadline <= Date.now() && !['collecting', 'succeeded', 'cancelled'].includes(this.store.get(job.id)!.stage)) {
           this.store.updateJob(job.id, { stage: job.cancel_requested ? 'cancelled' : 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
@@ -316,7 +393,8 @@ export class ComfyService {
     }
     const compatible = (job: ComfyJob) => {
       const frozen = JSON.parse(job.input) as FrozenComfyInput;
-      return configuration.workflowIds.includes(frozen.workflowId) && (frozen.transport !== 'direct' || !Object.keys(configuration.headers ?? {}).length);
+      return (!job.instance_id || job.instance_id === configuration.id) && (job.eligible_at ?? 0) <= Date.now()
+        && configuration.workflowIds.includes(frozen.workflowId) && (frozen.transport !== 'direct' || !Object.keys(configuration.headers ?? {}).length);
     };
     const queued = this.store.queued().some(compatible);
     if (instance.state === 'waiting_capacity' && !queued && !resultRequests.length) return;
@@ -325,7 +403,7 @@ export class ComfyService {
       this.assertWorker();
       instance = this.store.instance(configuration.id)!;
       if (instance.state === 'closing') {
-        if (status === '22' || status === '26') { this.store.updateInstance(instance.id, { state: 'offline', action_started_at: null }); return; }
+        if (status === '22' || status === '26') { this.store.updateInstance(instance.id, { state: 'offline', action_started_at: null, action_sent: 0, stopped_at: instance.stopped_at ?? Date.now() }); return; }
         if (!instance.action_sent && status === '2') {
           const queue = await client.queue();
           this.assertWorker();
@@ -341,11 +419,20 @@ export class ComfyService {
         return;
       }
       if (status !== '2') {
+        this.clearedPolicies.delete(instance.id);
+        const prior = this.opening;
+        let release!: () => void;
+        this.opening = new Promise<void>(resolve => { release = resolve; });
+        await prior;
+        try {
+        this.assertWorker();
+        instance = this.store.instance(configuration.id)!;
         this.store.updateInstance(instance.id, { idle_policy_applied_at: null });
         const needed = this.store.queued().filter(compatible).length + resultRequests.length;
         const reserved = this.store.instances().filter(candidate => candidate.id !== instance.id && !candidate.draining && !candidate.job_id && candidate.state === 'starting'
           && this.options.configuration.instances.some(registered => registered.id === candidate.id && registered.workflowIds.some(id => configuration.workflowIds.includes(id)))).length;
-        if (instance.state !== 'starting' && (instance.state === 'waiting_capacity' || this.options.configuration.autoOpen && needed > reserved) && ['22', '26'].includes(status)) {
+        const activeCount = this.store.instances().filter(candidate => candidate.id !== instance.id && !candidate.draining && ['ready', 'busy', 'starting'].includes(candidate.state)).length;
+        if (instance.state !== 'starting' && activeCount < schedulerPolicy(this.options.configuration).maxConcurrentInstances && (instance.state === 'waiting_capacity' || this.options.configuration.autoOpen && needed > reserved) && ['22', '26'].includes(status)) {
           this.store.updateInstance(instance.id, { state: 'starting', action_started_at: Date.now(), action_sent: 0, error_code: null, next_action_at: null });
           instance = this.store.instance(instance.id)!;
         }
@@ -363,6 +450,7 @@ export class ComfyService {
           }
         }
         this.checkActionTimeout(instance.id);
+        } finally { release(); }
         return;
       }
       if (configuration.areaName && this.options.platform.getInstance) {
@@ -381,15 +469,17 @@ export class ComfyService {
         this.deferInstance(instance.id, 'COMFY_EXTERNAL_OCCUPANCY');
         return;
       }
-      if (!this.store.instance(instance.id)!.idle_policy_applied_at && this.options.platform.setGpuIdleShutdown) {
+      await this.configureIdlePolicy(instance.id);
+      if (!this.options.configuration.scheduler && !this.store.instance(instance.id)!.idle_policy_applied_at && this.options.platform.setGpuIdleShutdown) {
         await this.options.platform.setGpuIdleShutdown(instance.id);
         this.assertWorker();
         this.store.updateInstance(instance.id, { idle_policy_applied_at: Date.now() });
       }
-      this.store.updateInstance(instance.id, { state: 'ready', action_started_at: null, capacity_started_at: null, next_action_at: null, error_code: null });
+      this.store.updateInstance(instance.id, { state: 'ready', action_started_at: null, capacity_started_at: null, next_action_at: null, error_code: null, stopped_at: null });
       for (const job of resultRequests) this.store.updateJob(job.id, { result_wake_requested: 0, result_checked_at: Date.now() });
     }
     const workflowIds = configuration.workflowIds.filter(id => this.store.queued().some(job => compatible(job) && (JSON.parse(job.input) as FrozenComfyInput).workflowId === id));
+    if (this.store.instances().filter(candidate => candidate.job_id).length >= schedulerPolicy(this.options.configuration).maxConcurrentInstances) return;
     const next = this.store.claim(instance.id, workflowIds);
     if (next) {
       this.store.updateJob(next.id, { deadline: Date.now() + this.options.configuration.jobTimeoutMs });
@@ -412,6 +502,7 @@ export class ComfyService {
     this.assertWorker();
     instance = this.store.instance(configuration.id)!;
     if (status !== '2') {
+      this.clearedPolicies.delete(instance.id);
       if (instance.state !== 'starting') {
         this.store.updateInstance(instance.id, { state: 'starting', action_started_at: Date.now(), action_sent: 0,
           idle_policy_applied_at: null, error_code: 'COMFY_UPLOAD_INSTANCE_OFFLINE' });
@@ -432,7 +523,8 @@ export class ComfyService {
       this.checkActionTimeout(instance.id);
       return false;
     }
-    if (instance.state === 'busy' && instance.idle_policy_applied_at) return true;
+    await this.configureIdlePolicy(instance.id);
+    if (!this.options.configuration.scheduler && instance.state === 'busy' && instance.idle_policy_applied_at) return true;
     await client.health();
     const queue = await client.queue();
     this.assertWorker();
@@ -440,13 +532,13 @@ export class ComfyService {
       this.deferInstance(instance.id, 'COMFY_EXTERNAL_OCCUPANCY');
       return false;
     }
-    if (!instance.idle_policy_applied_at && this.options.platform.setGpuIdleShutdown) {
+    if (!this.options.configuration.scheduler && !instance.idle_policy_applied_at && this.options.platform.setGpuIdleShutdown) {
       await this.options.platform.setGpuIdleShutdown(instance.id);
       this.assertWorker();
       this.store.updateInstance(instance.id, { idle_policy_applied_at: Date.now() });
     }
     this.store.updateInstance(instance.id, { state: 'busy', action_started_at: null, action_sent: 0,
-      capacity_started_at: null, next_action_at: null, error_code: null });
+      capacity_started_at: null, next_action_at: null, error_code: null, stopped_at: null });
     return true;
   }
   private deferInstance(id: string, code: string): void {
@@ -539,7 +631,7 @@ export class ComfyService {
     } else if (current.stage === 'submitting') this.store.updateJob(job.id, { stage: 'running' });
   }
   private launchCollection(id: string, client: DataClient): void {
-    if (this.collecting.has(id) || this.collecting.size >= 3) return;
+    if (this.collecting.has(id) || this.collecting.size >= (this.options.configuration.scheduler?.maxConcurrentInstances ?? 3)) return;
     const operation = this.collect(id, client).finally(() => { this.collecting.delete(id); });
     this.collecting.set(id, operation);
   }

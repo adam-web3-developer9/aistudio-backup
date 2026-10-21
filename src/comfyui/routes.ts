@@ -37,12 +37,25 @@ export function registerComfyAdminRoutes(app: FastifyInstance, runtime: SystemRu
     const registered = new Set(service.options.configuration.instances.map(instance => instance.id));
     return {
       autoOpen: service.options.configuration.autoOpen,
+      scheduler: service.options.configuration.scheduler,
+      elastic: { enabled: service.options.configuration.elastic?.enabled ?? false,
+        maxInstances: service.options.configuration.elastic?.maxInstances,
+        maxHourlyCost: service.options.configuration.elastic?.maxHourlyCost,
+        lastError: service.lifecycle.lastError },
+      metrics: service.metrics(),
+      resources: service.store.resources().map(resource => {
+        const observation = service.store.resourceObservations().find(item => item.resource_key === resource.key);
+        return { key: resource.key, state: resource.state, instanceId: resource.instance_id,
+          templateId: resource.template_id, errorCode: resource.error_code, createdAt: resource.created_at, updatedAt: resource.updated_at,
+          platformStatus: observation?.status, observedAt: observation?.observed_at };
+      }),
       instances: service.store.instances().filter(instance => registered.has(instance.id)).map(instance => ({
         id: instance.id, state: instance.state, draining: !!instance.draining, jobId: instance.job_id,
         errorCode: instance.error_code, pendingResults: service.store.pendingResults(instance.id).length,
         areaName: service.options.configuration.instances.find(configuration => configuration.id === instance.id)?.areaName,
         gpuModel: service.options.configuration.instances.find(configuration => configuration.id === instance.id)?.gpuModel,
         nextActionAt: instance.next_action_at,
+        idleSince: instance.idle_since, stoppedAt: instance.stopped_at,
       })),
       queued: service.store.queued().length,
       workflows: service.options.configuration.workflows.map(profile => ({
@@ -50,6 +63,27 @@ export function registerComfyAdminRoutes(app: FastifyInstance, runtime: SystemRu
         bindings: Object.entries(profile.bindings).map(([name, binding]) => ({ name, kind: binding.kind ?? 'value', required: binding.kind === 'media' && !binding.omitWhenMissing || binding.required === true })),
       })),
     };
+  });
+  app.post('/api/admin/comfyui/resources/:key/inspect', async (request, reply) => {
+    const principal = await runtime.requireAdmin(request, 'authorize');
+    const params = z.object({ key: z.string().regex(/^[A-Za-z0-9_-]{1,100}$/) }).safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ code: 'INVALID_INPUT' });
+    const key = params.data.key;
+    if (!service.store.resource(key)) return reply.code(404).send({ code: 'COMFY_RESOURCE_UNKNOWN' });
+    runtime.store.audit({ actorId: principal.id, action: 'comfyui.resource.inspect', targetType: 'comfyResource', targetId: key });
+    await service.inspectResource(key);
+    return reply.code(202).send({ resourceKey: key, accepted: true });
+  });
+  app.post('/api/admin/comfyui/resources/:key/stop-unregistered', async (request, reply) => {
+    const principal = await runtime.requireAdmin(request, 'authorize');
+    const params = z.object({ key: z.string().regex(/^[A-Za-z0-9_-]{1,100}$/) }).safeParse(request.params);
+    const body = z.object({ confirmNoExternalWork: z.literal(true) }).strict().safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send({ code: 'INVALID_INPUT' });
+    const key = params.data.key;
+    if (!service.store.resource(key)) return reply.code(404).send({ code: 'COMFY_RESOURCE_UNKNOWN' });
+    runtime.store.audit({ actorId: principal.id, action: 'comfyui.resource.stopUnregistered', targetType: 'comfyResource', targetId: key });
+    await service.stopUnregisteredResource(key);
+    return reply.code(202).send({ resourceKey: key, accepted: true });
   });
   app.post('/api/admin/comfyui/instances/:id/:action', async (request, reply) => {
     const principal = await runtime.requireAdmin(request, 'authorize');

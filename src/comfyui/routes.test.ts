@@ -85,7 +85,11 @@ describe('registerComfyAdminRoutes', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({
       autoOpen: false, queued: 1,
-      instances: [{ id: '1', state: 'busy', draining: false, jobId: job.id, errorCode: null, pendingResults: 1, nextActionAt: null }],
+      elastic: { enabled: false, lastError: null }, resources: [],
+      metrics: expect.objectContaining({ queued: 1, eligibleQueued: 1,
+        cost: expect.objectContaining({ isEstimate: true, includesHistoricalBilling: false, unknownCostInstances: 1 }) }),
+      instances: [{ id: '1', state: 'busy', draining: false, jobId: job.id, errorCode: null, pendingResults: 1, nextActionAt: null,
+        idleSince: null, stoppedAt: null }],
       workflows: [{ id: 'example', version: '1', bindings: [{ name: 'text', kind: 'value', required: true }] }],
     });
     for (const secret of ['https://', 'private-comfy', 'URL_SECRET', 'TOKEN_SECRET', 'Authorization', 'PRIVATE_GRAPH_NODE', 'GRAPH_SECRET', 'PRIVATE_JOB_INPUT', 'baseUrl', 'graph']) {
@@ -203,6 +207,184 @@ describe('registerComfyAdminRoutes', () => {
     expect(requireAdmin).toHaveBeenCalledWith(expect.anything(), 'authorize');
     expect(control).not.toHaveBeenCalled();
     expect(auditRows()).toEqual([]);
+  });
+});
+
+const resourceActions = [
+  { action: 'inspect', auditAction: 'comfyui.resource.inspect' },
+  { action: 'stop-unregistered', auditAction: 'comfyui.resource.stopUnregistered' },
+] as const;
+
+function resourceFixture(resourceKey = 'resource-1') {
+  const context = fixture();
+  context.audit.mockImplementation(input => {
+    context.db.prepare('INSERT INTO test_audit VALUES(?,?,?,?)').run(input.actorId, input.action, input.targetType, input.targetId);
+  });
+  context.store.saveResource({ key: resourceKey, name: 'private-worker', state: 'blocked', instance_id: '99', configuration: null,
+    template_id: 'private-template', hourly_cost: 1, storage_hourly_cost: 0.1, created_at: 1_000, updated_at: 1_000, error_code: null });
+  const operations = {
+    inspect: vi.spyOn(context.service, 'inspectResource').mockResolvedValue(undefined),
+    'stop-unregistered': vi.spyOn(context.service, 'stopUnregisteredResource').mockResolvedValue(undefined),
+  };
+  const request = (action: string, payload?: unknown, selectedKey = resourceKey, headers: Record<string, string> = adminHeaders) => context.app.inject({
+    method: 'POST', url: '/api/admin/comfyui/resources/' + encodeURIComponent(selectedKey) + '/' + action,
+    headers: { ...headers, ...(payload === undefined ? {} : { 'content-type': 'application/json' }) },
+    ...(payload === undefined ? {} : { payload: JSON.stringify(payload) }),
+  });
+  return { ...context, operations, request, resourceKey };
+}
+
+describe.each(resourceActions)('ComfyUI resource administration: $action', ({ action, auditAction }) => {
+  const confirmation = action === 'stop-unregistered' ? { confirmNoExternalWork: true } : undefined;
+
+  it.each(['resource-1', 'a'.repeat(100)])('audits before calling the service with exactly the resource key %s', async resourceKey => {
+    const context = resourceFixture(resourceKey);
+    const expectedAudit = { actor_id: 'test-admin', action: auditAction, target_type: 'comfyResource', target_id: resourceKey };
+    context.operations[action].mockImplementation(async selectedKey => {
+      expect(selectedKey).toBe(resourceKey);
+      expect(context.db.inTransaction).toBe(false);
+      expect(context.auditRows()).toEqual([expectedAudit]);
+    });
+    const response = await context.request(action, confirmation);
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({ resourceKey, accepted: true });
+    expect(context.requireAdmin).toHaveBeenCalledExactlyOnceWith(expect.anything(), 'authorize');
+    expect(context.audit).toHaveBeenCalledExactlyOnceWith({ actorId: 'test-admin', action: auditAction, targetType: 'comfyResource', targetId: resourceKey });
+    expect(context.auditRows()).toEqual([expectedAudit]);
+    expect(context.operations[action]).toHaveBeenCalledExactlyOnceWith(resourceKey);
+    expect(context.operations[action === 'inspect' ? 'stop-unregistered' : 'inspect']).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { role: undefined, status: 401, code: 'UNAUTHENTICATED' },
+    { role: 'member', status: 403, code: 'ADMIN_REQUIRED' },
+    { role: 'readonly', status: 403, code: 'SUPERADMIN_REQUIRED' },
+    { role: 'operator', status: 403, code: 'SUPERADMIN_REQUIRED' },
+  ])('rejects role=$role without auditing or calling either resource operation', async ({ role, status, code }) => {
+    const context = resourceFixture();
+    const before = context.store.resources();
+    const response = await context.request(action, confirmation, context.resourceKey, role ? { 'x-test-role': role } : {});
+    expect(response.statusCode).toBe(status);
+    expect(response.json()).toEqual({ code });
+    expect(context.requireAdmin).toHaveBeenCalledExactlyOnceWith(expect.anything(), 'authorize');
+    expect(context.audit).not.toHaveBeenCalled();
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations.inspect).not.toHaveBeenCalled();
+    expect(context.operations['stop-unregistered']).not.toHaveBeenCalled();
+    expect(context.store.resources()).toEqual(before);
+  });
+
+  it('checks authorization before validating input or revealing whether the resource exists', async () => {
+    const context = resourceFixture();
+    const lookup = vi.spyOn(context.store, 'resource');
+    const response = await context.request(action, { confirmNoExternalWork: false }, 'invalid.key', {});
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ code: 'UNAUTHENTICATED' });
+    expect(lookup).not.toHaveBeenCalled();
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations[action]).not.toHaveBeenCalled();
+  });
+
+  it.each(['invalid.key', 'bad/key', 'bad key', '资源'])('rejects invalid resource key %s before lookup or audit', async resourceKey => {
+    const context = resourceFixture();
+    const lookup = vi.spyOn(context.store, 'resource');
+    const response = await context.request(action, confirmation, resourceKey);
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ code: 'INVALID_INPUT' });
+    expect(lookup).not.toHaveBeenCalled();
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations[action]).not.toHaveBeenCalled();
+  });
+
+  it('rejects an overlong resource key at the router boundary before authorization or audit', async () => {
+    const context = resourceFixture();
+    const lookup = vi.spyOn(context.store, 'resource');
+    const response = await context.request(action, confirmation, 'a'.repeat(101));
+    expect(response.statusCode).toBe(414);
+    expect(context.requireAdmin).not.toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations[action]).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 for a resource outside the pool without auditing or invoking the service', async () => {
+    const context = resourceFixture();
+    const response = await context.request(action, confirmation, 'missing-resource');
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ code: 'COMFY_RESOURCE_UNKNOWN' });
+    expect(context.audit).not.toHaveBeenCalled();
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations[action]).not.toHaveBeenCalled();
+  });
+
+  it('does not invoke the service if its audit cannot be persisted', async () => {
+    const context = resourceFixture();
+    const before = context.store.resources();
+    context.audit.mockImplementationOnce(() => { throw new Error('private audit failure'); });
+    const response = await context.request(action, confirmation);
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ code: 'REQUEST_FAILED' });
+    expect(response.body).not.toContain('private audit failure');
+    expect(context.audit).toHaveBeenCalledTimes(1);
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations[action]).not.toHaveBeenCalled();
+    expect(context.store.resources()).toEqual(before);
+  });
+
+  it.each([
+    { status: 404, code: 'COMFY_RESOURCE_UNKNOWN' },
+    { status: 409, code: 'COMFY_WORKER_BUSY' },
+    { status: 409, code: action === 'inspect' ? 'COMFY_CREATION_UNCONFIRMED' : 'COMFY_RESOURCE_STOP_UNSAFE' },
+    { status: 503, code: 'COMFY_RESOURCE_INSPECTION_UNAVAILABLE' },
+  ])('preserves the attempted-operation audit when the service rejects with $status/$code', async ({ status, code }) => {
+    const context = resourceFixture();
+    context.operations[action].mockRejectedValueOnce(new SystemError(status, code, 'private provider detail TOKEN_SECRET'));
+    const response = await context.request(action, confirmation);
+    expect(response.statusCode).toBe(status);
+    expect(response.json()).toEqual({ code });
+    expect(response.body).not.toContain('TOKEN_SECRET');
+    expect(context.operations[action]).toHaveBeenCalledExactlyOnceWith(context.resourceKey);
+    expect(context.auditRows()).toEqual([{ actor_id: 'test-admin', action: auditAction, target_type: 'comfyResource', target_id: context.resourceKey }]);
+  });
+
+  it('returns a generic 500 without exposing unexpected service errors, retaining its audit', async () => {
+    const context = resourceFixture();
+    context.operations[action].mockRejectedValueOnce(new Error('https://private-provider.invalid?token=TOKEN_SECRET'));
+    const response = await context.request(action, confirmation);
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ code: 'REQUEST_FAILED' });
+    expect(response.body).not.toContain('TOKEN_SECRET');
+    expect(context.operations[action]).toHaveBeenCalledExactlyOnceWith(context.resourceKey);
+    expect(context.auditRows()).toHaveLength(1);
+  });
+});
+
+describe('ComfyUI stop-unregistered confirmation', () => {
+  it.each([
+    undefined, null, {}, true, [],
+    { confirmNoExternalWork: false }, { confirmNoExternalWork: 'true' }, { confirmNoExternalWork: 1 },
+    { confirmNoExternalWork: null }, { confirmNoExternalWork: true, force: true },
+  ])('requires an explicit literal true and rejects invalid payload %j before lookup, audit or service call', async payload => {
+    const context = resourceFixture();
+    const lookup = vi.spyOn(context.store, 'resource');
+    const response = await context.request('stop-unregistered', payload);
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ code: 'INVALID_INPUT' });
+    expect(context.requireAdmin).toHaveBeenCalledExactlyOnceWith(expect.anything(), 'authorize');
+    expect(lookup).not.toHaveBeenCalled();
+    expect(context.audit).not.toHaveBeenCalled();
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations['stop-unregistered']).not.toHaveBeenCalled();
+  });
+
+  it('does not accept a query-string confirmation in place of the required JSON body', async () => {
+    const context = resourceFixture();
+    const response = await context.app.inject({ method: 'POST',
+      url: '/api/admin/comfyui/resources/' + context.resourceKey + '/stop-unregistered?confirmNoExternalWork=true', headers: adminHeaders });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ code: 'INVALID_INPUT' });
+    expect(context.auditRows()).toEqual([]);
+    expect(context.operations['stop-unregistered']).not.toHaveBeenCalled();
   });
 });
 

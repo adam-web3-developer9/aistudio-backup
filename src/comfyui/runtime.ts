@@ -27,7 +27,15 @@ export function createComfyService(options: ComfyRuntimeOptions & {
   return new ComfyService({
     store: new ComfyStore(options.db, options.eventSink), configuration: options.configuration,
     platform: new AigateClient({ token: options.token, fetch: options.fetch, capacityErrorCodes: options.configuration.capacityErrorCodes }),
-    client: instance => clients.get(instance.id)!, assets: options.assets, ownsAsset: options.ownsAsset,
+    client: instance => {
+      let client = clients.get(instance.id);
+      if (!client) {
+        client = new ComfyClient({ baseUrl: instance.baseUrl, headers: instance.headers, fetch: options.fetch,
+          allowedGpuModels: instance.gpuModel ? [instance.gpuModel] : ['5090', '4090'] });
+        clients.set(instance.id, client);
+      }
+      return client;
+    }, assets: options.assets, ownsAsset: options.ownsAsset,
     owner: createHash('sha256').update(options.apiKey).digest('hex'),
     results: new ComfyResultStore(path.join(options.dataDirectory, 'comfy-results')),
   });

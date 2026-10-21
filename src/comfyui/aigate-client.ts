@@ -3,6 +3,11 @@ export interface AigateInstance {
   status: string;
   operationStatus?: string;
   areaName?: string;
+  instanceName?: string;
+  count?: number;
+  imageId?: string;
+  imageType?: string;
+  chargeType?: string;
   services: Array<{
     host: string;
     port?: number;
@@ -12,15 +17,80 @@ export interface AigateInstance {
   }>;
 }
 
+export interface AigateSku {
+  areaName: string;
+  skuName: string;
+  price: string;
+  vmSize: string;
+  cpuMf: string;
+  cpuCore: number;
+  memorySize: string;
+  sysDiskSize: string;
+  maxGpuCount: number;
+}
+
+export type AigateCreateRequest = {
+  areaName: string;
+  count: number;
+  imageId: string;
+  imageType: '2' | '3';
+} & ({ skuName: string; gpuModel?: never } | { gpuModel: string; skuName?: never });
+
+export interface AigatePageRequest {
+  current: number;
+  pageSize: number;
+  operationStatus?: string | null;
+  instanceName?: string;
+}
+
+export interface AigateInstancePage {
+  total: number;
+  records: AigateInstance[];
+}
+
+export interface AigateReconcileOptions {
+  maxPages: number;
+  pageSize?: number;
+  operationStatus?: string | null;
+}
+
+export interface AigateReconcileResult {
+  records: AigateInstance[];
+  complete: boolean;
+  pagesScanned: number;
+}
+
 export class AigateError extends Error {
-  constructor(public readonly code: string, message: string, public readonly errCode?: string) {
+  constructor(public readonly code: string, message: string, public readonly errCode?: string, public readonly uncertain = false) {
     super(message);
     this.name = 'AigateError';
   }
 }
 
-function invalidResponse(): never {
-  throw new AigateError('INVALID_RESPONSE', 'Invalid AIGate response');
+function invalidResponse(uncertain = false): never {
+  throw new AigateError('INVALID_RESPONSE', 'Invalid AIGate response', undefined, uncertain);
+}
+
+function isInt64(value: unknown): value is string {
+  return typeof value === 'string' && /^(?:0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= 9_223_372_036_854_775_807n;
+}
+
+function responseId(value: unknown, uncertain = false): string {
+  const id = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value;
+  if (!isInt64(id)) return invalidResponse(uncertain);
+  return id;
+}
+
+function nonEmpty(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function positiveInteger(value: unknown, max = Number.MAX_SAFE_INTEGER): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= max;
+}
+
+function invalidArgument(): never {
+  throw new AigateError('INVALID_ARGUMENT', 'Invalid AIGate request parameters');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -71,12 +141,18 @@ export class AigateClient {
 
   async getInstance(instanceId: string): Promise<AigateInstance> {
     const data = await this.request('get', instanceId);
+    const instance = this.parseInstance(data);
+    if (instance.id !== instanceId) return invalidResponse();
+    return instance;
+  }
+
+  private parseInstance(data: unknown): AigateInstance {
     if (!isRecord(data)) return invalidResponse();
     const rawId = data.instanceId;
     const id = typeof rawId === 'string' ? rawId
       : typeof rawId === 'number' && Number.isSafeInteger(rawId) ? String(rawId) : undefined;
     const tools = data.instanceUtilList ?? [];
-    if (id !== instanceId || !Array.isArray(tools)) return invalidResponse();
+    if (id === undefined || !isInt64(id) || !Array.isArray(tools)) return invalidResponse();
     const operationStatus = data.operationStatus;
     if (operationStatus !== undefined && typeof operationStatus !== 'string') return invalidResponse();
     const status = data.instanceStatus ?? data.status ?? operationStatus;
@@ -101,8 +177,100 @@ export class AigateClient {
       }
       return result;
     });
-    return { id, status, ...(operationStatus === undefined ? {} : { operationStatus }),
+    const metadata: Partial<AigateInstance> = {};
+    for (const key of ['instanceName', 'imageType', 'chargeType'] as const) {
+      const value = data[key];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== 'string') return invalidResponse();
+      metadata[key] = value;
+    }
+    if (data.imageId !== undefined && data.imageId !== null) metadata.imageId = responseId(data.imageId);
+    if (data.count !== undefined && data.count !== null) {
+      if (!positiveInteger(data.count, 8)) return invalidResponse();
+      metadata.count = data.count;
+    }
+    return { ...metadata, id, status, ...(operationStatus === undefined ? {} : { operationStatus }),
       ...(typeof areaName === 'string' ? { areaName } : {}), services };
+  }
+
+  async skuList(areaName: string): Promise<AigateSku[]> {
+    if (!nonEmpty(areaName)) return invalidArgument();
+    const data = await this.request('skuList', undefined, { areaName });
+    if (!Array.isArray(data)) return invalidResponse();
+    return data.map(item => {
+      if (!isRecord(item)) return invalidResponse();
+      const result = {} as AigateSku;
+      for (const key of ['areaName', 'skuName', 'price', 'vmSize', 'cpuMf', 'memorySize', 'sysDiskSize'] as const) {
+        if (!nonEmpty(item[key])) return invalidResponse();
+        result[key] = item[key];
+      }
+      for (const key of ['cpuCore', 'maxGpuCount'] as const) {
+        if (!positiveInteger(item[key])) return invalidResponse();
+        result[key] = item[key];
+      }
+      return result;
+    });
+  }
+
+  async createInstance(request: AigateCreateRequest): Promise<string> {
+    if (!isRecord(request) || !nonEmpty(request.areaName) || !positiveInteger(request.count, 8)
+      || !isInt64(request.imageId) || !['2', '3'].includes(request.imageType)
+      || (request.skuName !== undefined) === (request.gpuModel !== undefined)
+      || !nonEmpty(request.skuName ?? request.gpuModel)) return invalidArgument();
+    const fields = { areaName: request.areaName, count: request.count, imageType: request.imageType,
+      ...(request.skuName !== undefined ? { skuName: request.skuName } : { gpuModel: request.gpuModel }) };
+    const body = JSON.stringify(fields).slice(0, -1) + ',"imageId":' + request.imageId + '}';
+    const data = await this.request('start', undefined, undefined, body);
+    if (!isRecord(data)) return invalidResponse(true);
+    return responseId(data.instanceId, true);
+  }
+
+  async pageInstances(request: AigatePageRequest): Promise<AigateInstancePage> {
+    if (!isRecord(request) || !positiveInteger(request.current) || !positiveInteger(request.pageSize, 20)
+      || (request.operationStatus !== undefined && request.operationStatus !== null && !nonEmpty(request.operationStatus))
+      || (request.instanceName !== undefined && !nonEmpty(request.instanceName))) return invalidArgument();
+    const data = await this.request('page', undefined, undefined, JSON.stringify({ current: request.current,
+      pageSize: request.pageSize, ...(request.operationStatus === undefined ? {} : { operationStatus: request.operationStatus }) }));
+    if (!isRecord(data) || typeof data.total !== 'number' || !Number.isSafeInteger(data.total) || data.total < 0
+      || !Array.isArray(data.records) || data.records.length > request.pageSize) return invalidResponse();
+    const records = data.records.map(item => this.parseInstance(item));
+    return { total: data.total, records: request.instanceName === undefined ? records
+      : records.filter(item => item.instanceName === request.instanceName) };
+  }
+
+  async findInstancesByName(name: string, options: AigateReconcileOptions): Promise<AigateReconcileResult> {
+    if (!nonEmpty(name) || !isRecord(options) || !positiveInteger(options.maxPages, 100)
+      || !positiveInteger(options.pageSize ?? 20, 20)) return invalidArgument();
+    const pageSize = options.pageSize ?? 20;
+    const records: AigateInstance[] = [];
+    const seen = new Set<string>();
+    let previousTotal: number | undefined;
+    let stable = true;
+    for (let current = 1; current <= options.maxPages; current++) {
+      const page = await this.pageInstances({ current, pageSize,
+        ...(options.operationStatus === undefined ? {} : { operationStatus: options.operationStatus }) });
+      if (previousTotal !== undefined && page.total !== previousTotal) stable = false;
+      previousTotal = page.total;
+      for (const instance of page.records) {
+        if (seen.has(instance.id)) stable = false;
+        else {
+          seen.add(instance.id);
+          if (instance.instanceName === name) records.push(instance);
+        }
+      }
+      if (current * pageSize >= page.total || page.records.length < pageSize) {
+        return { records, complete: stable && seen.size === page.total, pagesScanned: current };
+      }
+    }
+    return { records, complete: false, pagesScanned: options.maxPages };
+  }
+
+  async releaseInstance(instanceId: string): Promise<void> {
+    await this.request('release', instanceId);
+  }
+
+  async clearGpuIdleShutdown(instanceId: string): Promise<void> {
+    await this.request('clearTimerStop', instanceId);
   }
 
   async getInstanceStatus(instanceId: string): Promise<string> {
@@ -131,16 +299,23 @@ export class AigateClient {
     return code;
   }
 
-  private async request(action: 'get' | 'status' | 'open' | 'close' | 'setTimerStop', instanceId: string): Promise<unknown> {
-    if (typeof instanceId !== 'string' || !/^\d+$/.test(instanceId)) {
+  private async request(action: 'get' | 'status' | 'open' | 'close' | 'setTimerStop' | 'clearTimerStop' | 'skuList' | 'start' | 'page' | 'release',
+    instanceId?: string, query?: Record<string, string>, payload?: string): Promise<unknown> {
+    const needsId = !['skuList', 'start', 'page'].includes(action);
+    if (needsId && (typeof instanceId !== 'string' || !/^\d+$/.test(instanceId))) {
       throw new AigateError('INVALID_ARGUMENT', 'AIGate instance ID must be a decimal string');
     }
-    const gpuIdleShutdown = action === 'setTimerStop';
-    if (gpuIdleShutdown && (!/^(?:0|[1-9]\d{0,18})$/.test(instanceId) || BigInt(instanceId) > 9_223_372_036_854_775_807n)) {
+    const gpuIdleShutdown = action === 'setTimerStop' || action === 'clearTimerStop';
+    if ((gpuIdleShutdown || action === 'release') && !isInt64(instanceId)) {
       throw new AigateError('INVALID_ARGUMENT', 'AIGate instance ID must be a canonical non-negative int64 decimal string');
     }
-    const url = new URL(`/api/openapi/instance/${action}`, this.#baseUrl);
-    if (!gpuIdleShutdown) url.searchParams.set('instanceId', instanceId);
+    const url = new URL('/api/openapi/instance/' + (action === 'clearTimerStop' ? 'setTimerStop' : action), this.#baseUrl);
+    if (needsId && !gpuIdleShutdown) url.searchParams.set('instanceId', instanceId!);
+    for (const [key, value] of Object.entries(query ?? {})) url.searchParams.set(key, value);
+    const post = gpuIdleShutdown || action === 'start' || action === 'page';
+    const bodyText = gpuIdleShutdown ? '{"instanceId":' + instanceId + (action === 'clearTimerStop'
+      ? ',"stopType":"0"}' : ',"stopType":"2","utilizationRate":10,"leisureTime":30}') : payload;
+    const mutation = action === 'start' || action === 'release' || action === 'clearTimerStop';
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
@@ -154,9 +329,9 @@ export class AigateClient {
         let response: Response;
         try {
           response = await this.#fetch(url, {
-            method: gpuIdleShutdown ? 'POST' : 'GET',
-            headers: { Authorization: `Bearer ${this.#token}`, ...(gpuIdleShutdown ? { 'Content-Type': 'application/json' } : {}) },
-            ...(gpuIdleShutdown ? { body: `{"instanceId":${instanceId},"stopType":"2","utilizationRate":10,"leisureTime":30}` } : {}),
+            method: post ? 'POST' : 'GET',
+            headers: { Authorization: 'Bearer ' + this.#token, ...(post ? { 'Content-Type': 'application/json' } : {}) },
+            ...(bodyText === undefined ? {} : { body: bodyText }),
             signal: controller.signal,
             redirect: 'error',
             cache: 'no-store'
@@ -189,18 +364,23 @@ export class AigateClient {
           const errCode = this.safeErrorCode(body.errCode);
           const explicitlyUnavailable = typeof body.msg === 'string' && body.msg.length <= 500 &&
             /(?:显卡|GPU|算力)(?:资源|库存)?(?:不足|已售罄|已售完|暂无库存)|(?:暂无|没有|无)可用(?:的)?(?:GPU|显卡|算力)|(?:GPU|显卡)(?:资源)?(?:暂不可用|暂时不可用)/i.test(body.msg);
-          if (action === 'open' && (errCode !== undefined && this.#capacityErrorCodes.has(errCode) || explicitlyUnavailable)) {
+          if ((action === 'open' || action === 'start') && (errCode !== undefined && this.#capacityErrorCodes.has(errCode) || explicitlyUnavailable)) {
             throw new AigateError('CAPACITY_UNAVAILABLE', 'AIGate capacity is unavailable', errCode);
           }
           throw new AigateError('BUSINESS_REJECTED', 'AIGate explicitly rejected the request', errCode);
         }
         if (action === 'status' && typeof body.data !== 'string') return invalidResponse();
-        if ((action === 'open' || action === 'close') && body.data !== null && typeof body.data !== 'string') {
+        if ((action === 'open' || action === 'close' || action === 'release') && body.data !== null && typeof body.data !== 'string') {
           return invalidResponse();
         }
         if (gpuIdleShutdown && body.data !== null && body.data !== true) return invalidResponse();
         return body.data;
       })()]);
+    } catch (error) {
+      if (mutation && error instanceof AigateError && !['BUSINESS_REJECTED', 'CAPACITY_UNAVAILABLE'].includes(error.code)) {
+        throw new AigateError(error.code, error.message, error.errCode, true);
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
