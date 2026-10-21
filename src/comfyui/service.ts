@@ -55,7 +55,6 @@ export class ComfyService {
   private readonly collecting = new Map<string, Promise<void>>();
   private readonly processing = new Map<string, Promise<void>>();
   private opening: Promise<void> = Promise.resolve();
-  private readonly clearedPolicies = new Set<string>();
   private timer?: ReturnType<typeof setInterval>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private active?: Promise<void>;
@@ -114,11 +113,10 @@ export class ComfyService {
     await this.lifecycle.stopUnregistered(key);
   }
   private async configureIdlePolicy(id: string): Promise<void> {
-    if (!this.options.configuration.scheduler || this.clearedPolicies.has(id)) return;
-    if (!this.options.platform.clearGpuIdleShutdown) throw new SystemError(503, 'COMFY_IDLE_POLICY_UNAVAILABLE', 'Cannot safely disable the platform idle shutdown policy');
-    await this.options.platform.clearGpuIdleShutdown(id);
+    if (this.store.instance(id)!.idle_policy_applied_at || !this.options.platform.setGpuIdleShutdown) return;
+    await this.options.platform.setGpuIdleShutdown(id);
     this.assertWorker();
-    this.clearedPolicies.add(id);
+    this.store.updateInstance(id, { idle_policy_applied_at: Date.now() });
   }
   submit(input: ComfyInput): { job: ComfyJob; created: boolean } {
     const prior = this.store.byRequest(this.options.owner, input.requestKey);
@@ -373,7 +371,6 @@ export class ComfyService {
           const status = await this.options.platform.getInstanceStatus(instance.id);
           this.assertWorker();
           if (status !== '2') { await this.ensureUploadReady(configuration, client); return; }
-          await this.configureIdlePolicy(instance.id);
         }
         await this.observe(job, client);
         if (this.store.instance(instance.id)?.job_id && job.deadline <= Date.now() && !['collecting', 'succeeded', 'cancelled'].includes(this.store.get(job.id)!.stage)) {
@@ -419,7 +416,6 @@ export class ComfyService {
         return;
       }
       if (status !== '2') {
-        this.clearedPolicies.delete(instance.id);
         const prior = this.opening;
         let release!: () => void;
         this.opening = new Promise<void>(resolve => { release = resolve; });
@@ -470,11 +466,6 @@ export class ComfyService {
         return;
       }
       await this.configureIdlePolicy(instance.id);
-      if (!this.options.configuration.scheduler && !this.store.instance(instance.id)!.idle_policy_applied_at && this.options.platform.setGpuIdleShutdown) {
-        await this.options.platform.setGpuIdleShutdown(instance.id);
-        this.assertWorker();
-        this.store.updateInstance(instance.id, { idle_policy_applied_at: Date.now() });
-      }
       this.store.updateInstance(instance.id, { state: 'ready', action_started_at: null, capacity_started_at: null, next_action_at: null, error_code: null, stopped_at: null });
       for (const job of resultRequests) this.store.updateJob(job.id, { result_wake_requested: 0, result_checked_at: Date.now() });
     }
@@ -502,7 +493,6 @@ export class ComfyService {
     this.assertWorker();
     instance = this.store.instance(configuration.id)!;
     if (status !== '2') {
-      this.clearedPolicies.delete(instance.id);
       if (instance.state !== 'starting') {
         this.store.updateInstance(instance.id, { state: 'starting', action_started_at: Date.now(), action_sent: 0,
           idle_policy_applied_at: null, error_code: 'COMFY_UPLOAD_INSTANCE_OFFLINE' });
@@ -523,7 +513,6 @@ export class ComfyService {
       this.checkActionTimeout(instance.id);
       return false;
     }
-    await this.configureIdlePolicy(instance.id);
     if (!this.options.configuration.scheduler && instance.state === 'busy' && instance.idle_policy_applied_at) return true;
     await client.health();
     const queue = await client.queue();
@@ -532,11 +521,7 @@ export class ComfyService {
       this.deferInstance(instance.id, 'COMFY_EXTERNAL_OCCUPANCY');
       return false;
     }
-    if (!this.options.configuration.scheduler && !instance.idle_policy_applied_at && this.options.platform.setGpuIdleShutdown) {
-      await this.options.platform.setGpuIdleShutdown(instance.id);
-      this.assertWorker();
-      this.store.updateInstance(instance.id, { idle_policy_applied_at: Date.now() });
-    }
+    await this.configureIdlePolicy(instance.id);
     this.store.updateInstance(instance.id, { state: 'busy', action_started_at: null, action_sent: 0,
       capacity_started_at: null, next_action_at: null, error_code: null, stopped_at: null });
     return true;
