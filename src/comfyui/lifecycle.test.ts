@@ -93,6 +93,26 @@ function releasableFixture() {
   return context;
 }
 
+function unifiedReleaseFixture() {
+  const instances: ComfyPoolConfiguration['instances'] = Array.from({ length: 10 }, (_, index) => ({
+    id: String(index + 1), baseUrl: 'https://worker-' + (index + 1) + '.waas.aigate.cc',
+    workflowIds: ['render'], areaName: '华东一区', gpuModel: '5090',
+    lifecycle: { allowRelease: true, rebuildVerified: true, hourlyCost: 1, storageHourlyCost: 0.1 },
+  }));
+  const context = fixture({ instances: instances.slice(0, 3) });
+  for (const instance of instances.slice(3)) {
+    context.configuration.instances.push(instance);
+    context.store.registerInstances([instance.id]);
+    context.store.saveResource(resource({ key: 'elastic-' + instance.id, state: 'registered', instance_id: instance.id,
+      configuration: JSON.stringify(instance), created_at: clock - 3_600_000 }));
+  }
+  for (const instance of instances) context.store.updateInstance(instance.id, {
+    state: 'offline', idle_since: clock - 3_600_000, stopped_at: clock - 3_600_000,
+  });
+  context.platform.getInstanceStatus.mockResolvedValue('22');
+  return context;
+}
+
 beforeEach(() => {
   clock = startedAt;
   vi.spyOn(Date, 'now').mockImplementation(() => clock);
@@ -515,6 +535,85 @@ describe('ComfyLifecycle resource tracking and inspection', () => {
 });
 
 describe('ComfyLifecycle idle and release safety', () => {
+  it.each(['22', '26'])('releases the original three and seven elastic instances uniformly after stopped retention in status %s', async status => {
+    const context = unifiedReleaseFixture();
+    const instanceIds = context.configuration.instances.map(instance => instance.id);
+    expect(context.store.resources().map(item => item.instance_id).sort()).toEqual(instanceIds.slice(3).sort());
+    context.platform.getInstanceStatus.mockResolvedValue(status);
+    for (const instanceId of instanceIds) context.store.updateInstance(instanceId, { stopped_at: clock - 3_599_999 });
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+    clock += 1;
+    context.platform.releaseInstance.mockImplementation(async instanceId => {
+      expect(context.store.resources().find(item => item.instance_id === instanceId)).toMatchObject({ state: 'releasing' });
+      expect(context.store.instance(instanceId)?.draining).toBe(1);
+    });
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance.mock.calls.map(([instanceId]) => instanceId).sort()).toEqual([...instanceIds].sort());
+    expect(context.store.resources()).toHaveLength(10);
+    expect(context.store.resources().every(item => item.state === 'releasing')).toBe(true);
+    expect(context.configuration.instances.map(instance => instance.id)).toEqual(instanceIds);
+    expect(context.platform.closeInstance).not.toHaveBeenCalled();
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
+  it('does not resurrect released static IDs on restart and scales from a template after all ten instances are released', async () => {
+    const context = unifiedReleaseFixture();
+    const instanceIds = context.configuration.instances.map(instance => instance.id);
+    const templates = structuredClone(context.configuration.elastic!.templates);
+    await context.lifecycle.tick();
+    context.platform.getInstance.mockImplementation(async instanceId => ({ id: instanceId, status: '4', services: [] }));
+    const releasing = context.restart();
+    expect(releasing.configuration.instances.map(instance => instance.id).sort()).toEqual([...instanceIds].sort());
+    await releasing.lifecycle.tick();
+    expect(releasing.lifecycle.lastError).toBeNull();
+    expect(releasing.store.resources()).toHaveLength(10);
+    expect(releasing.store.resources().every(item => item.state === 'released')).toBe(true);
+    expect(releasing.configuration.instances).toEqual([]);
+    const restarted = context.restart();
+    expect(restarted.configuration.instances).toEqual([]);
+    expect(restarted.configuration.elastic!.templates).toEqual(templates);
+    await restarted.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(10);
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+    clock += restarted.configuration.elastic!.createCooldownMs;
+    context.platform.getInstance.mockResolvedValue(context.metadata);
+    context.platform.getInstanceStatus.mockResolvedValue('2');
+    context.submit();
+    await restarted.lifecycle.tick();
+    expect(restarted.lifecycle.lastError).toBeNull();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    expect(restarted.configuration.instances.map(instance => instance.id)).toEqual([createdId]);
+    expect(restarted.store.resources().filter(item => item.state === 'released')).toHaveLength(10);
+    expect(restarted.store.resources().find(item => item.instance_id === createdId)).toMatchObject({ state: 'registered', template_id: 'template' });
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(10);
+  });
+
+  it.each([
+    { instanceId: '1', source: 'static', work: 'uncollected result' },
+    { instanceId: '4', source: 'elastic', work: 'uncollected result' },
+    { instanceId: '1', source: 'static', work: 'unconfirmed submission' },
+    { instanceId: '4', source: 'elastic', work: 'unconfirmed submission' },
+  ])('protects $work on a $source instance without shielding other instance sources', async ({ instanceId, work }) => {
+    const context = unifiedReleaseFixture();
+    const job = context.submit();
+    context.store.updateInstance(instanceId, { state: 'ready' });
+    expect(context.store.claim(instanceId, ['render'], clock)?.id).toBe(job.id);
+    context.store.updateJob(job.id, work === 'uncollected result'
+      ? { stage: 'succeeded', result_pending: 1, result: '{}' }
+      : { stage: 'submitting', provider_confirmed: 0 });
+    context.store.releaseSlot(job.id);
+    context.store.updateInstance(instanceId, { state: 'offline' });
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(9);
+    expect(context.platform.releaseInstance).not.toHaveBeenCalledWith(instanceId);
+    expect(context.store.instance(instanceId)).toMatchObject({ draining: 0, idle_since: null });
+    expect(context.store.hasUnresolvedWork(instanceId)).toBe(true);
+    expect(context.configuration.instances.some(instance => instance.id === instanceId)).toBe(true);
+    expect(context.platform.closeInstance).not.toHaveBeenCalled();
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
   it('does not mutate platform resources after losing worker ownership', async () => {
     const context = releasableFixture();
     context.assertWorker.mockImplementation(() => { throw new Error('lease lost'); });
