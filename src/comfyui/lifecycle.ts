@@ -190,9 +190,12 @@ export class ComfyLifecycle {
         this.lastError = null;
       } catch (error) {
         this.options.assertWorker();
+        const capacityUnavailable = !resource.instance_id && (error as { uncertain?: boolean })?.uncertain === false
+          && (error as { code?: string })?.code === 'CAPACITY_UNAVAILABLE';
         store.saveResource({ ...resource, state: resource.instance_id ? 'creating' : (error as { uncertain?: boolean })?.uncertain === false ? 'released' : 'uncertain',
           updated_at: Date.now(), error_code: safeCode(error) });
-        this.lastError = resource.instance_id ? 'COMFY_RESOURCE_INITIALIZING' : 'COMFY_CREATION_UNCONFIRMED';
+        this.lastError = resource.instance_id ? 'COMFY_RESOURCE_INITIALIZING' : capacityUnavailable ? 'COMFY_CAPACITY_UNAVAILABLE' : 'COMFY_CREATION_UNCONFIRMED';
+        if (capacityUnavailable) continue;
       }
       return;
     }

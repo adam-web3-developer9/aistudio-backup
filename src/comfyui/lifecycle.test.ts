@@ -69,6 +69,14 @@ function resource(patch: Partial<ComfyResource> = {}): ComfyResource {
     template_id: 'template', hourly_cost: 1, storage_hourly_cost: 0.2, created_at: clock, updated_at: clock, error_code: null, ...patch };
 }
 
+function fallbackFixture() {
+  const context = fixture();
+  context.configuration.elastic!.templates.push({ ...context.configuration.elastic!.templates[0]!, id: 'fallback', areaName: '华东二区' });
+  context.platform.skuList.mockImplementation(async areaName => [{ ...context.sku, areaName }]);
+  context.demand();
+  return context;
+}
+
 function idleFixture(stopped = false) {
   const context = fixture({ autoOpen: false });
   context.store.updateInstance('1', { state: stopped ? 'offline' : 'ready', idle_since: clock - 300_000,
@@ -97,6 +105,73 @@ afterEach(async () => {
 });
 
 describe('ComfyLifecycle elastic creation', () => {
+  it('falls back to the next region after a confirmed capacity rejection without an ID', async () => {
+    const context = fallbackFixture();
+    context.platform.createInstance.mockRejectedValueOnce(new AigateError('CAPACITY_UNAVAILABLE', 'no capacity'));
+    context.platform.getInstance.mockResolvedValue({ ...context.metadata, areaName: '华东二区' });
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
+    expect(context.platform.createInstance).toHaveBeenNthCalledWith(1, expect.objectContaining({ areaName: '华东一区' }));
+    expect(context.platform.createInstance).toHaveBeenNthCalledWith(2, expect.objectContaining({ areaName: '华东二区' }));
+    expect(context.store.resources()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ template_id: 'template', state: 'released', instance_id: null, error_code: 'COMFY_CAPACITY_UNAVAILABLE' }),
+      expect.objectContaining({ template_id: 'fallback', state: 'registered', instance_id: createdId, error_code: null }),
+    ]));
+    expect(context.store.resources()).toHaveLength(2);
+    expect(context.configuration.instances.map(instance => instance.id)).toEqual(['1', createdId]);
+    expect(context.lifecycle.lastError).toBeNull();
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports confirmed capacity exhaustion and preserves creation cooldown', async () => {
+    const context = fallbackFixture();
+    context.platform.createInstance.mockRejectedValue(new AigateError('CAPACITY_UNAVAILABLE', 'no capacity'));
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
+    expect(context.store.resources()).toHaveLength(2);
+    for (const row of context.store.resources()) {
+      expect(row).toMatchObject({ state: 'released', instance_id: null, error_code: 'COMFY_CAPACITY_UNAVAILABLE' });
+    }
+    expect(context.lifecycle.lastError).toBe('COMFY_CAPACITY_UNAVAILABLE');
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { code: 'TIMEOUT', uncertain: true, state: 'uncertain' },
+    { code: 'CAPACITY_UNAVAILABLE', uncertain: true, state: 'uncertain' },
+    { code: 'CAPACITY_UNAVAILABLE', uncertain: undefined, state: 'uncertain' },
+    { code: 'BUSINESS_REJECTED', uncertain: false, state: 'released' },
+  ])('does not fall back for $code with uncertainty $uncertain', async ({ code, uncertain, state }) => {
+    const context = fallbackFixture();
+    context.platform.createInstance.mockRejectedValue(Object.assign(new Error('creation failed'), { code, uncertain }));
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    expect(context.platform.skuList).toHaveBeenCalledExactlyOnceWith('华东一区');
+    expect(context.store.resources()).toEqual([expect.objectContaining({ state, instance_id: null, error_code: 'COMFY_' + code })]);
+    expect(context.lifecycle.lastError).toBe('COMFY_CREATION_UNCONFIRMED');
+    if (uncertain !== false) {
+      clock += context.configuration.elastic!.createCooldownMs;
+      await context.lifecycle.tick();
+      expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+      expect(context.lifecycle.lastError).toBe('COMFY_RESOURCE_RECONCILIATION_REQUIRED');
+    }
+  });
+
+  it('does not fall back after a known ID even for a confirmed initialization capacity rejection', async () => {
+    const context = fallbackFixture();
+    context.platform.getInstance.mockRejectedValue(new AigateError('CAPACITY_UNAVAILABLE', 'initialization failed'));
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    expect(context.platform.skuList).toHaveBeenCalledExactlyOnceWith('华东一区');
+    expect(context.store.resources()).toEqual([expect.objectContaining({ state: 'creating', instance_id: createdId, error_code: 'COMFY_CAPACITY_UNAVAILABLE' })]);
+    expect(context.lifecycle.lastError).toBe('COMFY_RESOURCE_INITIALIZING');
+    clock += context.configuration.elastic!.createCooldownMs;
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+  });
+
   it('creates one instance for compatible queue pressure and durably registers verified metadata', async () => {
     const context = fixture();
     context.demand();
