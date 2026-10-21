@@ -7,15 +7,18 @@ accounts, administration, projects and private media on one HTTPS origin.
 Channels remain disabled until their production accounts are configured and the
 gateway is explicitly enabled.
 
-Nginx connects through the separate loopback ingress on port 3002. Install it
+Nginx connects through the separate loopback ingress on port 3003. Install it
 with install-ingress.sh and verify its health endpoint before switching an
-existing Nginx upstream from 3001 to 3002 with a tested configuration reload.
+existing Nginx upstream to 3003 with a tested configuration reload.
 The ingress is not restarted by application deployments. It holds new connections
 for up to 90 seconds while the application is restarting, with a 1024-connection
 limit. Only refused connections are retried, before any request bytes are
 forwarded; requests already delivered to the application are never replayed.
 It does not hide provider errors or guarantee availability beyond that bounded
-wait. Updating an active ingress requires a separate drain window.
+wait. The ingress service is instantiated by port. To update an active ingress,
+set SYSTEM_INGRESS_PORT to an unused port when running install-ingress.sh,
+verify health, reload Nginx to that port, and drain the old service before
+stopping it. The installer refuses to overwrite a running implementation.
 
 ## First installation
 

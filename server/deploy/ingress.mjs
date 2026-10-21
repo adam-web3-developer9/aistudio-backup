@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 export function createIngress({ host = '127.0.0.1', port = 3001, waitMs = 90_000, retryMs = 100, maxConnections = 1024 } = {}) {
   const connections = new Set();
-  const server = net.createServer(client => {
+  const server = net.createServer({ allowHalfOpen: true }, client => {
     client.pause();
     connections.add(client);
     let upstream;
@@ -20,7 +20,7 @@ export function createIngress({ host = '127.0.0.1', port = 3001, waitMs = 90_000
     client.on('error', () => client.destroy());
     const connect = () => {
       if (client.destroyed) return;
-      upstream = net.createConnection({ host, port });
+      upstream = net.createConnection({ host, port, allowHalfOpen: true });
       upstream.once('connect', () => {
         if (client.destroyed) { upstream.destroy(); return; }
         connected = true;
@@ -33,7 +33,7 @@ export function createIngress({ host = '127.0.0.1', port = 3001, waitMs = 90_000
           retry = setTimeout(connect, retryMs);
         } else client.destroy();
       });
-      upstream.once('close', () => { if (connected) client.destroy(); });
+      upstream.once('close', () => { if (connected && !upstream.readableEnded) client.destroy(); });
     };
     connect();
   });

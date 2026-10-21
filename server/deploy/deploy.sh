@@ -56,6 +56,19 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
 print('true' if values.get('SYSTEM_VIDEO_GATEWAY_ENABLED')=='true' else 'false')
 PY
 )
+comfy_configuration=$(python3 - /etc/aistudio-studio/system.env <<'PY'
+import pathlib
+for line in pathlib.Path('/etc/aistudio-studio/system.env').read_text().splitlines():
+    if line.strip() and not line.lstrip().startswith('#') and '=' in line:
+        key,value=line.split('=',1)
+        if key.strip()=='SYSTEM_COMFYUI_CONFIG':
+            print(value.strip().strip('"\''))
+            break
+PY
+)
+if [[ -n "$comfy_configuration" ]]; then
+  runuser -u "$APP_USER" -- test -r "$comfy_configuration"
+fi
 check_health() {
   python3 -c 'import json,sys; health=json.load(sys.stdin); assert health["status"]=="ok"; assert sys.argv[1]!="true" or health.get("channelsEnabled") is True and health.get("videoGatewayEnabled") is True' "$gateway_enabled"
 }
