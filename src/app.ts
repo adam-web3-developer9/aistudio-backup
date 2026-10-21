@@ -116,7 +116,7 @@ const MIN_RETAINED_HAILUO_CREDITS = 28;
 /** Old desktop clients omit upload-intent options; reserve the provider's maximum H3 duration. */
 const MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS = 15;
 
-export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; comfyui?: ComfyRuntimeOptions; managedAccountCreditReader?:ManagedAccountCreditReader; managedAccountArchived?:(id:string,reason:ManagedArchiveReason)=>void; trustProxy?: boolean | string[]; warmup?: boolean } = {}) {
+export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; comfyui?: ComfyRuntimeOptions; managedAccountCreditReader?:ManagedAccountCreditReader; managedAccountArchived?:(id:string,reason:ManagedArchiveReason)=>void; trustProxy?: boolean | string[]; warmup?: boolean; onClose?: () => Promise<void> } = {}) {
   if (options.managedGateway && !options.managedChannels) throw new Error('Managed video gateway requires managed channels');
   assertVideoGatewayConfiguration(options.managedGateway === true, config.apiKey);
   assertVideoGatewayProxyConfiguration(options.managedGateway === true, config.mioraProxyUrl);
@@ -125,6 +125,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const uploadIntents = gateway && options.managedChannels ? new MioraUploadIntentStore(options.managedChannels.db, config.apiKey!) : undefined;
   const mioraTransfers = new MioraCosTransferCoordinator();
   const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
+  if (options.onClose) app.addHook('onClose', options.onClose);
   const mioraDiagnosticSink = new MioraDiagnosticSink(app.log);
   app.addHook('onRequest', (request, _reply, done) => {
     withMioraDiagnostics(mioraDiagnosticSink, { requestId:request.id }, done);

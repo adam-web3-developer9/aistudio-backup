@@ -199,6 +199,25 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['1', 'template'])('counts only unbound queue pressure when jobs are bound to %s', async instanceId => {
+    const context = fixture();
+    context.store.registerInstances([instanceId]);
+    context.store.updateInstance(instanceId, { state: 'ready' });
+    for (let index = 0; index < 2; index++) {
+      const job = context.submit();
+      expect(context.store.claim(instanceId, ['render'], clock)?.id).toBe(job.id);
+      context.store.updateJob(job.id, { stage: 'queued', eligible_at: clock + 1_000 });
+      context.store.releaseSlot(job.id);
+    }
+    clock += 1_000;
+    context.submit();
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+    context.submit();
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['no-demand', 'unsupported', 'auto-open-disabled', 'elastic-disabled', 'delayed', 'expired'] as const)('does not create for %s', async scenario => {
     const context = fixture();
     if (scenario !== 'no-demand') {
@@ -559,6 +578,34 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(context.platform.closeInstance).not.toHaveBeenCalled();
     expect(context.platform.releaseInstance).not.toHaveBeenCalled();
     expect(context.store.instance('1')?.idle_since).toBeNull();
+  });
+
+  it.each([
+    { stopped: false, binding: 'unbound' }, { stopped: true, binding: 'unbound' },
+    { stopped: false, binding: 'self' }, { stopped: true, binding: 'self' },
+    { stopped: false, binding: 'other' }, { stopped: true, binding: 'other' },
+  ])('respects queued affinity with $binding binding and stopped=$stopped', async ({ stopped, binding }) => {
+    const context = idleFixture(stopped);
+    context.configuration.instances[0]!.lifecycle = { allowRelease: true, rebuildVerified: true, hourlyCost: 1, storageHourlyCost: 0.1 };
+    const job = context.submit();
+    const instanceId = binding === 'self' ? '1' : '2';
+    if (binding !== 'unbound') {
+      context.store.registerInstances([instanceId]);
+      context.store.updateInstance(instanceId, { state: 'ready' });
+      expect(context.store.claim(instanceId, ['render'], clock)?.id).toBe(job.id);
+      context.store.updateJob(job.id, { stage: 'queued' });
+      context.store.releaseSlot(job.id);
+      context.store.updateInstance('1', { state: stopped ? 'offline' : 'ready' });
+    }
+    await context.lifecycle.tick();
+    expect(context.store.get(job.id)).toMatchObject({ stage: 'queued', instance_id: binding === 'unbound' ? null : instanceId });
+    expect(context.platform.closeInstance).toHaveBeenCalledTimes(binding === 'other' && !stopped ? 1 : 0);
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(binding === 'other' && stopped ? 1 : 0);
+    if (binding === 'other') {
+      expect(stopped ? context.platform.releaseInstance : context.platform.closeInstance).toHaveBeenCalledWith('1');
+    } else {
+      expect(context.store.instance('1')?.idle_since).toBeNull();
+    }
   });
 
   it.each(['running', 'pending'] as const)('does not close or release when the external ComfyUI queue has %s work', async kind => {

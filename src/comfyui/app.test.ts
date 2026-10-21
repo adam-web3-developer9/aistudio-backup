@@ -10,8 +10,70 @@ import { config } from '../config.js';
 import { ChannelStore } from '../system-channels/store.js';
 import type { ComfyService } from './service.js';
 import type { ComfyPoolConfiguration } from './configuration.js';
+import { MemorySystemMailer } from '../system/index.js';
+import { buildSystemWebApp } from '../system/web-app.js';
 
 vi.mock('undici', async original => ({ ...await original<typeof import('undici')>(), fetch: vi.fn(async () => { throw new Error('Unexpected provider request'); }) }));
+
+test.each([false, true])('system shutdown releases the ComfyUI worker before closing SQLite (startup failure: %s)', async startupFailure => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'comfy-system-close-'));
+  const original = { ...config };
+  let app: FastifyInstance | undefined;
+  let db: Database.Database | undefined;
+  const order: string[] = [];
+  const configuration: ComfyPoolConfiguration = {
+    autoOpen: false, pollIntervalMs: 60_000, bootTimeoutMs: 60_000, jobTimeoutMs: 120_000,
+    instances: [], workflows: [],
+  };
+  try {
+    Object.assign(config, { dataDir: path.join(directory, 'data'), apiKey: 'system-close-test-key-at-least-32-characters', mioraProxyUrl: 'http://127.0.0.1:1',
+      hailuoTokenFile: path.join(directory, 'tokens.txt'), dreamMakerAccountFile: path.join(directory, 'dreammaker.txt'),
+      higgsfieldAccountFile: path.join(directory, 'higgsfield.txt'), mioraAccountFile: path.join(directory, 'miora.txt'), mioraImportDir: path.join(directory, 'imports') });
+    await mkdir(config.mioraImportDir);
+    await Promise.all([config.hailuoTokenFile, config.dreamMakerAccountFile, config.higgsfieldAccountFile, config.mioraAccountFile].map(file => writeFile(file, '')));
+    const building = buildSystemWebApp({ databasePath: path.join(directory, 'system.sqlite'), mediaDirectory: path.join(directory, 'media'),
+      secret: 'isolated-system-close-test-secret-at-least-32-characters', baseUrl: 'http://127.0.0.1:3001', mailer: new MemorySystemMailer(), testMode: true,
+      channelsEnabled: true, videoGatewayEnabled: true, credentialKey: Buffer.alloc(32, 1).toString('base64'),
+      comfyui: { configuration, token: 'unused-test-token', fetch: vi.fn(async () => { throw new Error('Unexpected ComfyUI request'); }) },
+      beforeReady: async instance => {
+        app = instance;
+        const service = (instance as unknown as { channelRuntime: { comfy: ComfyService } }).channelRuntime.comfy;
+        db = service.store.db;
+        await service.tick();
+        expect(db.prepare('SELECT COUNT(*) AS count FROM comfy_worker').get()).toEqual({ count: 1 });
+        const releaseWorker = service.store.releaseWorker.bind(service.store);
+        vi.spyOn(service.store, 'releaseWorker').mockImplementation(owner => {
+          expect(db!.open).toBe(true);
+          releaseWorker(owner);
+          expect(db!.prepare('SELECT COUNT(*) AS count FROM comfy_worker').get()).toEqual({ count: 0 });
+          order.push('worker');
+        });
+        const closeDatabase = db.close.bind(db);
+        vi.spyOn(db, 'close').mockImplementation(() => {
+          order.push('database');
+          return closeDatabase();
+        });
+        if (startupFailure) throw new Error('Isolated startup failure');
+      },
+    });
+    if (startupFailure) await expect(building).rejects.toThrow('Isolated startup failure');
+    else {
+      const state = await building;
+      await expect(state.app.close()).resolves.toBeUndefined();
+      await state.runtime.close();
+    }
+    expect(order).toEqual(['worker', 'database']);
+    expect(db!.open).toBe(false);
+  } finally {
+    await app?.close().catch(() => {});
+    if (db?.open) db.close();
+    Object.assign(config, original);
+    vi.restoreAllMocks();
+    const target = path.resolve(directory);
+    if (!target.startsWith(path.resolve(tmpdir()) + path.sep)) throw new Error('Unsafe test cleanup path');
+    await rm(target, { recursive: true, force: true });
+  }
+});
 
 test('authenticated gateway uses SQL for ComfyUI submission, query, list, cancellation and private result retrieval', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'comfy-app-'));

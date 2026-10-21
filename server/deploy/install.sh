@@ -61,5 +61,6 @@ EOF
 install -m 0644 "$directory/aistudio-studio-deploy.timer" /etc/systemd/system/aistudio-studio-deploy.timer
 systemctl daemon-reload
 systemctl enable aistudio-studio.service
+bash "$directory/install-ingress.sh"
 echo 'Installed. Run aistudio-studio-deploy, then enable --now aistudio-studio-deploy.timer after verification.'
 echo 'To enable Miora after deployment, explicitly run: python3 current/server/deploy/enable-video-gateway.py; then restart aistudio-studio.service.'

@@ -27,8 +27,8 @@ export async function buildSystemWebApp(options:SystemWebOptions) {
   const runtime=await createSystemRuntime(options);let app:FastifyInstance | undefined;
   try {
     const channels=new ChannelStore(runtime.db,options.credentialKey);
-    if(options.channelsEnabled){if(!options.credentialKey)throw new Error('Channel worker requires CHANNEL_CREDENTIAL_KEY');const {buildApp}=await import('../app.js');app=await buildApp({managedChannels:channels,managedGateway:options.videoGatewayEnabled,comfyui:options.comfyui,managedAccountCreditReader:options.managedAccountCreditReader,managedAccountArchived:(id,reason)=>runtime.store.audit({actorId:null,action:'channel.account.autoArchive',targetType:'channelAccount',targetId:id,metadata:{reason}}),trustProxy:options.trustProxy,warmup:false});}
-    else app=Fastify({logger:systemLoggerOptions,bodyLimit:2*1024*1024,trustProxy:options.trustProxy??false});
+    if(options.channelsEnabled){if(!options.credentialKey)throw new Error('Channel worker requires CHANNEL_CREDENTIAL_KEY');const {buildApp}=await import('../app.js');app=await buildApp({managedChannels:channels,managedGateway:options.videoGatewayEnabled,comfyui:options.comfyui,managedAccountCreditReader:options.managedAccountCreditReader,managedAccountArchived:(id,reason)=>runtime.store.audit({actorId:null,action:'channel.account.autoArchive',targetType:'channelAccount',targetId:id,metadata:{reason}}),trustProxy:options.trustProxy,warmup:false,onClose:()=>runtime.close()});}
+    else {app=Fastify({logger:systemLoggerOptions,bodyLimit:2*1024*1024,trustProxy:options.trustProxy??false});app.addHook('onClose',async()=>runtime.close());}
     app.setErrorHandler<Error & {statusCode?:number}>((error,_request,reply)=>{if(error instanceof SystemError)return reply.code(error.statusCode).send({code:error.code,message:error.message});return reply.code(error.statusCode&&error.statusCode<500?error.statusCode:500).send({code:'REQUEST_FAILED',message:'Request failed'});});
     app.addHook('onRequest',async(request,reply)=>{
       if(!request.url.startsWith('/api/'))return;
@@ -37,7 +37,7 @@ export async function buildSystemWebApp(options:SystemWebOptions) {
         await runtime.authenticate(request);
       }
     });
-    await registerSystemRoutes(app,{runtime});
+    await registerSystemRoutes(app,{runtime,closeRuntime:false});
     const packageShares=registerPackageShareRoutes(app,{runtime,enabled:options.packageSharesEnabled});
     const mediaPolicy=resolveMediaPolicy(options.mediaPolicy);
     app.get('/api/system/media-policy',async request=>{await runtime.authenticate(request);return {streaming:true,deprecatedQuotaPolicy:true,maxFileBytes:mediaPolicy.maxFileBytes,projectBytes:mediaPolicy.projectBytes,ownerBytes:mediaPolicy.ownerBytes};});

@@ -117,8 +117,9 @@ export class ComfyLifecycle {
       remaining--;
     }
   }
-  private compatible(instance: Pick<InstanceConfiguration, 'workflowIds'>) {
-    return this.pending().filter(job => instance.workflowIds.includes((JSON.parse(job.input) as FrozenComfyInput).workflowId));
+  private compatible(instance: Pick<InstanceConfiguration, 'workflowIds'> & Partial<Pick<InstanceConfiguration, 'id'>>) {
+    return this.pending().filter(job => (!job.instance_id || job.instance_id === instance.id)
+      && instance.workflowIds.includes((JSON.parse(job.input) as FrozenComfyInput).workflowId));
   }
   private reservedCost(): number | null {
     let total = 0;
@@ -156,7 +157,7 @@ export class ComfyLifecycle {
       if (!template.skuPriceUnitVerified || !Number.isFinite(template.skuPriceToHourlyFactor) || template.skuPriceToHourlyFactor <= 0) {
         this.lastError = 'COMFY_SKU_PRICE_UNIT_UNVERIFIED'; continue;
       }
-      const demand = this.compatible(template).filter(job => !job.instance_id).length;
+      const demand = this.compatible({ workflowIds: template.workflowIds }).length;
       if (!demand) continue;
       const supported = configuration.instances.filter(instance => !store.instance(instance.id)?.draining
         && instance.workflowIds.some(id => template.workflowIds.includes(id)));
@@ -174,7 +175,7 @@ export class ComfyLifecycle {
         || Number(sku.price) * template.skuPriceToHourlyFactor > template.hourlyCost) {
         this.lastError = 'COMFY_SKU_QUOTE_UNVERIFIED'; continue;
       }
-      if (!this.compatible(template).some(job => !job.instance_id)) return;
+      if (!this.compatible({ workflowIds: template.workflowIds }).some(job => !job.instance_id)) return;
       const key = randomUUID();
       const resource: ComfyResource = { key, name: 'hailuo-' + key, state: 'creating', instance_id: null, configuration: null,
         template_id: template.id, hourly_cost: template.hourlyCost, storage_hourly_cost: template.storageHourlyCost,

@@ -7,6 +7,16 @@ accounts, administration, projects and private media on one HTTPS origin.
 Channels remain disabled until their production accounts are configured and the
 gateway is explicitly enabled.
 
+Nginx connects through the separate loopback ingress on port 3002. Install it
+with install-ingress.sh and verify its health endpoint before switching an
+existing Nginx upstream from 3001 to 3002 with a tested configuration reload.
+The ingress is not restarted by application deployments. It holds new connections
+for up to 90 seconds while the application is restarting, with a 1024-connection
+limit. Only refused connections are retried, before any request bytes are
+forwarded; requests already delivered to the application are never replayed.
+It does not hide provider errors or guarantee availability beyond that bounded
+wait. Updating an active ingress requires a separate drain window.
+
 ## First installation
 
 Use the existing SSH helper / key. Upload this directory to a temporary server
