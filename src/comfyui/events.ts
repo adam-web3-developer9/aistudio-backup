@@ -18,6 +18,12 @@ export interface ComfyEventDetails {
   httpStatus?: number;
   nodeId?: string;
   errorType?: string;
+  requestType?: 'timeout' | 'connection' | 'http' | 'parse';
+  elapsedMs?: number;
+  attempt?: number;
+  plannedPromptId?: string;
+  acceptedPromptId?: string;
+  attemptMarker?: string;
 }
 export interface ComfyEventInput {
   jobId?: string;
@@ -78,7 +84,8 @@ function input(value: unknown): ComfyEventInput {
   let details: ComfyEventDetails | undefined;
   if (value.details !== undefined) {
     fields(value.details, ['fromStage', 'toStage', 'fromState', 'toState', 'completed', 'total', 'areaName', 'gpuModel',
-      'upstreamCode', 'httpStatus', 'nodeId', 'errorType']);
+      'upstreamCode', 'httpStatus', 'nodeId', 'errorType', 'requestType', 'elapsedMs', 'attempt',
+      'plannedPromptId', 'acceptedPromptId', 'attemptMarker']);
     member(value.details.fromStage, stages);
     member(value.details.toStage, stages);
     member(value.details.fromState, states);
@@ -90,6 +97,12 @@ function input(value: unknown): ComfyEventInput {
     safeCode(value.details.upstreamCode);
     safeCode(value.details.nodeId);
     safeCode(value.details.errorType);
+    member(value.details.requestType, ['timeout', 'connection', 'http', 'parse']);
+    counter(value.details.elapsedMs);
+    counter(value.details.attempt);
+    safeCode(value.details.plannedPromptId);
+    safeCode(value.details.acceptedPromptId);
+    identifier(value.details.attemptMarker);
     if (value.details.httpStatus !== undefined && (typeof value.details.httpStatus !== 'number' ||
         !Number.isInteger(value.details.httpStatus) || value.details.httpStatus < 100 || value.details.httpStatus > 599)) invalid();
     details = Object.fromEntries(Object.entries(value.details).filter(([, item]) => item !== undefined));

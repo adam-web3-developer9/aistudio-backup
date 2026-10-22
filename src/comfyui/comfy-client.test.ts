@@ -180,6 +180,20 @@ describe('ComfyClient native contract', () => {
 });
 
 describe('findAttempt bounded recovery', () => {
+  it('reports an accepted queue marker before a later history request fails', async () => {
+    const { client } = setup(Response.json({ queue_running: [queued('accepted')], queue_pending: [] }), new Error('lost history'));
+    const observed: string[] = [];
+    await expect(client.findAttempt('attempt', id => observed.push(id))).rejects.toMatchObject({ code: 'TRANSPORT_ERROR' });
+    expect(observed).toEqual(['accepted']);
+  });
+  it('reads complete native history before treating a full recent window as absent', async () => {
+    const recent = Object.fromEntries(Array.from({ length: 1000 }, (_, index) => [`other-${index}`, { prompt: queued(`other-${index}`, 'other-attempt') }]));
+    const { client, fetcher } = setup(Response.json({ queue_running: [], queue_pending: [] }), Response.json(recent),
+      Response.json({ original: { prompt: queued('original') }, ...recent }));
+    await expect(client.findAttempt('attempt')).resolves.toEqual({ promptId: 'original' });
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual(['https://comfy.example/queue',
+      'https://comfy.example/history?max_items=1000', 'https://comfy.example/history']);
+  });
   it.each(['running', 'pending', 'history'])('finds marker in %s and deduplicates the same prompt', async (location) => {
     const { client, fetcher } = setup(
       Response.json({ queue_running: location === 'running' ? [queued('one')] : [], queue_pending: location === 'pending' ? [queued('one')] : [] }),
@@ -203,6 +217,13 @@ describe('findAttempt bounded recovery', () => {
 });
 
 describe('safe native diagnostics and GPU policy', () => {
+  it('keeps only request category, status and elapsed time when native submission loses its response', async () => {
+    const connection = await setup(Object.assign(new Error('SECRET_URL_TOKEN_PROMPT'), { cause: { code: 'ENOTFOUND' } })).client.submit(input).catch(error => error);
+    expect(connection).toMatchObject({ code: 'SUBMISSION_UNKNOWN', details: { requestType: 'connection', errorType: 'ENOTFOUND', elapsedMs: expect.any(Number) } });
+    const parse = await setup(new Response('SECRET_BODY')).client.submit(input).catch(error => error);
+    expect(parse).toMatchObject({ code: 'SUBMISSION_UNKNOWN', details: { requestType: 'parse', httpStatus: 200, elapsedMs: expect.any(Number) } });
+    expect(JSON.stringify([connection, parse])).not.toContain('SECRET');
+  });
   it('retains a validation node and error type but never logs provider free text', async () => {
     const { client, fetcher } = setup(Response.json({
       error: { type: 'prompt_outputs_failed_validation', message: 'SECRET_PROMPT' },

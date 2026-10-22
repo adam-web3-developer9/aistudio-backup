@@ -20,6 +20,8 @@ export const comfyInputsSchema = z.object({
   inputs: z.record(z.string(), z.object({ name: z.string().min(1).max(200), subfolder: z.string().min(1).max(250), type: z.literal('input') }).strict()),
 }).strict();
 
+export const comfyRetrySchema = z.object({ requestKey: z.string().regex(/^[A-Za-z0-9_.:-]{1,200}$/) }).strict();
+
 export const comfyEventQuerySchema = z.object({ after: z.coerce.number().int().nonnegative().default(0), limit: z.coerce.number().int().min(1).max(100).default(50) }).strict();
 
 export function registerComfyAdminRoutes(app: FastifyInstance, runtime: SystemRuntime, service: ComfyService): void {

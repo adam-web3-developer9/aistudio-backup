@@ -171,6 +171,24 @@ test('authenticated gateway uses SQL for ComfyUI submission, query, list, cancel
     expect(cancelled.json()).toMatchObject({ status: 'failed', stage: 'cancelled', remoteStopped: false });
     await service.tick();
     expect(submitted).toBe(1);
+    const retryJob = service.submit({ ...body, adapterId: 'comfyui-v1', requestKey: 'explicit-retry-window' }).job;
+    service.store.claim(configuration.instances[0]!.id, ['tested-workflow']);
+    service.store.updateJob(retryJob.id, { stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED', deadline: Date.now() - 1, provider_confirmed: 0 });
+    const beforeRetry = service.get(retryJob.id);
+    const retryUrl = `/v1/jobs/${retryJob.id}/retry`;
+    const retryBody = { requestKey: `${retryJob.id}:${Date.now()}` };
+    expect((await app.inject({ method: 'POST', url: retryUrl, payload: retryBody })).statusCode).toBe(401);
+    expect(service.get(retryJob.id)).toEqual(beforeRetry);
+    const retry = await app.inject({ method: 'POST', url: retryUrl, headers, payload: retryBody });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({ id: retryJob.id, stage: 'submitting' });
+    const renewed = service.get(retryJob.id);
+    expect(renewed.deadline).toBeGreaterThan(beforeRetry.deadline);
+    expect(renewed.prompt_id).toBe(beforeRetry.prompt_id);
+    expect(renewed.input).toBe(beforeRetry.input);
+    expect((await app.inject({ method: 'POST', url: retryUrl, headers, payload: retryBody })).statusCode).toBe(200);
+    expect(service.get(retryJob.id).deadline).toBe(renewed.deadline);
+    expect(submitted).toBe(1);
   } finally {
     await app?.close();
     db.close();

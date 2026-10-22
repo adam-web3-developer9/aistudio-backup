@@ -32,9 +32,9 @@ export function assertVideoGatewayRequest(request: FastifyRequest, enabled: bool
   const pathname = request.url.split('?')[0]!;
   const uploadIntentPath = /^\/v1\/upload-intents\/[A-Za-z0-9_-]{1,200}$/.test(pathname);
   const intentAction = /^\/v1\/upload-intents\/[A-Za-z0-9_-]{1,200}\/(complete|finalize|manifest|manifest-stream|status|items|diagnostics)$/.exec(pathname)?.[1];
-  const comfyAction = /^\/v1\/jobs\/(job_gateway_comfy_[A-Za-z0-9_-]{1,170})\/(result|cancel|reconcile|inputs|collected|events)$/.exec(pathname)?.[2];
+  const comfyAction = /^\/v1\/jobs\/(job_gateway_comfy_[A-Za-z0-9_-]{1,170})\/(result|cancel|reconcile|retry|inputs|collected|events)$/.exec(pathname)?.[2];
   const allowed = request.method === 'POST' && (pathname === '/v1/assets' || pathname === '/v1/jobs'
-      || pathname === '/v1/upload-intents' || pathname === '/v1/upload-intents/staged' || intentAction === 'complete' || intentAction === 'finalize' || comfyAction === 'cancel' || comfyAction === 'reconcile' || comfyAction === 'inputs' || comfyAction === 'collected')
+      || pathname === '/v1/upload-intents' || pathname === '/v1/upload-intents/staged' || intentAction === 'complete' || intentAction === 'finalize' || comfyAction === 'cancel' || comfyAction === 'reconcile' || comfyAction === 'retry' || comfyAction === 'inputs' || comfyAction === 'collected')
     || request.method === 'PUT' && (intentAction === 'manifest' || intentAction === 'manifest-stream')
     || request.method === 'GET' && (pathname === '/v1/jobs' || pathname.startsWith('/v1/jobs/') && gatewayJobId.test(pathname.slice('/v1/jobs/'.length))
       || uploadIntentPath || intentAction === 'status' || intentAction === 'items' || intentAction === 'diagnostics' || comfyAction === 'result' || comfyAction === 'events');

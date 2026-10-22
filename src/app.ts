@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { createComfyService, type ComfyRuntimeOptions } from './comfyui/runtime.js';
-import { comfyEventQuerySchema, comfyInputsSchema, comfyJobSchema } from './comfyui/routes.js';
+import { comfyEventQuerySchema, comfyInputsSchema, comfyJobSchema, comfyRetrySchema } from './comfyui/routes.js';
 import { validMediaSignature } from './system-media/routes.js';
 import { randomUUID } from 'node:crypto';
 import { ManagedSessionStore } from './system-channels/session-store.js';
@@ -1460,6 +1460,13 @@ app.get('/v1/jobs/:id/result', async (request, reply) => {
       const { id } = request.params as { id: string };
       await comfy.reconcile(id);
       return reply.send(comfy.publicJob(comfy.get(id)));
+    });
+    app.post('/v1/jobs/:id/retry', async (request, reply) => {
+      const { id } = request.params as { id: string };
+      comfy.get(id);
+      const parsed = comfyRetrySchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send(errorBody('INVALID_INPUT', 'Invalid retry request'));
+      return reply.send(comfy.publicJob(await comfy.resumeSubmission(id, parsed.data.requestKey)));
     });
   }
 

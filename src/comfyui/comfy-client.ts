@@ -1,4 +1,7 @@
-export interface ComfyDiagnostics { httpStatus?: number; upstreamCode?: string; nodeId?: string; errorType?: string }
+export interface ComfyDiagnostics {
+  httpStatus?: number; upstreamCode?: string; nodeId?: string; errorType?: string;
+  requestType?: 'timeout' | 'connection' | 'http' | 'parse'; elapsedMs?: number;
+}
 export class ComfyError extends Error {
   constructor(public readonly code: string, message: string, public readonly uncertain?: boolean, public readonly details?: ComfyDiagnostics) {
     super(message);
@@ -54,6 +57,7 @@ export class ComfyClient {
   private readonly fetcher: typeof fetch;
   private readonly timeoutMs: number;
   private readonly allowedGpuModels?: readonly string[];
+  private readonly responseStartedAt = new WeakMap<Response, number>();
 
   constructor(options: { baseUrl: string; headers?: Record<string, string>; fetch?: typeof fetch; timeoutMs?: number; allowedGpuModels?: readonly string[] }) {
     let url: URL;
@@ -70,6 +74,7 @@ export class ComfyClient {
   }
 
   private async request(path: string, body?: object | FormData, submitting = false, streaming = false): Promise<Response> {
+    const startedAt = Date.now();
     const headers = new Headers(this.headers);
     const multipart = body instanceof FormData;
     if (multipart) headers.delete('content-type');
@@ -85,14 +90,18 @@ export class ComfyClient {
         method: body === undefined ? 'GET' : 'POST', headers, body: serialized,
         redirect: 'error', signal: headerController?.signal ?? AbortSignal.timeout(this.timeoutMs)
       });
-    } catch {
+    } catch (error) {
+      const failure = error as { name?: string; code?: unknown; cause?: { code?: unknown } } | undefined;
+      const errorType = safeIdentifier(failure?.cause?.code ?? failure?.code ?? failure?.name);
       throw new ComfyError(submitting ? 'SUBMISSION_UNKNOWN' : 'TRANSPORT_ERROR',
-        submitting ? 'Submission outcome unknown; reconcile before any further action' : 'ComfyUI request failed', submitting);
+        submitting ? 'Submission outcome unknown; reconcile before any further action' : 'ComfyUI request failed', submitting,
+        { requestType: ['AbortError', 'TimeoutError', 'UND_ERR_CONNECT_TIMEOUT'].includes(errorType ?? '') ? 'timeout' : 'connection', errorType,
+          elapsedMs: Math.max(0, Date.now() - startedAt) });
     } finally {
       if (headerTimer !== undefined) clearTimeout(headerTimer);
     }
     if (!response.ok) {
-      const details: ComfyDiagnostics = { httpStatus: response.status };
+      const details: ComfyDiagnostics = { httpStatus: response.status, requestType: 'http' };
       const reader = response.body?.getReader();
       if (reader) {
         try {
@@ -120,14 +129,21 @@ export class ComfyClient {
         } catch {} finally { reader.releaseLock(); }
       }
       const rejected = submitting && response.status >= 400 && response.status < 500 && response.status !== 408;
+      details.elapsedMs = Math.max(0, Date.now() - startedAt);
       throw new ComfyError(submitting ? rejected ? 'SUBMISSION_REJECTED' : 'SUBMISSION_UNKNOWN' : 'HTTP_ERROR',
         `ComfyUI HTTP ${response.status}`, submitting ? !rejected : undefined, details);
     }
+    this.responseStartedAt.set(response, startedAt);
     return response;
   }
 
   private async json(response: Response): Promise<unknown> {
-    try { return await response.json(); } catch { return invalid(); }
+    try { return await response.json(); } catch (error) {
+      const errorType = safeIdentifier((error as Error)?.name);
+      throw new ComfyError('INVALID_RESPONSE', 'Unrecognized ComfyUI response', undefined,
+        { requestType: ['AbortError', 'TimeoutError'].includes(errorType ?? '') ? 'timeout' : 'parse', errorType,
+          httpStatus: response.status, elapsedMs: Math.max(0, Date.now() - (this.responseStartedAt.get(response) ?? Date.now())) });
+    }
   }
 
   async health(): Promise<void> {
@@ -169,21 +185,31 @@ export class ComfyClient {
       const value = await this.json(response);
       if (!record(value) || typeof value.prompt_id !== 'string' || !value.prompt_id.trim() || /[\x00-\x1f\x7f]/.test(value.prompt_id)) invalid();
       return { promptId: value.prompt_id };
-    } catch {
-      throw new ComfyError('SUBMISSION_UNKNOWN', 'Submission acknowledgement unknown; reconcile before any further action', true);
+    } catch (error) {
+      throw new ComfyError('SUBMISSION_UNKNOWN', 'Submission acknowledgement unknown; reconcile before any further action', true,
+        { requestType: 'parse', httpStatus: response.status,
+          elapsedMs: Math.max(0, Date.now() - (this.responseStartedAt.get(response) ?? Date.now())),
+          ...(error instanceof ComfyError ? error.details : {}) });
     }
   }
 
-  async findAttempt(attemptId: string): Promise<{ promptId: string } | undefined> {
+  async findAttempt(attemptId: string, onConfirmed?: (promptId: string) => void): Promise<{ promptId: string } | undefined> {
     if (!attemptId) throw new ComfyError('INVALID_INPUT', 'Attempt identifier is required');
     const queue = await this.queue();
     const matches = new Set([...queue.running, ...queue.pending].filter((item) => item.marker === attemptId).map((item) => item.promptId));
-    const history = await this.json(await this.request('/history?max_items=1000'));
+    for (const promptId of matches) onConfirmed?.(promptId);
+    let history = await this.json(await this.request('/history?max_items=1000'));
     if (!record(history)) invalid();
+    // Absence in the recent window is not evidence for another submission.
+    // Native ComfyUI bounds its own full history; read it only when the window may be truncated.
+    if (Object.keys(history).length >= 1000) {
+      history = await this.json(await this.request('/history'));
+      if (!record(history)) invalid();
+    }
     for (const entry of Object.values(history)) {
       if (!record(entry) || !Array.isArray(entry.prompt)) invalid();
       const item = tuple(entry.prompt);
-      if (item.marker === attemptId) matches.add(item.promptId);
+      if (item.marker === attemptId) { matches.add(item.promptId); onConfirmed?.(item.promptId); }
     }
     if (matches.size > 1) throw new ComfyError('AMBIGUOUS_ATTEMPT', 'Multiple prompts match this attempt');
     const promptId = [...matches][0];

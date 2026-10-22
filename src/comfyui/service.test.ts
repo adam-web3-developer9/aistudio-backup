@@ -324,7 +324,7 @@ describe('ComfyService pool safety', () => {
     expect(second.client.history).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])('defers unresolved timed-out work without freeing its slot or closing the instance (ack lost: %s)', async (ackLost) => {
+  it.each([false, true])('retains accepted timed-out work, while a fully absent unaccepted task can leave its empty slot (ack lost: %s)', async (ackLost) => {
     vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
     const { service, submit, store, db, client, platform } = fixture();
     if (ackLost) {
@@ -341,10 +341,10 @@ describe('ComfyService pool safety', () => {
     }
     db.prepare('UPDATE comfy_jobs SET deadline=? WHERE id=?').run(Date.now() - 1, job.id);
     await service.tick();
-    expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id,
-      error_code: 'COMFY_REMOTE_UNCONFIRMED', next_action_at: Date.now() + 30_000 });
+    expect(store.instance('1')).toMatchObject({ state: ackLost ? 'ready' : 'offline', job_id: ackLost ? null : job.id });
+    if (!ackLost) expect(store.instance('1')).toMatchObject({ error_code: 'COMFY_REMOTE_UNCONFIRMED', next_action_at: Date.now() + 30_000 });
     expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
-    expect(() => service.control('1', 'close')).toThrow();
+    if (!ackLost) expect(() => service.control('1', 'close')).toThrow();
     expect(client.submit).toHaveBeenCalledTimes(1);
     expect(platform.closeInstance).not.toHaveBeenCalled();
   });
@@ -355,6 +355,8 @@ describe('ComfyService pool safety', () => {
     if (ackLost) client.submit.mockRejectedValueOnce(new ComfyError('SUBMISSION_UNKNOWN', 'Ack lost', true));
     const job = submit('late-unknown-success');
     await service.tick();
+    // Visible native work keeps this uncertain slot occupied until its late result.
+    if (ackLost) client.queue.mockResolvedValue({ running: [{ promptId: 'other-visible-work', marker: 'other' }], pending: [] });
     client.history.mockResolvedValue({ state: 'missing', outputs: [] });
     db.prepare('UPDATE comfy_jobs SET deadline=? WHERE id=?').run(Date.now() - 1, job.id);
     await service.tick();
@@ -423,6 +425,7 @@ describe('ComfyService pool safety', () => {
     client.history.mockResolvedValue({ state: 'missing', outputs: [] });
     const job = submit('late-unknown-failure');
     await service.tick();
+    client.queue.mockResolvedValue({ running: [{ promptId: 'other-visible-work', marker: 'other' }], pending: [] });
     db.prepare('UPDATE comfy_jobs SET deadline=? WHERE id=?').run(Date.now() - 1, job.id);
     await service.tick();
     expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id, next_action_at: Date.now() + 30_000 });

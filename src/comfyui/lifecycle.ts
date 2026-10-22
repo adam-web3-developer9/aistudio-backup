@@ -310,7 +310,7 @@ export class ComfyLifecycle {
     let instance = store.instance(configuration.id)!;
     if (instance.state === 'closing' || instance.state === 'starting' || instance.state === 'waiting_capacity' || instance.draining) return;
     const policy = schedulerPolicy(this.options.configuration);
-    if (store.hasUnresolvedWork(instance.id) || this.compatible(configuration).length) {
+    if (store.hasComputeWork(instance.id) || this.compatible(configuration).length) {
       if (instance.idle_since !== null) store.updateInstance(instance.id, { idle_since: null });
       return;
     }
@@ -323,9 +323,11 @@ export class ComfyLifecycle {
     if (warm.some(item => item.id === instance.id)) return;
     const status = await platform.getInstanceStatus(instance.id);
     this.options.assertWorker();
-    if (store.hasUnresolvedWork(instance.id) || this.compatible(configuration).length) return;
+    if (store.hasComputeWork(instance.id) || this.compatible(configuration).length) return;
     if (['22', '26'].includes(status)) {
       if (instance.stopped_at === null) store.updateInstance(instance.id, { state: 'offline', stopped_at: Date.now(), idle_policy_applied_at: null });
+      // A terminal execution may stop consuming GPU while its original disk and IDs remain recoverable.
+      if (store.hasUnresolvedWork(instance.id)) return;
       const stopped = store.instance(instance.id)!;
       const elastic = this.options.configuration.elastic;
       const releaseAfter = elastic?.stoppedRetention && !retained.has(instance.id)
@@ -356,7 +358,7 @@ export class ComfyLifecycle {
     await client.health();
     const queue = await client.queue();
     this.options.assertWorker();
-    if (queue.running.length || queue.pending.length || store.hasUnresolvedWork(instance.id) || this.compatible(configuration).length) return;
+    if (queue.running.length || queue.pending.length || store.hasComputeWork(instance.id) || this.compatible(configuration).length) return;
     store.updateInstance(instance.id, { state: 'closing', action_started_at: Date.now(), action_sent: 1, idle_policy_applied_at: null });
     await platform.closeInstance(instance.id);
   }

@@ -773,6 +773,38 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(context.platform.releaseInstance).not.toHaveBeenCalled();
   });
 
+  it('stops GPU for a terminal unconfirmed result without releasing its recovery disk or execution identity', async () => {
+    const context = fixture({ autoOpen: false });
+    context.configuration.instances[0]!.lifecycle = { allowRelease: true, rebuildVerified: true, hourlyCost: 1, storageHourlyCost: 0.1 };
+    const job = context.submit();
+    expect(context.store.claim('1', ['render'], clock)?.id).toBe(job.id);
+    context.store.updateJob(job.id, { stage: 'failed', provider_confirmed: 1,
+      error_code: 'COMFY_REMOTE_UNCONFIRMED', deadline: clock - 1 });
+    const originalJob = context.store.get(job.id);
+    await context.lifecycle.tick();
+    expect(context.store.instance('1')?.idle_since).toBe(clock);
+    expect(context.platform.closeInstance).not.toHaveBeenCalled();
+    clock += 300_000;
+    context.platform.closeInstance.mockImplementation(async id => {
+      expect(id).toBe('1');
+      expect(context.store.instance('1')).toMatchObject({ state: 'closing', job_id: job.id, action_sent: 1 });
+    });
+    await context.lifecycle.tick();
+    expect(context.client.health).toHaveBeenCalledOnce();
+    expect(context.client.queue).toHaveBeenCalledOnce();
+    expect(context.platform.closeInstance).toHaveBeenCalledExactlyOnceWith('1');
+    expect(context.store.get(job.id)).toEqual(originalJob);
+    context.platform.getInstanceStatus.mockResolvedValue('22');
+    context.store.updateInstance('1', { state: 'offline', stopped_at: clock });
+    clock += context.configuration.elastic!.releaseAfterMs;
+    await context.lifecycle.tick();
+    expect(context.store.hasUnresolvedWork('1')).toBe(true);
+    expect(context.store.instance('1')?.job_id).toBe(job.id);
+    expect(context.configuration.instances.map(instance => instance.id)).toEqual(['1']);
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+    expect(context.platform.closeInstance).toHaveBeenCalledTimes(1);
+  });
+
   it('retains the configured minimum number of warm instances', async () => {
     const context = idleFixture();
     context.configuration.scheduler!.minWarmInstances = 1;

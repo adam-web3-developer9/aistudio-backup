@@ -525,32 +525,32 @@ describe('direct upload reservation recovery after external GPU shutdown', () =>
     expect(restarted.client.submit).not.toHaveBeenCalled();
   });
 
-  it('restores health and idle policy before returning to busy, then confirms and submits the original job exactly once', async () => {
+  it('restores health and clears GPU idle shutdown before returning to busy, then submits the original job exactly once', async () => {
     const { service, store, platform, client, job, receipt, startedAt } = await reservedUpload();
-    const setter = vi.fn<NonNullable<ComfyServiceOptions['platform']['setGpuIdleShutdown']>>().mockResolvedValue(undefined);
-    service.options.platform.setGpuIdleShutdown = setter;
+    const clear = vi.fn<NonNullable<ComfyServiceOptions['platform']['clearGpuIdleShutdown']>>().mockResolvedValue(undefined);
+    service.options.platform.clearGpuIdleShutdown = clear;
     await service.tick();
-    expect(setter).not.toHaveBeenCalled();
+    expect(clear).not.toHaveBeenCalled();
     platform.getInstanceStatus.mockResolvedValue('11');
     await service.tick();
     platform.getInstanceStatus.mockResolvedValue('2');
     vi.mocked(Date.now).mockReturnValue(startedAt + 1_000);
     await service.tick();
     expect(client.health).toHaveBeenCalledTimes(1);
-    expect(setter).toHaveBeenCalledExactlyOnceWith('1');
+    expect(clear).toHaveBeenCalledExactlyOnceWith('1');
     expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id,
-      action_started_at: null, idle_policy_applied_at: startedAt + 1_000 });
+      action_started_at: null, idle_policy_applied_at: null });
     expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', direct_inputs: null, prompt_id: job.prompt_id });
     expect(client.submit).not.toHaveBeenCalled();
     await service.tick();
-    expect(client.health).toHaveBeenCalledTimes(1);
-    expect(setter).toHaveBeenCalledTimes(1);
+    expect(client.health).toHaveBeenCalledTimes(2);
+    expect(clear).toHaveBeenCalledTimes(1);
     service.completeInputs(job.id, receipt(job.id));
     await service.tick();
     service.completeInputs(job.id, receipt(job.id));
     await service.tick();
     expect(client.submit).toHaveBeenCalledTimes(1);
-    expect(client.submit.mock.calls[0]![0]).toMatchObject({ attemptId: job.id, promptId: job.prompt_id });
+    expect(client.submit.mock.calls[0]![0]).toMatchObject({ attemptId: expect.stringContaining(job.id + '_native_'), promptId: job.prompt_id });
     expect(platform.openInstance).toHaveBeenCalledTimes(1);
   });
 
