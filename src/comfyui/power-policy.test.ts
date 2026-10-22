@@ -36,7 +36,7 @@ test('cancels the legacy timer for running instances once per power cycle and ag
   expect(clearGpuIdleShutdown).toHaveBeenCalledTimes(3);
 });
 
-test('a cancellation failure records the real error, preserves work, and retries without blocking the caller', async () => {
+test('a cancellation rejection is not repeated, while a transient failure retries without blocking work', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
   const { store, policy, clearGpuIdleShutdown } = fixture();
   clearGpuIdleShutdown.mockRejectedValueOnce(new AigateError('BUSINESS_REJECTED', 'private provider text', '40301'));
@@ -49,6 +49,26 @@ test('a cancellation failure records the real error, preserves work, and retries
   expect(clearGpuIdleShutdown).toHaveBeenCalledTimes(1);
   clock.mockReturnValue(Date.now() + 30_000);
   await policy.reconcile('1', '2');
+  expect(clearGpuIdleShutdown).toHaveBeenCalledTimes(1);
+  await policy.reconcile('1', '11');
+  await policy.reconcile('1', '2');
+  expect(clearGpuIdleShutdown).toHaveBeenCalledTimes(1);
+  await policy.reconcile('1', '22');
+  await policy.reconcile('1', '2');
   expect(clearGpuIdleShutdown).toHaveBeenCalledTimes(2);
   expect(store.events.list({ instanceId: '1' }).at(-1)?.code).toBe('COMFY_GPU_IDLE_CLEARED');
+
+  const transient = fixture();
+  transient.clearGpuIdleShutdown.mockRejectedValueOnce(new AigateError('NETWORK_ERROR', 'private network detail'));
+  const original = transient.store.instance('1');
+  await expect(transient.policy.reconcile('1', '2')).resolves.toBeUndefined();
+  await transient.policy.reconcile('1', '2');
+  expect(transient.clearGpuIdleShutdown).toHaveBeenCalledTimes(1);
+  expect(transient.store.instance('1')).toEqual(original);
+  expect(transient.store.events.list({ instanceId: '1' }).at(-1)).toMatchObject({ code: 'COMFY_GPU_IDLE_CLEAR_FAILED',
+    details: { errorType: 'NETWORK_ERROR' } });
+  clock.mockReturnValue(Date.now() + 30_000);
+  await transient.policy.reconcile('1', '2');
+  expect(transient.clearGpuIdleShutdown).toHaveBeenCalledTimes(2);
+  expect(transient.store.events.list({ instanceId: '1' }).at(-1)?.code).toBe('COMFY_GPU_IDLE_CLEARED');
 });

@@ -498,7 +498,7 @@ describe('capacity scheduling with SQLite and mock clients', () => {
         statuses.set('1', '2');
         store.updateInstance('1', { state: 'ready' });
       }
-      idlePolicyClearer.mockRejectedValue({ code: 'BUSINESS_REJECTED' });
+      idlePolicyClearer.mockRejectedValue({ code: 'NETWORK_ERROR' });
       const job = submit();
       await service.tick();
       await service.tick();

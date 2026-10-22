@@ -293,13 +293,13 @@ test.each([
   expect(clearGpuIdleShutdown).toHaveBeenCalledTimes(scenario === 'missing' ? 0 : 1);
 });
 
-test('rejected GPU idle cancellation does not block dispatch or query and recovers on its next retry', async () => {
+test('transient GPU idle cancellation failure does not block dispatch or query and recovers on its next retry', async () => {
   const { service, store, platform, clients, submit } = fixture();
   const now = Date.now();
   vi.spyOn(Date, 'now').mockReturnValue(now);
   const setGpuIdleShutdown = vi.fn();
   Object.assign(platform, { setGpuIdleShutdown });
-  platform.clearGpuIdleShutdown.mockRejectedValueOnce(new AigateError('BUSINESS_REJECTED', 'Timer cancellation rejected'));
+  platform.clearGpuIdleShutdown.mockRejectedValueOnce(new AigateError('NETWORK_ERROR', 'Timer cancellation connection failed'));
   const job = submit('timer-recovery');
   await service.tick();
   expect(store.instance('1')).toMatchObject({ idle_policy_applied_at: null, error_code: null });
