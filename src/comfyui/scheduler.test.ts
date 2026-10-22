@@ -137,6 +137,128 @@ test('a stopped instance with an uncertain submission is woken for the original 
   expect(service.get(job.id).stage).toBe('running');
 });
 
+test.each(['submitting', 'running'] as const)('expired %s work retains its slot without repeatedly waking a stopped instance across restart', async stage => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+  const { service, store, platform, clients, submit } = fixture();
+  const job = submit('expired-stopped');
+  await service.tick();
+  store.updateJob(job.id, { stage, provider_confirmed: stage === 'running' ? 1 : 0, deadline: Date.now() - 1 });
+  store.updateInstance('1', { state: 'starting', action_sent: 1, action_started_at: Date.now() - 60_001 });
+  platform.getInstanceStatus.mockResolvedValue('22');
+  await service.tick();
+  expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED', prompt_id: job.prompt_id });
+  expect(store.instance('1')).toMatchObject({ state: 'offline', job_id: job.id, action_sent: 0, action_started_at: null,
+    error_code: 'COMFY_RECOVERY_PAUSED', stopped_at: Date.now() });
+  expect(service.publicJob(service.get(job.id)).progress.message).toContain('已暂停自动开机恢复');
+  await service.close();
+  const restarted = new ComfyService(service.options);
+  try {
+    for (const elapsed of [600_001, 3_600_000, 86_400_000]) {
+      clock.mockReturnValue(1_800_000_000_000 + elapsed);
+      await restarted.tick();
+    }
+    expect(platform.openInstance).not.toHaveBeenCalled();
+    expect(platform.closeInstance).not.toHaveBeenCalled();
+    expect(clients[0]!.history).not.toHaveBeenCalled();
+    expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
+    expect(store.instance('1')!.job_id).toBe(job.id);
+    platform.getInstanceStatus.mockResolvedValue('2');
+    clients[0]!.history.mockResolvedValue({ state: 'failed', outputs: [] });
+    clock.mockReturnValue(Date.now() + 30_000);
+    await restarted.tick();
+    expect(clients[0]!.history).toHaveBeenCalledWith(job.prompt_id);
+    expect(restarted.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_RENDER_FAILED' });
+    expect(store.instance('1')!.job_id).toBeNull();
+    expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
+  } finally { await restarted.close(); }
+});
+
+test('cancelling an expired unconfirmed submission does not free its protected slot or wake the instance', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+  const { service, store, platform, clients, submit } = fixture();
+  const job = submit('cancel-unknown');
+  await service.tick();
+  store.updateJob(job.id, { stage: 'submitting', provider_confirmed: 0, deadline: Date.now() - 1 });
+  service.cancel(job.id);
+  platform.getInstanceStatus.mockResolvedValue('22');
+  await service.tick();
+  expect(service.get(job.id)).toMatchObject({ stage: 'cancelled', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
+  expect(store.instance('1')).toMatchObject({ job_id: job.id, error_code: 'COMFY_RECOVERY_PAUSED' });
+  expect(platform.openInstance).not.toHaveBeenCalled();
+  expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
+  platform.getInstanceStatus.mockResolvedValue('2');
+  clients[0]!.history.mockResolvedValue({ state: 'missing', outputs: [] });
+  clock.mockReturnValue(Date.now() + 30_000);
+  await service.tick();
+  expect(service.get(job.id).stage).toBe('cancelled');
+  expect(store.instance('1')!.job_id).toBe(job.id);
+  clients[0]!.history.mockResolvedValue({ state: 'succeeded', outputs: [] });
+  await service.tick();
+  expect(service.get(job.id)).toMatchObject({ stage: 'cancelled', result: null, result_pending: 0 });
+  expect(store.instance('1')!.job_id).toBeNull();
+  expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
+});
+
+test('a paused original direct task can still recover its late result after the instance is started externally', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+  const { service, store, platform, clients, submit } = fixture();
+  const job = submit('late-direct-result', true);
+  await service.tick();
+  service.completeInputs(job.id, {});
+  await service.tick();
+  store.updateJob(job.id, { deadline: Date.now() - 1 });
+  platform.getInstanceStatus.mockResolvedValue('22');
+  await service.tick();
+  expect(store.instance('1')!.error_code).toBe('COMFY_RECOVERY_PAUSED');
+  platform.getInstanceStatus.mockResolvedValue('2');
+  clients[0]!.history.mockResolvedValue({ state: 'succeeded', outputs: [
+    { nodeId: '1', filename: 'late.mp4', subfolder: job.id, type: 'output' },
+  ] });
+  clock.mockReturnValue(Date.now() + 30_000);
+  await service.tick();
+  expect(service.get(job.id)).toMatchObject({ stage: 'succeeded', error_code: null, result_pending: 1, prompt_id: job.prompt_id });
+  expect(service.get(job.id).result).toContain('late.mp4');
+  expect(clients[0]!.history).toHaveBeenCalledWith(job.prompt_id);
+  expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
+  expect(platform.openInstance).not.toHaveBeenCalled();
+});
+
+test('a direct task accepted with zero instances creates an instance and receives an upload reservation', async () => {
+  const { service, configuration, platform, submit } = fixture();
+  const authenticatedInstance = { ...configuration.instances[0]!, headers: { Authorization: 'server-only' } };
+  configuration.instances.length = 0;
+  configuration.elastic = { enabled: true, maxInstances: 6, maxHourlyCost: 10, createCooldownMs: 60_000,
+    releaseAfterMs: 3_600_000, reconcileTimeoutMs: 300_000,
+    templates: [{ id: 'template', areaName: '华东一区', gpuModel: '5090', skuName: 'RTX 5090', imageId: '123', imageType: '3',
+      workflowIds: ['test'], hourlyCost: 1, storageHourlyCost: 0.2, skuPriceToHourlyFactor: 1, skuPriceUnitVerified: true,
+      allowRelease: true, rebuildVerified: true }] };
+  const createInstance = vi.fn().mockResolvedValue('1');
+  Object.assign(platform, {
+    createInstance,
+    skuList: vi.fn().mockResolvedValue([{ areaName: '华东一区', skuName: 'RTX 5090', price: '1.00' }]),
+    getInstance: vi.fn().mockResolvedValue({ id: '1', status: '2', areaName: '华东一区', imageId: '123', imageType: '3', count: 1,
+      services: [{ host: 'created.waas.aigate.cc', protocol: 'HTTP', httpType: '1', port: 8188 }] }),
+  });
+  configuration.autoOpen = false;
+  expect(() => submit('disabled-auto-open', true)).toThrow('No instance supports');
+  configuration.autoOpen = true;
+  configuration.elastic.enabled = false;
+  expect(() => submit('disabled-elastic', true)).toThrow('No instance supports');
+  configuration.elastic.enabled = true;
+  configuration.elastic.templates[0]!.workflowIds = ['other'];
+  expect(() => submit('unsupported-template', true)).toThrow('No instance supports');
+  configuration.elastic.templates[0]!.workflowIds = ['test'];
+  configuration.instances.push(authenticatedInstance);
+  expect(() => submit('authenticated-pool', true)).toThrow('No instance supports');
+  configuration.instances.length = 0;
+  const job = submit('zero-pool', true);
+  await service.tick();
+  await service.tick();
+  expect(createInstance).toHaveBeenCalledTimes(1);
+  expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1' });
+  expect(service.publicJob(service.get(job.id)).upload?.baseUrl).toBe('https://created.waas.aigate.cc');
+});
+
 test('an already running pool respects the execution concurrency cap', async () => {
   const { service, configuration, submit, clients } = fixture(3);
   configuration.scheduler!.maxConcurrentInstances = 1;

@@ -125,7 +125,10 @@ export class ComfyService {
     if (!profile) throw new SystemError(400, 'COMFY_WORKFLOW_UNKNOWN', 'Unknown workflow profile');
     const direct = input.transport === 'direct';
     if (!direct && input.directMedia || direct && Object.keys(input.media).length) throw new SystemError(400, 'COMFY_BINDING_INVALID', 'Direct and server media cannot be mixed');
-    if (direct && !this.options.configuration.instances.some(instance => instance.workflowIds.includes(profile.id) && !Object.keys(instance.headers ?? {}).length)) {
+    const directInstanceAvailable = this.options.configuration.instances.some(instance => instance.workflowIds.includes(profile.id) && !Object.keys(instance.headers ?? {}).length);
+    const directTemplateAvailable = !this.options.configuration.instances.length && this.options.configuration.autoOpen && this.options.configuration.elastic?.enabled
+      && this.options.configuration.elastic.templates.some(template => template.workflowIds.includes(profile.id));
+    if (direct && !directInstanceAvailable && !directTemplateAvailable) {
       throw new SystemError(400, 'COMFY_DIRECT_UNAVAILABLE', 'No instance supports credential-free client direct transfer');
     }
     const supplied = direct ? input.directMedia ?? {} : input.media;
@@ -172,7 +175,8 @@ export class ComfyService {
     const events = this.store.events.recent(job.id, 12);
     const waitingTargets = [...new Set(waiting.map(instance => this.options.configuration.instances.find(candidate => candidate.id === instance.id))
       .map(instance => [instance?.areaName, instance?.gpuModel].filter(Boolean).join(' / ')).filter(Boolean))];
-    const message = uploadRecovery && starting ? '原GPU实例已离线，正在唤醒原实例；保留原任务和已上传素材' :
+    const message = assigned?.job_id === job.id && assigned.error_code === 'COMFY_RECOVERY_PAUSED' ? '已暂停自动开机恢复，保留原任务与素材，等待人工核对远端结果；不会重新生成' :
+      uploadRecovery && starting ? '原GPU实例已离线，正在唤醒原实例；保留原任务和已上传素材' :
       capacityWaiting && !job.cancel_requested ? uploadRecovery && assigned ? '原GPU实例开机暂缺可分配GPU，正在轮询恢复；保留原任务和已上传素材' :
         `已登记实例开机暂缺可分配GPU，正在轮询候卡${waitingTargets.length ? `（${waitingTargets.join('、')}）` : ''}；尚未开始生成` :
       recovering ? recovering.error_code === 'COMFY_EXTERNAL_OCCUPANCY' ? '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交' : `GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（${recovering.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` : stageMessages[stage]!;
@@ -358,7 +362,7 @@ export class ComfyService {
     }
     if (instance.job_id) {
       let job = this.store.get(instance.job_id)!;
-      if (job.stage === 'awaiting_upload' || job.stage === 'cancelled' && !job.provider_confirmed) {
+      if (job.stage === 'awaiting_upload' || job.stage === 'cancelled' && !job.provider_confirmed && job.error_code !== 'COMFY_REMOTE_UNCONFIRMED') {
         if (job.cancel_requested || job.deadline <= Date.now()) {
           this.store.updateJob(job.id, { stage: job.cancel_requested ? 'cancelled' : 'failed', error_code: job.cancel_requested ? 'COMFY_CANCELLED' : 'COMFY_UPLOAD_TIMEOUT' });
           this.store.releaseSlot(job.id);
@@ -370,7 +374,16 @@ export class ComfyService {
         if (this.options.configuration.scheduler) {
           const status = await this.options.platform.getInstanceStatus(instance.id);
           this.assertWorker();
+          if (status !== '2' && (job.stage === 'failed' || job.stage === 'cancelled')) {
+            const stopped = status === '22' || status === '26';
+            this.store.updateInstance(instance.id, { error_code: 'COMFY_RECOVERY_PAUSED', action_started_at: null, action_sent: 0,
+              capacity_started_at: null, next_action_at: Date.now() + (this.options.configuration.capacityPollIntervalMs ?? 30_000),
+              ...(stopped ? { state: 'offline', stopped_at: instance.stopped_at ?? Date.now(), idle_policy_applied_at: null } : {}) });
+            return;
+          }
           if (status !== '2') { await this.ensureUploadReady(configuration, client); return; }
+          if (instance.error_code === 'COMFY_RECOVERY_PAUSED') this.store.updateInstance(instance.id, {
+            state: 'busy', error_code: null, next_action_at: null, stopped_at: null });
         }
         await this.observe(job, client);
         if (this.store.instance(instance.id)?.job_id && job.deadline <= Date.now() && !['collecting', 'succeeded', 'cancelled'].includes(this.store.get(job.id)!.stage)) {

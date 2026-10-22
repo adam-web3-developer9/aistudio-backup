@@ -125,6 +125,102 @@ afterEach(async () => {
 });
 
 describe('ComfyLifecycle elastic creation', () => {
+  it('does not reserve more instances than runnable jobs even when the queue target is shorter than a job', async () => {
+    const context = fixture();
+    context.configuration.scheduler!.targetQueueWaitMs = 100_000;
+    context.submit();
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
+  it.each(['completed', 'still-busy'] as const)('rechecks capacity after the SKU await when existing work is %s', async state => {
+    const context = fixture();
+    const active = context.submit();
+    expect(context.store.claim('1', ['render'], clock)?.id).toBe(active.id);
+    context.submit();
+    context.platform.skuList.mockImplementation(async () => {
+      if (state === 'completed') {
+        context.store.updateJob(active.id, { stage: 'succeeded' });
+        context.store.releaseSlot(active.id);
+      }
+      return [context.sku];
+    });
+    await context.lifecycle.tick();
+    expect(context.platform.skuList).toHaveBeenCalledTimes(1);
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(state === 'completed' ? 0 : 1);
+  });
+
+  it('does not create when remaining demand expires during the SKU await', async () => {
+    const context = fixture();
+    context.demand();
+    context.platform.skuList.mockImplementation(async () => {
+      clock += 60_000;
+      return [context.sku];
+    });
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
+  it('scales from zero registered instances for a queued direct job', async () => {
+    const context = fixture({ instances: [] });
+    context.store.saveResource(resource({ state: 'released', instance_id: 'old', created_at: clock - 120_000 }));
+    context.store.submit('owner', { adapterId: 'comfyui-v1', requestKey: 'direct-zero', transport: 'direct',
+      workflowId: 'render', media: {}, values: {}, profile: context.configuration.workflows[0]! }, 60_000, clock);
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    expect(context.store.instance(createdId)).toMatchObject({ state: 'starting', action_sent: 1, action_started_at: clock });
+    expect(context.store.resource('resource')?.state).toBe('released');
+  });
+
+  it.each(['2', '8', '9', '13'])('hands a reconciled instance in status %s to boot probing without demand or a fabricated open event', async status => {
+    const context = fixture();
+    context.platform.getInstance.mockResolvedValue({ ...context.metadata, operationStatus: status });
+    context.store.saveResource(resource({ instance_id: createdId, created_at: clock - 300_000 }));
+    await context.lifecycle.tick();
+    expect(context.store.instance(createdId)).toMatchObject({ state: 'starting', action_sent: 1, action_started_at: clock,
+      error_code: 'COMFY_INSTANCE_INITIALIZING' });
+    expect(context.store.events.list({ instanceId: createdId })).toEqual([
+      expect.objectContaining({ type: 'instance.updated', code: 'COMFY_INSTANCE_INITIALIZING',
+        details: { fromState: 'offline', toState: 'starting' } }),
+    ]);
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+    const restarted = context.restart();
+    expect(restarted.store.instance(createdId)).toMatchObject({ state: 'starting', action_sent: 1, action_started_at: clock,
+      error_code: 'COMFY_INSTANCE_INITIALIZING' });
+    expect(restarted.store.events.list({ instanceId: createdId }).some(event => event.code === 'COMFY_OPEN_REQUESTED')).toBe(false);
+  });
+
+  it.each(['2', '8', '9', '13'])('tracks newly created status %s as initialization rather than an open request', async status => {
+    const context = fixture();
+    context.demand();
+    context.platform.getInstance.mockResolvedValue({ ...context.metadata, status });
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    expect(context.store.instance(createdId)).toMatchObject({ state: 'starting', action_sent: 1, action_started_at: clock,
+      error_code: 'COMFY_INSTANCE_INITIALIZING' });
+    expect(context.store.events.list({ instanceId: createdId }).map(event => event.code)).toEqual(['COMFY_INSTANCE_INITIALIZING']);
+  });
+
+  it.each(['22', '26', 'unknown'])('does not request boot after registering a stopped or unknown instance in status %s', async status => {
+    const context = fixture();
+    context.store.saveResource(resource({ instance_id: createdId }));
+    context.platform.getInstance.mockResolvedValue({ ...context.metadata, operationStatus: status });
+    await context.lifecycle.tick();
+    expect(context.store.instance(createdId)).toMatchObject({ state: 'offline', action_sent: 0 });
+    expect(context.store.events.list({ instanceId: createdId })).toEqual([]);
+  });
+
+  it('keeps released status 4 out of boot probing during reconciliation', async () => {
+    const context = fixture();
+    context.store.saveResource(resource({ instance_id: createdId }));
+    context.platform.getInstance.mockResolvedValue({ ...context.metadata, operationStatus: '4' });
+    await context.lifecycle.tick();
+    expect(context.store.resource('resource')?.state).toBe('released');
+    expect(context.store.instance(createdId)).toBeUndefined();
+    expect(context.store.events.list({ instanceId: createdId })).toEqual([]);
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
   it('falls back to the next region after a confirmed capacity rejection without an ID', async () => {
     const context = fallbackFixture();
     context.platform.createInstance.mockRejectedValueOnce(new AigateError('CAPACITY_UNAVAILABLE', 'no capacity'));
@@ -784,6 +880,80 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(context.configuration.instances).toEqual([]);
     expect(context.store.resourceObservations()).toEqual([{ resource_key: 'resource', status: '4', observed_at: clock }]);
     expect(context.platform.releaseInstance).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains only the newest stopped instance and releases excess after one minute, not five', async () => {
+    const context = unifiedReleaseFixture();
+    context.configuration.elastic!.releaseAfterMs = 1_800_000;
+    context.configuration.elastic!.stoppedRetention = { maxInstances: 1, excessReleaseAfterMs: 60_000 };
+    for (const instance of context.configuration.instances) context.store.updateInstance(instance.id, {
+      stopped_at: clock - 59_999, idle_since: clock,
+    });
+    context.store.updateInstance('3', { stopped_at: clock - 30_000 });
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+    clock += 1;
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(9);
+    expect(context.platform.releaseInstance).not.toHaveBeenCalledWith('3');
+    expect(context.store.instance('3')?.draining).toBe(0);
+    clock += 1_770_000;
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(10);
+    expect(context.platform.releaseInstance).toHaveBeenLastCalledWith('3');
+    expect(context.platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1, 2])('keeps %i stopped instances with stable selection across restart and concurrent queries', async maxInstances => {
+    const context = unifiedReleaseFixture();
+    context.configuration.elastic!.stoppedRetention = { maxInstances, excessReleaseAfterMs: 60_000 };
+    for (const instance of context.configuration.instances) context.store.updateInstance(instance.id, { stopped_at: clock - 60_000 });
+    const configuration = structuredClone(context.configuration);
+    const restarted = new ComfyLifecycle({ store: context.store, configuration, platform: context.platform,
+      client: () => context.client, assertWorker: context.assertWorker });
+    lifecycles.push(restarted);
+    await restarted.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(10 - maxInstances);
+    const retained = context.configuration.instances.filter(instance => !context.store.instance(instance.id)?.draining).map(instance => instance.id);
+    expect(retained).toEqual(['1', '10'].slice(0, maxInstances));
+  });
+
+  it('does not let protected unknown remote work consume or bypass stopped retention', async () => {
+    const context = unifiedReleaseFixture();
+    context.configuration.elastic!.stoppedRetention = { maxInstances: 1, excessReleaseAfterMs: 60_000 };
+    const job = context.submit();
+    context.store.updateInstance('1', { state: 'ready' });
+    expect(context.store.claim('1', ['render'], clock)?.id).toBe(job.id);
+    context.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
+    for (const instance of context.configuration.instances) context.store.updateInstance(instance.id, { state: 'offline', stopped_at: clock - 60_000 });
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(8);
+    expect(context.platform.releaseInstance).not.toHaveBeenCalledWith('1');
+    expect(context.platform.releaseInstance).not.toHaveBeenCalledWith('10');
+    expect(context.store.instance('1')?.job_id).toBe(job.id);
+  });
+
+  it('does not release excess instances when work arrives during the platform check', async () => {
+    const context = releasableFixture();
+    context.configuration.elastic!.stoppedRetention = { maxInstances: 0, excessReleaseAfterMs: 60_000 };
+    context.store.updateInstance('1', { stopped_at: clock - 60_000, idle_since: clock });
+    context.platform.getInstanceStatus.mockImplementation(async () => { context.submit(); return '22'; });
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('still observes running idle time after external startup with tiered retention=%s', async tiered => {
+    const context = releasableFixture();
+    if (tiered) context.configuration.elastic!.stoppedRetention = { maxInstances: 0, excessReleaseAfterMs: 60_000 };
+    context.store.updateInstance('1', { stopped_at: clock - 60_000, idle_since: clock });
+    context.platform.getInstanceStatus.mockResolvedValue('2');
+    await context.lifecycle.tick();
+    expect(context.platform.closeInstance).not.toHaveBeenCalled();
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+    clock += 300_000;
+    await context.lifecycle.tick();
+    expect(context.platform.closeInstance).toHaveBeenCalledExactlyOnceWith('1');
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
   });
 
   it('never releases a running instance or an unconfigured platform instance', async () => {

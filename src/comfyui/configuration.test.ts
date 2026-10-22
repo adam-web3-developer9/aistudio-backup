@@ -236,6 +236,21 @@ describe('loadComfyConfiguration', () => {
     }
   );
 
+  it('loads opt-in stopped retention independently from running idle time', async () => {
+    const loaded = await loadConfiguration({ ...configuration(), elastic: { releaseAfterMs: 1_800_000, stoppedRetention: {} } });
+    expect(loaded.elastic?.stoppedRetention).toEqual({ maxInstances: 1, excessReleaseAfterMs: 60_000 });
+    const disabled = await loadConfiguration({ ...configuration(), elastic: { stoppedRetention: { maxInstances: 0 } } });
+    expect(disabled.elastic?.stoppedRetention?.maxInstances).toBe(0);
+  });
+
+  it.each([
+    { maxInstances: -1 }, { maxInstances: 1.5 }, { maxInstances: 101 }, { maxInstances: '1' },
+    { excessReleaseAfterMs: 0 }, { excessReleaseAfterMs: -1 }, { excessReleaseAfterMs: 1.5 },
+    { excessReleaseAfterMs: 1_800_001 }, { excessReleaseAfterMs: 604_800_001 }, { unknown: true },
+  ])('rejects invalid stopped retention %#', async stoppedRetention => {
+    await expect(loadConfiguration({ ...configuration(), elastic: { releaseAfterMs: 1_800_000, stoppedRetention } })).rejects.toThrow();
+  });
+
   it.each([101, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1])('rejects instance limits above 100: %s', async value => {
     await expect(loadConfiguration({ ...configuration(), scheduler: { maxConcurrentInstances: value } })).rejects.toThrow();
     await expect(loadConfiguration({ ...configuration(), elastic: { maxInstances: value } })).rejects.toThrow();

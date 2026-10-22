@@ -86,8 +86,9 @@ export class ComfyLifecycle {
     await this.reconcile();
     this.warm();
     await this.scale();
+    const retained = this.retainedStoppedInstances();
     await Promise.all([...this.options.configuration.instances].map(async instance => {
-      try { await this.idle(instance); }
+      try { await this.idle(instance, retained); }
       catch (error) {
         this.options.assertWorker();
         this.options.store.updateInstance(instance.id, { error_code: safeCode(error) });
@@ -137,6 +138,19 @@ export class ComfyLifecycle {
     return total;
   }
 
+  private needsCapacity(template: ElasticTemplate): boolean {
+    const { configuration, store } = this.options;
+    const policy = schedulerPolicy(configuration);
+    const demand = this.compatible({ workflowIds: template.workflowIds }).length;
+    if (!demand) return false;
+    const supported = configuration.instances.filter(instance => !store.instance(instance.id)?.draining
+      && instance.workflowIds.some(id => template.workflowIds.includes(id)));
+    const busy = supported.filter(instance => store.instance(instance.id)?.job_id).length;
+    const desired = Math.min(policy.maxConcurrentInstances,
+      busy + Math.min(demand, Math.ceil(demand * policy.estimatedJobMs / policy.targetQueueWaitMs)));
+    return supported.length < desired;
+  }
+
   private async scale(): Promise<void> {
     const { configuration, store, platform } = this.options;
     const elastic = configuration.elastic;
@@ -157,13 +171,7 @@ export class ComfyLifecycle {
       if (!template.skuPriceUnitVerified || !Number.isFinite(template.skuPriceToHourlyFactor) || template.skuPriceToHourlyFactor <= 0) {
         this.lastError = 'COMFY_SKU_PRICE_UNIT_UNVERIFIED'; continue;
       }
-      const demand = this.compatible({ workflowIds: template.workflowIds }).length;
-      if (!demand) continue;
-      const supported = configuration.instances.filter(instance => !store.instance(instance.id)?.draining
-        && instance.workflowIds.some(id => template.workflowIds.includes(id)));
-      const busy = supported.filter(instance => store.instance(instance.id)?.job_id).length;
-      const desired = Math.min(policy.maxConcurrentInstances, busy + Math.ceil(demand * policy.estimatedJobMs / policy.targetQueueWaitMs));
-      if (supported.length >= desired) continue;
+      if (!this.needsCapacity(template)) continue;
       if (committed + template.hourlyCost + template.storageHourlyCost > (elastic.maxHourlyCost ?? 0)) {
         this.lastError = 'COMFY_ELASTIC_BUDGET_EXCEEDED'; continue;
       }
@@ -175,7 +183,7 @@ export class ComfyLifecycle {
         || Number(sku.price) * template.skuPriceToHourlyFactor > template.hourlyCost) {
         this.lastError = 'COMFY_SKU_QUOTE_UNVERIFIED'; continue;
       }
-      if (!this.compatible({ workflowIds: template.workflowIds }).some(job => !job.instance_id)) return;
+      if (!this.needsCapacity(template)) continue;
       const key = randomUUID();
       const resource: ComfyResource = { key, name: 'hailuo-' + key, state: 'creating', instance_id: null, configuration: null,
         template_id: template.id, hourly_cost: template.hourlyCost, storage_hourly_cost: template.storageHourlyCost,
@@ -219,6 +227,10 @@ export class ComfyLifecycle {
     if (this.options.configuration.instances.some(instance => instance.id === metadata.id)) throw { code: 'ELASTIC_INSTANCE_COLLISION' };
     this.options.store.saveResource({ ...resource, state: 'registered', configuration: JSON.stringify(configuration), updated_at: Date.now(), error_code: null });
     this.options.store.registerInstances([metadata.id]);
+    if (['2', '8', '9', '13'].includes(metadata.operationStatus ?? metadata.status)) {
+      this.options.store.updateInstance(metadata.id, { state: 'starting', action_started_at: Date.now(), action_sent: 1,
+        stopped_at: null, idle_since: null, error_code: 'COMFY_INSTANCE_INITIALIZING' });
+    }
     this.options.configuration.instances.push(configuration);
   }
 
@@ -274,7 +286,26 @@ export class ComfyLifecycle {
     }
   }
 
-  private async idle(configuration: InstanceConfiguration): Promise<void> {
+  private retainedStoppedInstances(): Set<string> {
+    const { configuration, store } = this.options;
+    const elastic = configuration.elastic;
+    if (!elastic?.stoppedRetention) return new Set();
+    const resources = store.resources();
+    const candidates = configuration.instances.filter(item => {
+      const instance = store.instance(item.id);
+      const resource = resources.find(resource => resource.instance_id === item.id);
+      return item.lifecycle?.allowRelease && item.lifecycle.rebuildVerified
+        && instance?.state === 'offline' && !instance.draining && instance.stopped_at !== null
+        && Date.now() - instance.stopped_at < elastic.releaseAfterMs
+        && !store.hasUnresolvedWork(item.id) && !this.compatible(item).length
+        && (!resource || resource.state === 'registered');
+    });
+    candidates.sort((left, right) => store.instance(right.id)!.stopped_at! - store.instance(left.id)!.stopped_at!
+      || left.id.localeCompare(right.id));
+    return new Set(candidates.slice(0, elastic.stoppedRetention.maxInstances).map(instance => instance.id));
+  }
+
+  private async idle(configuration: InstanceConfiguration, retained: Set<string>): Promise<void> {
     const { store, platform } = this.options;
     let instance = store.instance(configuration.id)!;
     if (instance.state === 'closing' || instance.state === 'starting' || instance.state === 'waiting_capacity' || instance.draining) return;
@@ -285,7 +316,8 @@ export class ComfyLifecycle {
     }
     if (instance.idle_since === null) store.updateInstance(instance.id, { idle_since: Date.now() });
     instance = store.instance(instance.id)!;
-    if (Date.now() - instance.idle_since! < policy.idleStopAfterMs) return;
+    if (!(this.options.configuration.elastic?.stoppedRetention && instance.state === 'offline' && instance.stopped_at !== null)
+      && Date.now() - instance.idle_since! < policy.idleStopAfterMs) return;
     const warm = this.options.configuration.instances.filter(item => !store.instance(item.id)?.draining
       && ['ready', 'busy', 'starting'].includes(store.instance(item.id)!.state)).sort((left, right) => left.id.localeCompare(right.id)).slice(0, policy.minWarmInstances);
     if (warm.some(item => item.id === instance.id)) return;
@@ -295,7 +327,9 @@ export class ComfyLifecycle {
     if (['22', '26'].includes(status)) {
       if (instance.stopped_at === null) store.updateInstance(instance.id, { state: 'offline', stopped_at: Date.now(), idle_policy_applied_at: null });
       const stopped = store.instance(instance.id)!;
-      const releaseAfter = this.options.configuration.elastic?.releaseAfterMs;
+      const elastic = this.options.configuration.elastic;
+      const releaseAfter = elastic?.stoppedRetention && !retained.has(instance.id)
+        ? elastic.stoppedRetention.excessReleaseAfterMs : elastic?.releaseAfterMs;
       if (!releaseAfter || Date.now() - stopped.stopped_at! < releaseAfter || !configuration.lifecycle?.allowRelease
         || !configuration.lifecycle.rebuildVerified || !platform.releaseInstance) return;
       let resource = store.resources().find(item => item.instance_id === instance.id);
@@ -317,7 +351,7 @@ export class ComfyLifecycle {
       }
       return;
     }
-    if (status !== '2') return;
+    if (status !== '2' || Date.now() - instance.idle_since! < policy.idleStopAfterMs) return;
     const client = this.options.client(configuration);
     await client.health();
     const queue = await client.queue();

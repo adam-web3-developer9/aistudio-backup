@@ -29,6 +29,10 @@ const elasticSchema = z.object({
   maxHourlyCost: z.number().positive().optional(),
   createCooldownMs: durationMs.default(60_000),
   releaseAfterMs: durationMs.default(3_600_000),
+  stoppedRetention: z.object({
+    maxInstances: z.number().int().nonnegative().max(100).default(1),
+    excessReleaseAfterMs: durationMs.default(60_000),
+  }).strict().optional(),
   reconcileTimeoutMs: durationMs.default(300_000),
   templates: z.array(z.object({
     id: identifier,
@@ -99,6 +103,9 @@ export async function loadComfyConfiguration(file: string, environment = process
     }
     if (elastic.templates.some(template => template.allowRelease && !template.rebuildVerified)) throw new Error('Template allowRelease requires rebuildVerified');
     if (elastic.releaseAfterMs < parsed.scheduler.idleStopAfterMs) throw new Error('Elastic releaseAfterMs must cover scheduler idleStopAfterMs');
+    if (elastic.stoppedRetention && elastic.stoppedRetention.excessReleaseAfterMs > elastic.releaseAfterMs) {
+      throw new Error('Elastic excessReleaseAfterMs must not exceed releaseAfterMs');
+    }
     if (elastic.enabled) {
       if (!elastic.maxHourlyCost) throw new Error('Enabled elastic configuration requires an explicit maxHourlyCost budget');
       if (!elastic.templates.length) throw new Error('Enabled elastic configuration requires templates');
