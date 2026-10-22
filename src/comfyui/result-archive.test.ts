@@ -68,6 +68,20 @@ afterEach(async () => {
 });
 
 describe('GPU result archive fallback', () => {
+  it('persists the first SSH host fingerprint per known instance and rejects replacement across restart', async () => {
+    const context = fixture();
+    const fingerprint = 'a'.repeat(64);
+    expect(context.store.verifySshHostKey('unregistered', fingerprint)).toBe(false);
+    expect(context.store.verifySshHostKey('1', 'invalid')).toBe(false);
+    expect(context.store.verifySshHostKey('1', fingerprint)).toBe(true);
+    await context.restart();
+    const recovered = new ComfyStore(context.db);
+    expect(recovered.verifySshHostKey('1', fingerprint.toUpperCase())).toBe(true);
+    expect(recovered.verifySshHostKey('1', 'b'.repeat(64))).toBe(false);
+    context.store.registerInstances(['2']);
+    expect(recovered.verifySshHostKey('2', 'b'.repeat(64))).toBe(true);
+  });
+
   it('waits ten minutes from first success, verifies the object, and permits idle shutdown without another five-minute wait', async () => {
     const context = fixture();
     const job = context.succeed();

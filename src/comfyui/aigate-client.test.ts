@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AigateClient, AigateError, type AigateCreateRequest, type AigatePageRequest } from './aigate-client.js';
+import { AigateClient, AigateError, type AigateCreateRequest, type AigatePageRequest, type AigateSshConnection } from './aigate-client.js';
 
 const instanceId = '1096749550260588544';
 const token = 'private-test-token';
@@ -11,6 +11,232 @@ function setup(body: unknown = { code: 0, data: instance, ok: true }, status = 2
 }
 
 afterEach(() => vi.useRealTimers());
+
+describe('AigateClient SSH connection', () => {
+  const sshTool = { name: 'SSH', host: 'worker-1.waas.aigate.cc', protocol: 'TCP', port: 22,
+    instancePort: '48595', userAccount: 'private-ssh-user', password: 'private-ssh-password' };
+  const connection: AigateSshConnection = { host: sshTool.host, port: 48595,
+    username: sshTool.userAccount, password: sshTool.password };
+  const detail = { ...instance, instanceUtilList: [sshTool] };
+
+  it.each(['ssh', 'SSH', 'sSh'])('returns only the dedicated connection for tool name %s using one read', async name => {
+    const { client, fetchMock } = setup({ code: 0, data: { ...detail, instanceUtilList: [
+      { host: 'web.example', port: 8188, instancePort: 'null', protocol: 'HTTP', password: token },
+      { ...sshTool, name }
+    ] } });
+    await expect(client.getSshConnection(instanceId)).resolves.toEqual(connection);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe(`https://waas.aigate.cc/api/openapi/instance/get?instanceId=${instanceId}`);
+    expect(init).toMatchObject({ method: 'GET', redirect: 'error', cache: 'no-store',
+      headers: { Authorization: 'Bearer ' + token } });
+    expect(init?.body).toBeUndefined();
+    expect(String(url)).not.toContain(sshTool.password);
+  });
+
+  it.each(['109674955026058855', instanceId, '9223372036854775807'])('preserves exact unquoted int64 ID %s', async id => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      JSON.stringify({ code: 0, data: detail }).replace(`"instanceId":"${instanceId}"`, `"instanceId":${id}`)
+    ));
+    const client = new AigateClient({ token, fetch: fetchMock });
+    await expect(client.getSshConnection(id)).resolves.toEqual(connection);
+    expect(String(fetchMock.mock.calls[0]![0])).toContain(`instanceId=${id}`);
+  });
+
+  it('accepts safe numeric IDs and numeric external ports', async () => {
+    const { client } = setup({ code: 0, data: { ...detail, instanceId: 123,
+      instanceUtilList: [{ ...sshTool, port: '22', instancePort: 48595 }] } });
+    await expect(client.getSshConnection('123')).resolves.toEqual(connection);
+  });
+
+  it.each(['', ' ', '01', '-1', '1.0', '1e3', '1\n', '1&other=value', '9223372036854775808',
+    123, Number(instanceId), null, undefined])('rejects invalid input IDs before transport %#', async id => {
+    const { client, fetchMock } = setup({ code: 0, data: detail });
+    await expect(client.getSshConnection(id as string)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['123', '1096749550260588545', Number(instanceId), '01', '9223372036854775808', null, undefined])(
+    'rejects wrong or malformed returned IDs %#', async returnedId => {
+      const { client, fetchMock } = setup({ code: 0, data: { ...detail, instanceId: returnedId } });
+      await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each([
+    { operationStatus: '2' }, { operationStatus: undefined, status: '2' },
+    { operationStatus: undefined, instanceStatus: '2' }, { operationStatus: '2', status: '2', instanceStatus: '2' }
+  ])('accepts only running state metadata %#', async status => {
+    const { client } = setup({ code: 0, data: { ...detail, ...status } });
+    await expect(client.getSshConnection(instanceId)).resolves.toEqual(connection);
+  });
+
+  it.each([
+    { operationStatus: undefined }, { operationStatus: '22' }, { operationStatus: '26' },
+    { operationStatus: 'running' }, { operationStatus: 2 }, { operationStatus: null },
+    { status: '26' }, { status: 2 }, { status: null }, { instanceStatus: '26' },
+    { instanceStatus: 2 }, { instanceStatus: null }, { operationStatus: '26', instanceStatus: '2' },
+    { status: '26', instanceStatus: '2' }
+  ])('rejects missing, conflicting or non-running states without opening %#', async status => {
+    const { client, fetchMock } = setup({ code: 0, data: { ...detail, ...status } });
+    await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(new URL(String(fetchMock.mock.calls[0]![0])).pathname).toBe('/api/openapi/instance/get');
+  });
+
+  it.each([undefined, null, [], {}, [null], [{ ...sshTool, name: undefined }],
+    [{ ...sshTool, name: 'ssh ' }], [{ ...sshTool, name: 'terminal' }], [sshTool, sshTool],
+    [sshTool, { ...sshTool, name: 'sSh', protocol: 'HTTP', port: 8188 }]])(
+    'rejects absent, malformed or ambiguous SSH tools %#', async instanceUtilList => {
+      const { client } = setup({ code: 0, data: { ...detail, instanceUtilList } });
+      await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+    }
+  );
+
+  it.each([undefined, null, 'tcp', 'HTTP', 'UDP', 1])('requires TCP protocol %#', async protocol => {
+    const { client } = setup({ code: 0, data: { ...detail, instanceUtilList: [{ ...sshTool, protocol }] } });
+    await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+  });
+
+  it.each([undefined, null, 0, 21, 23, 65536, '22\n', '22bad'])('requires internal SSH port 22 %#', async port => {
+    const { client } = setup({ code: 0, data: { ...detail, instanceUtilList: [{ ...sshTool, port }] } });
+    await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+  });
+
+  it.each([undefined, null, 'null', 0, -1, 65536, 1.5, true, {}, '48595bad', '1e3',
+    '22\n', ' 22', '+22', 'Infinity', '999999999999999999999999999999999'])('rejects invalid external ports %#', async instancePort => {
+    const { client } = setup({ code: 0, data: { ...detail, instanceUtilList: [{ ...sshTool, instancePort }] } });
+    await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+  });
+
+  it.each([1, '65535'])('accepts external port boundary %s', async instancePort => {
+    const { client } = setup({ code: 0, data: { ...detail, instanceUtilList: [{ ...sshTool, instancePort }] } });
+    await expect(client.getSshConnection(instanceId)).resolves.toEqual({ ...connection, port: Number(instancePort) });
+  });
+
+  it.each(['WORKER-1.WAAS.AIGATE.CC', 'worker.zone.waas.aigate.cc', 'a'.repeat(63) + '.waas.aigate.cc'])(
+    'accepts bare provider hostname %#', async host => {
+      const { client } = setup({ code: 0, data: { ...detail, instanceUtilList: [{ ...sshTool, host }] } });
+      await expect(client.getSshConnection(instanceId)).resolves.toEqual({ ...connection, host });
+    }
+  );
+
+  it.each([undefined, null, '', ' ', 'waas.aigate.cc', 'evil.example', 'worker.waas.aigate.cc.evil.example',
+    'worker.evilwaas.aigate.cc', 'https://worker.waas.aigate.cc', 'ssh://worker.waas.aigate.cc',
+    '//worker.waas.aigate.cc', 'worker.waas.aigate.cc/path', 'worker.waas.aigate.cc:22',
+    'user@worker.waas.aigate.cc', 'user:password@worker.waas.aigate.cc', '127.0.0.1', '::1', '[::1]',
+    'worker.waas.aigate.cc?query', 'worker.waas.aigate.cc#fragment', 'worker.waas.aigate.cc.',
+    ' worker.waas.aigate.cc', 'worker.waas.aigate.cc\n', 'worker.waas.aigate.cc\r\n',
+    'worker\0.waas.aigate.cc', '-worker.waas.aigate.cc', 'worker-.waas.aigate.cc',
+    'worker_name.waas.aigate.cc', 'worker..waas.aigate.cc', 'a'.repeat(64) + '.waas.aigate.cc',
+    ('a'.repeat(60) + '.').repeat(4) + 'waas.aigate.cc'])('rejects unsafe or malformed hosts %#', async host => {
+    const { client } = setup({ code: 0, data: { ...detail, instanceUtilList: [{ ...sshTool, host }] } });
+    await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+  });
+
+  describe.each(['userAccount', 'password'] as const)('%s credentials', key => {
+    it.each([undefined, null, '', ' ', 123, true, {}, [], 'bad\rvalue', 'bad\nvalue', 'bad\0value'])(
+      'rejects missing, empty, non-string or control-containing credentials %#', async value => {
+        const { client } = setup({ code: 0, data: { ...detail, [key]: sshTool[key],
+          instanceUtilList: [{ ...sshTool, [key]: value }] } });
+        await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+      }
+    );
+
+    it('rejects excessively long credentials', async () => {
+      const { client } = setup({ code: 0, data: { ...detail,
+        instanceUtilList: [{ ...sshTool, [key]: 'x'.repeat(key === 'userAccount' ? 257 : 4097) }] } });
+      await expect(client.getSshConnection(instanceId)).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+    });
+  });
+
+  it('preserves credentials verbatim within their length limits', async () => {
+    const username = 'u'.repeat(256);
+    const password = ' ' + 'p'.repeat(4094) + ' ';
+    const { client } = setup({ code: 0, data: { ...detail,
+      instanceUtilList: [{ ...sshTool, userAccount: username, password }] } });
+    await expect(client.getSshConnection(instanceId)).resolves.toEqual({ ...connection, username, password });
+  });
+
+  it.each(['business', 'http', 'json', 'fetch', 'body', 'connection'] as const)(
+    'sanitizes %s failures including an echoed password in errCode', async phase => {
+      const secretBody = JSON.stringify({ code: 1, errCode: sshTool.password, msg: sshTool.userAccount,
+        data: detail, token });
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(secretBody));
+      if (phase === 'http') fetchMock.mockResolvedValue(new Response(secretBody, { status: 500 }));
+      if (phase === 'json') fetchMock.mockResolvedValue(new Response(secretBody.slice(0, -1)));
+      if (phase === 'fetch') fetchMock.mockRejectedValue(new Error(secretBody));
+      if (phase === 'body') fetchMock.mockResolvedValue({ ok: true,
+        text: () => Promise.reject(new Error(secretBody)) } as unknown as Response);
+      if (phase === 'connection') fetchMock.mockResolvedValue(Response.json({ code: 0,
+        data: { ...detail, instanceUtilList: [sshTool, sshTool] } }));
+      const client = new AigateClient({ token, fetch: fetchMock });
+      const error = await client.getSshConnection(instanceId).catch(error => error);
+      const codes = { business: 'BUSINESS_REJECTED', http: 'HTTP_ERROR', json: 'INVALID_RESPONSE',
+        fetch: 'NETWORK_ERROR', body: 'NETWORK_ERROR', connection: 'INVALID_RESPONSE' };
+      expect(error).toBeInstanceOf(AigateError);
+      expect(error).toMatchObject({ code: codes[phase], uncertain: false });
+      expect(error.cause).toBeUndefined();
+      expect(error.errCode).toBeUndefined();
+      for (const secret of [token, sshTool.userAccount, sshTool.password, sshTool.host, secretBody]) {
+        expect(String(error)).not.toContain(secret);
+        expect(JSON.stringify(error)).not.toContain(secret);
+        expect(error.stack).not.toContain(secret);
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(new URL(String(fetchMock.mock.calls[0]![0])).pathname).toBe('/api/openapi/instance/get');
+    }
+  );
+
+  it.each(['fetch', 'body'])('bounds SSH %s time without retries or exposing secrets', async phase => {
+    vi.useFakeTimers();
+    const stalled = new Promise<never>(() => {});
+    const fetchMock = vi.fn<typeof fetch>();
+    if (phase === 'fetch') fetchMock.mockReturnValue(stalled);
+    else fetchMock.mockResolvedValue({ ok: true, text: () => stalled } as unknown as Response);
+    const client = new AigateClient({ token, fetch: fetchMock, timeoutMs: 20 });
+    const result = client.getSshConnection(instanceId).catch(error => error);
+    await vi.advanceTimersByTimeAsync(20);
+    const error = await result;
+    expect(error).toMatchObject({ code: 'TIMEOUT', uncertain: false });
+    expect(error.cause).toBeUndefined();
+    expect(error.errCode).toBeUndefined();
+    expect(String(error)).not.toContain(token);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![1]?.signal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not log or cache credentials, and ordinary metadata stays secret-free', async () => {
+    const logs = (['log', 'info', 'warn', 'error', 'debug'] as const).map(method => vi.spyOn(console, method));
+    try {
+      const { client, fetchMock } = setup({ code: 0, data: { ...detail, username: sshTool.userAccount,
+        password: sshTool.password } });
+      fetchMock.mockImplementation(async () => Response.json({ code: 0, data: { ...detail,
+        username: sshTool.userAccount, password: sshTool.password } }));
+      const first = await client.getSshConnection(instanceId);
+      first.password = 'changed-locally';
+      await expect(client.getSshConnection(instanceId)).resolves.toEqual(connection);
+      const metadata = await client.getInstance(instanceId);
+      expect(metadata).toEqual({ id: instanceId, status: '2', operationStatus: '2',
+        services: [{ host: sshTool.host, port: 22, instancePort: 48595, protocol: 'TCP' }] });
+      for (const secret of [sshTool.userAccount, sshTool.password]) {
+        expect(JSON.stringify(metadata)).not.toContain(secret);
+        expect(JSON.stringify(client)).not.toContain(secret);
+      }
+      for (const log of logs) expect(log).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      for (const [url, init] of fetchMock.mock.calls) {
+        expect(new URL(String(url)).pathname).toBe('/api/openapi/instance/get');
+        expect(init?.method).toBe('GET');
+        expect(init?.body).toBeUndefined();
+      }
+    } finally {
+      for (const log of logs) log.mockRestore();
+    }
+  });
+});
 
 describe('AigateClient elastic instance APIs', () => {
   const createRequest: AigateCreateRequest = {

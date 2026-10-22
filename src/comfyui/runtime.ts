@@ -10,11 +10,11 @@ import { ComfyStore } from './store.js';
 import { validateProfile } from './workflow.js';
 import type { ComfyEventSink } from './events.js';
 import { TosResultStorage } from './tos-result-storage.js';
-import { HttpGpuResultExporter } from './gpu-result-exporter.js';
+import { SshGpuResultExporter } from './ssh-result-exporter.js';
 
 export interface ComfyRuntimeOptions {
   configuration: ComfyPoolConfiguration; token: string; fetch?: typeof fetch;
-  archiveSecrets?: { accessKeyId: string; accessKeySecret: string; exporterSecret: string };
+  archiveSecrets?: { accessKeyId: string; accessKeySecret: string };
 }
 export async function comfyOptionsFromEnv(environment = process.env): Promise<ComfyRuntimeOptions | undefined> {
   if (!environment.SYSTEM_COMFYUI_CONFIG) return;
@@ -22,10 +22,9 @@ export async function comfyOptionsFromEnv(environment = process.env): Promise<Co
   const configuration = await loadComfyConfiguration(environment.SYSTEM_COMFYUI_CONFIG, environment);
   const archiveSecrets = configuration.resultArchive ? {
     accessKeyId: environment.COMFY_TOS_ACCESS_KEY_ID ?? '', accessKeySecret: environment.COMFY_TOS_ACCESS_KEY_SECRET ?? '',
-    exporterSecret: environment.COMFY_RESULT_EXPORT_SECRET ?? '',
   } : undefined;
-  if (archiveSecrets && (!archiveSecrets.accessKeyId || !archiveSecrets.accessKeySecret || Buffer.byteLength(archiveSecrets.exporterSecret) < 32)) {
-    throw new Error('ComfyUI result archive credentials and exporter authentication must be configured');
+  if (archiveSecrets && (!archiveSecrets.accessKeyId.trim() || !archiveSecrets.accessKeySecret.trim())) {
+    throw new Error('ComfyUI result archive credentials must be configured');
   }
   return { configuration, token: environment.AIGATE_ACCESS_TOKEN, ...(archiveSecrets ? { archiveSecrets } : {}) };
 }
@@ -35,6 +34,8 @@ export function createComfyService(options: ComfyRuntimeOptions & {
   eventSink?: ComfyEventSink;
 }): ComfyService {
   for (const profile of options.configuration.workflows) validateProfile(profile);
+  const store = new ComfyStore(options.db, options.eventSink);
+  const platform = new AigateClient({ token: options.token, fetch: options.fetch, capacityErrorCodes: options.configuration.capacityErrorCodes });
   const archive = options.configuration.resultArchive;
   if (archive && !options.archiveSecrets) throw new Error('ComfyUI result archive credentials are missing');
   const resultArchive = archive && options.archiveSecrets ? {
@@ -45,14 +46,14 @@ export function createComfyService(options: ComfyRuntimeOptions & {
     exporter: (id: string) => {
       const instance = options.configuration.instances.find(instance => instance.id === id);
       if (!instance) throw new Error('Archive instance is unavailable');
-      return new HttpGpuResultExporter({ baseUrl: instance.baseUrl, secret: options.archiveSecrets!.exporterSecret, fetch: options.fetch });
+      return new SshGpuResultExporter({ connection: () => platform.getSshConnection(id),
+        verifyHostKey: fingerprint => store.verifySshHostKey(id, fingerprint) });
     },
   } : undefined;
   const clients = new Map(options.configuration.instances.map(instance => [instance.id,
     new ComfyClient({ baseUrl: instance.baseUrl, headers: instance.headers, fetch: options.fetch, allowedGpuModels: instance.gpuModel ? [instance.gpuModel] : ['5090', '4090'] })]));
   return new ComfyService({
-    store: new ComfyStore(options.db, options.eventSink), configuration: options.configuration,
-    platform: new AigateClient({ token: options.token, fetch: options.fetch, capacityErrorCodes: options.configuration.capacityErrorCodes }),
+    store, configuration: options.configuration, platform,
     client: instance => {
       let client = clients.get(instance.id);
       if (!client) {

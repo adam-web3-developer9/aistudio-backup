@@ -1,4 +1,8 @@
-# ComfyUI result export 扩展
+# ComfyUI result export
+
+当前服务端使用 `ssh_runner.py` 经SSH按需运行，上传逻辑复用 `exporter.py`。脚本由标准输入送入GPU内存，不安装custom_nodes，不重启ComfyUI，不需要自定义镜像或GPU环境密钥。SSH认证、进程定位、源任务核验、GPU直传及TOS确认由服务端归档调度衔接，流程见 `docs/features/comfyui-result-archive.md`。
+
+下面的HTTP扩展安装说明保留为独立兼容方案，当前运行时不使用这些端点。
 
 仅提供已完成结果的摘要查询和 GPU 本机到火山 TOS 的预签名 PUT 上传，不提交工作流、不执行任意命令、不删除或移动文件。Hailuo 只处理 JSON 控制数据；视频字节不经 Hailuo 网关。
 

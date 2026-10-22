@@ -73,6 +73,9 @@ export class ComfyStore {
         uploaded_at INTEGER, expires_at INTEGER, error_code TEXT
       );
       CREATE INDEX IF NOT EXISTS comfy_result_archives_due ON comfy_result_archives(state,next_at);
+      CREATE TABLE IF NOT EXISTS comfy_ssh_host_keys (
+        instance_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL
+      );
     `);
     for (const [table, columns] of Object.entries({
       comfy_jobs: { direct_inputs: 'TEXT', result_wake_requested: 'INTEGER NOT NULL DEFAULT 0', result_checked_at: 'INTEGER', finished_at: 'INTEGER', collected_at: 'INTEGER',
@@ -90,6 +93,13 @@ export class ComfyStore {
   }
   registerInstances(ids: string[]): void {
     this.db.transaction(() => { for (const id of ids) this.db.prepare('INSERT OR IGNORE INTO comfy_instances(id) VALUES(?)').run(id); })();
+  }
+  verifySshHostKey(instanceId: string, fingerprint: string): boolean {
+    if (!this.instance(instanceId) || !/^[a-f0-9]{64}$/i.test(fingerprint)) return false;
+    const normalized = fingerprint.toLowerCase();
+    this.db.prepare('INSERT OR IGNORE INTO comfy_ssh_host_keys(instance_id,fingerprint) VALUES(?,?)').run(instanceId, normalized);
+    const stored = this.db.prepare('SELECT fingerprint FROM comfy_ssh_host_keys WHERE instance_id=?').get(instanceId) as { fingerprint: string };
+    return stored.fingerprint === normalized;
   }
   acquireWorker(owner: string, now: number): boolean {
     return this.db.prepare(`INSERT INTO comfy_worker(id,owner,expires_at) VALUES(1,?,?)

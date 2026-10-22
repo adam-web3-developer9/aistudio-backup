@@ -82,11 +82,11 @@ describe('loadComfyConfiguration', () => {
   it('loads archive secrets only from the explicit server environment', async () => {
     const file = await fixture({ ...configuration(), resultArchive });
     const environment = { SYSTEM_COMFYUI_CONFIG: file, AIGATE_ACCESS_TOKEN: 'fixture-aigate', COMFY_TEST_SECRET: 'test-secret',
-      COMFY_TOS_ACCESS_KEY_ID: 'fixture-id', COMFY_TOS_ACCESS_KEY_SECRET: 'fixture-secret', COMFY_RESULT_EXPORT_SECRET: 'x'.repeat(32) };
+      COMFY_TOS_ACCESS_KEY_ID: 'fixture-id', COMFY_TOS_ACCESS_KEY_SECRET: 'fixture-secret' };
     const loaded = await comfyOptionsFromEnv(environment);
-    expect(loaded?.archiveSecrets).toEqual({ accessKeyId: 'fixture-id', accessKeySecret: 'fixture-secret', exporterSecret: 'x'.repeat(32) });
+    expect(loaded?.archiveSecrets).toEqual({ accessKeyId: 'fixture-id', accessKeySecret: 'fixture-secret' });
     expect(JSON.stringify(loaded?.configuration)).not.toContain('fixture-secret');
-    for (const field of ['COMFY_TOS_ACCESS_KEY_ID', 'COMFY_TOS_ACCESS_KEY_SECRET', 'COMFY_RESULT_EXPORT_SECRET']) {
+    for (const field of ['COMFY_TOS_ACCESS_KEY_ID', 'COMFY_TOS_ACCESS_KEY_SECRET']) {
       await expect(comfyOptionsFromEnv({ ...environment, [field]: '' })).rejects.toThrow('credentials');
     }
   });

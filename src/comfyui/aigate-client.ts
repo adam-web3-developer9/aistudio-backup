@@ -17,6 +17,13 @@ export interface AigateInstance {
   }>;
 }
 
+export interface AigateSshConnection {
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+}
+
 export interface AigateSku {
   areaName: string;
   skuName: string;
@@ -72,7 +79,8 @@ function invalidResponse(uncertain = false): never {
 }
 
 function isInt64(value: unknown): value is string {
-  return typeof value === 'string' && /^(?:0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= 9_223_372_036_854_775_807n;
+  return typeof value === 'string' && value === value.trim()
+    && /^(?:0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= 9_223_372_036_854_775_807n;
 }
 
 function responseId(value: unknown, uncertain = false): string {
@@ -99,7 +107,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function parsePort(value: unknown): number | undefined {
   if (value === undefined || value === null) return undefined;
-  const port = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+  const port = typeof value === 'string' && value === value.trim() && /^\d+$/.test(value) ? Number(value) : value;
   if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) {
     return invalidResponse();
   }
@@ -144,6 +152,32 @@ export class AigateClient {
     const instance = this.parseInstance(data);
     if (instance.id !== instanceId) return invalidResponse();
     return instance;
+  }
+
+  async getSshConnection(instanceId: string): Promise<AigateSshConnection> {
+    if (!isInt64(instanceId)) return invalidArgument();
+    const data = await this.request('get', instanceId).catch((error: unknown) => {
+      throw new AigateError(error instanceof AigateError ? error.code : 'NETWORK_ERROR',
+        'AIGate SSH connection request failed');
+    });
+    const instance = this.parseInstance(data);
+    if (instance.id !== instanceId || instance.status !== '2'
+      || !isRecord(data) || ['operationStatus', 'instanceStatus', 'status'].some(key => data[key] !== undefined && data[key] !== '2')
+      || !Array.isArray(data.instanceUtilList)) return invalidResponse();
+    const tools = data.instanceUtilList.filter((tool: unknown): tool is Record<string, unknown> =>
+      isRecord(tool) && typeof tool.name === 'string' && tool.name.toLowerCase() === 'ssh');
+    if (tools.length !== 1) return invalidResponse();
+    const tool = tools[0]!;
+    const host = tool.host;
+    const port = parsePort(tool.instancePort);
+    const username = tool.userAccount;
+    const password = tool.password;
+    if (tool.protocol !== 'TCP' || parsePort(tool.port) !== 22 || port === undefined
+      || typeof host !== 'string' || host.length > 253 || host !== host.trim()
+      || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+waas\.aigate\.cc$/i.test(host)
+      || !nonEmpty(username) || username.length > 256 || /[\r\n\0]/.test(username)
+      || !nonEmpty(password) || password.length > 4096 || /[\r\n\0]/.test(password)) return invalidResponse();
+    return { host, port, username, password };
   }
 
   private parseInstance(data: unknown): AigateInstance {
