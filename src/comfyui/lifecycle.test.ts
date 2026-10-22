@@ -370,6 +370,41 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
   });
 
+  it.each([false, true])('creates without an hourly budget when existing cost is unknown=%s', async unknownCost => {
+    const context = fixture();
+    delete context.configuration.elastic!.maxHourlyCost;
+    if (unknownCost) delete context.configuration.instances[0]!.lifecycle;
+    context.demand();
+    await context.lifecycle.tick();
+    expect(context.platform.skuList).toHaveBeenCalledExactlyOnceWith('华东一区');
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    expect(context.lifecycle.lastError).toBeNull();
+  });
+
+  it.each([undefined, 1, 2])('applies warm-instance hourly gating only when budget=%s is configured', async maxHourlyCost => {
+    const context = fixture();
+    context.configuration.elastic!.maxHourlyCost = maxHourlyCost;
+    context.configuration.scheduler!.minWarmInstances = 1;
+    context.store.updateInstance('1', { state: 'offline' });
+    await context.lifecycle.tick();
+    expect(context.store.instance('1')?.state).toBe(maxHourlyCost === 1 ? 'offline' : 'starting');
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
+  it.each(['elastic', 'scheduler', 'quote', 'uncertain'] as const)('preserves %s protection without an hourly budget', async protection => {
+    const context = fixture();
+    delete context.configuration.elastic!.maxHourlyCost;
+    if (protection === 'elastic') context.configuration.elastic!.maxInstances = 1;
+    if (protection === 'scheduler') context.configuration.scheduler!.maxConcurrentInstances = 1;
+    if (protection === 'quote') context.platform.skuList.mockResolvedValue([{ ...context.sku, price: '1.01' }]);
+    if (protection === 'uncertain') context.store.saveResource(resource({ state: 'uncertain' }));
+    context.demand();
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+    if (protection === 'quote') expect(context.lifecycle.lastError).toBe('COMFY_SKU_QUOTE_UNVERIFIED');
+    if (protection === 'uncertain') expect(context.lifecycle.lastError).toBe('COMFY_RESOURCE_RECONCILIATION_REQUIRED');
+  });
+
   it.each(['overpriced', 'malformed', 'missing', 'wrong-area', 'wrong-sku'] as const)('rejects an unverified %s SKU quote', async scenario => {
     const context = fixture();
     context.demand();

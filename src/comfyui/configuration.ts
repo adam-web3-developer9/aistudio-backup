@@ -119,7 +119,6 @@ export async function loadComfyConfiguration(file: string, environment = process
       throw new Error('Elastic excessReleaseAfterMs must not exceed releaseAfterMs');
     }
     if (elastic.enabled) {
-      if (!elastic.maxHourlyCost) throw new Error('Enabled elastic configuration requires an explicit maxHourlyCost budget');
       if (!elastic.templates.length) throw new Error('Enabled elastic configuration requires templates');
       if (elastic.templates.some(template => template.skuPriceUnitVerified !== true)) throw new Error('Enabled elastic configuration requires skuPriceUnitVerified for every template');
       if (parsed.scheduler.maxConcurrentInstances > elastic.maxInstances) throw new Error('Scheduler maxConcurrentInstances must not exceed elastic maxInstances');

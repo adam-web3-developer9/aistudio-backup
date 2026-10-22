@@ -106,9 +106,9 @@ export class ComfyLifecycle {
     const warm = configuration.instances.filter(instance => !store.instance(instance.id)?.draining
       && ['ready', 'busy', 'starting'].includes(store.instance(instance.id)!.state)).length;
     let remaining = Math.min(policy.minWarmInstances, policy.maxConcurrentInstances) - warm;
-    if (configuration.elastic?.enabled) {
+    if (configuration.elastic?.enabled && configuration.elastic.maxHourlyCost !== undefined) {
       const cost = this.reservedCost();
-      if (cost === null || cost > (configuration.elastic.maxHourlyCost ?? 0)) return;
+      if (cost === null || cost > configuration.elastic.maxHourlyCost) return;
     }
     for (const configuration of this.options.configuration.instances) {
       if (remaining <= 0) return;
@@ -163,7 +163,7 @@ export class ComfyLifecycle {
     const policy = schedulerPolicy(configuration);
     const lastCreated = Math.max(0, ...resources.map(resource => resource.created_at));
     if (Date.now() - lastCreated < elastic.createCooldownMs) return;
-    const committed = this.reservedCost();
+    const committed = elastic.maxHourlyCost === undefined ? 0 : this.reservedCost();
     if (committed === null) { this.lastError = 'COMFY_COST_UNKNOWN'; return; }
     if (configuration.instances.length >= elastic.maxInstances || configuration.instances.length >= policy.maxConcurrentInstances) return;
     const templates = [...elastic.templates].sort((left, right) => (left.gpuModel === '4090' ? 1 : 0) - (right.gpuModel === '4090' ? 1 : 0) || left.hourlyCost - right.hourlyCost);
@@ -172,7 +172,7 @@ export class ComfyLifecycle {
         this.lastError = 'COMFY_SKU_PRICE_UNIT_UNVERIFIED'; continue;
       }
       if (!this.needsCapacity(template)) continue;
-      if (committed + template.hourlyCost + template.storageHourlyCost > (elastic.maxHourlyCost ?? 0)) {
+      if (elastic.maxHourlyCost !== undefined && committed + template.hourlyCost + template.storageHourlyCost > elastic.maxHourlyCost) {
         this.lastError = 'COMFY_ELASTIC_BUDGET_EXCEEDED'; continue;
       }
       const skus = await platform.skuList(template.areaName);

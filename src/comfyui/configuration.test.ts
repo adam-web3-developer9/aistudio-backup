@@ -295,12 +295,19 @@ describe('loadComfyConfiguration', () => {
     expect(loaded.elastic!.maxInstances).toBe(100);
   });
 
+  it('allows count-limited elastic creation without an hourly budget', async () => {
+    const loaded = await loadConfiguration({ ...configuration(), scheduler: { maxConcurrentInstances: 20 },
+      elastic: { enabled: true, maxInstances: 20, createCooldownMs: 10_000, templates: [elasticTemplate()] } });
+    expect(loaded.elastic!.maxHourlyCost).toBeUndefined();
+    expect(loaded.elastic!.maxInstances).toBe(20);
+    expect(loaded.scheduler!.maxConcurrentInstances).toBe(20);
+  });
+
   it.each([
-    { enabled: true, templates: [elasticTemplate()] },
     { enabled: true, maxHourlyCost: 10 },
     { enabled: true, maxHourlyCost: 10, templates: [] }
-  ])('requires an explicit budget and templates when elastic is enabled %#', async elastic => {
-    await expect(loadConfiguration({ ...configuration(), elastic })).rejects.toThrow(/budget|requires templates/);
+  ])('requires templates when elastic is enabled %#', async elastic => {
+    await expect(loadConfiguration({ ...configuration(), elastic })).rejects.toThrow('requires templates');
   });
 
   it.each(['maxInstances', 'maxHourlyCost', 'createCooldownMs', 'releaseAfterMs', 'reconcileTimeoutMs'])(

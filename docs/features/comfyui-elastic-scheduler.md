@@ -39,12 +39,12 @@
 
 elastic 默认不配置/不启用。启用必须提供：
 
-1. maxInstances、maxHourlyCost 和创建冷却；实例总数及并发上限均最多100。
-2. 每个现有实例的 lifecycle.hourlyCost、storageHourlyCost。费率未知时返回 COMFY_COST_UNKNOWN，禁止自动租新机器，不把未知费率当零。
+1. maxInstances 和创建冷却；实例总数及并发上限均最多100。maxHourlyCost 可选；不配置时只按实例数量限制容量。
+2. 配置 maxHourlyCost 时，每个现有实例必须提供 lifecycle.hourlyCost、storageHourlyCost。费率未知时返回 COMFY_COST_UNKNOWN，禁止自动租新机器，不把未知费率当零。
 3. 至少一个已验证模板：id、areaName、gpuModel、imageId、imageType、skuName、skuPriceToHourlyFactor、skuPriceUnitVerified、workflowIds、hourlyCost、storageHourlyCost、rebuildVerified、allowRelease。
 4. imageId 是保留精度的十进制 int64 字符串；imageType 仅官方的 "2"/"3"；创建使用 skuName，而不是臆造 skuId。单次只创建一台单GPU实例。
 
-按可分配、未绑定的排队工作量以及估计任务耗时计算目标容量；已绑定上传等待、结果收取不单独触发新增实例。容量足够、处于冷却、预算不足、存在未对账资源时不创建。官方没有明确SKU price字段的单位映射，必须由运营方核实并显式设置 skuPriceUnitVerified=true 和 skuPriceToHourlyFactor，不能默认字段就是每小时单价。每次创建前读取对应区域的官方SKU列表，使用已核实的换算系数核对型号和价格不超过模板上限。预算保守预留全部登记实例的计算及存储费率，包括停机实例可能重新开机的计算费用。
+按可分配、未绑定的排队工作量以及估计任务耗时计算目标容量；已绑定上传等待、结果收取不单独触发新增实例。容量足够、处于冷却、存在未对账资源，或配置了金额预算且预算不足时不创建。官方没有明确SKU price字段的单位映射，必须由运营方核实并显式设置 skuPriceUnitVerified=true 和 skuPriceToHourlyFactor，不能默认字段就是每小时单价。每次创建前读取对应区域的官方SKU列表，使用已核实的换算系数核对型号和价格不超过模板上限。配置金额预算时，保守预留全部登记实例的计算及存储费率，包括停机实例可能重新开机的计算费用；未配置时不执行金额预算检查。
 
 新增容量不超过实际可分配的任务数；SKU查询返回后再次核对队列和现有容量，避免等待报价期间任务已被其他实例处理，仍按旧需求租机。新资源注册后若平台已在启动或运行，继续探活至可分配，即使原队列已经消失也不遗漏启动检查；无任务时随后按业务闲置策略回收。
 
@@ -110,6 +110,6 @@ cost.isEstimate 始终为 true，includesHistoricalBilling 为 false；未知费
 
 ## 部署验收
 
-先完成 TypeScript 类型检查、全量 ComfyUI 回归和服务构建，再以真实SKU/镜像及费率配置预算。生产配置与令牌仅留服务器，不提交Git。必须先做镜像重建验收，才能批准对应实例的 allowRelease；不能用虚构价格或未经验证的镜像启用付费扩容及破坏性释放。
+先完成 TypeScript 类型检查、全量 ComfyUI 回归和服务构建，再以真实SKU/镜像及费率配置数量上限和可选金额预算。生产配置与令牌仅留服务器，不提交Git。必须先做镜像重建验收，才能批准对应实例的 allowRelease；不能用虚构价格或未经验证的镜像启用付费扩容及破坏性释放。
 
 本地模拟测试覆盖故障查询超时、同机串行/跨机独立、上传预约重排、创建不确定与重启、预算/数量/报价上限、空闲关机、外部占用、未收取结果保护、停机释放及释放不确定不重试。测试不会创建真实收费实例或删除生产磁盘。
