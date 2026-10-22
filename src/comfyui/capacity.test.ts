@@ -43,12 +43,12 @@ function fixture(overrides: Partial<Configuration> = {}, filename?: string, enab
     download: vi.fn<DataClient['download']>()
   }]));
   const statuses = new Map(configuration.instances.map(instance => [instance.id, '22']));
-  const idlePolicyClearer = vi.fn<NonNullable<ComfyServiceOptions['platform']['clearGpuIdleShutdown']>>().mockResolvedValue(undefined);
+  const idlePolicySetter = vi.fn<NonNullable<ComfyServiceOptions['platform']['setGpuIdleShutdown']>>().mockResolvedValue(undefined);
   const platform = {
     getInstanceStatus: vi.fn<ComfyServiceOptions['platform']['getInstanceStatus']>().mockImplementation(async id => statuses.get(id)!),
     openInstance: vi.fn<ComfyServiceOptions['platform']['openInstance']>().mockImplementation(async id => { statuses.set(id, '2'); }),
     closeInstance: vi.fn<ComfyServiceOptions['platform']['closeInstance']>(),
-    ...(enableIdlePolicy ? { clearGpuIdleShutdown: idlePolicyClearer } : {})
+    ...(enableIdlePolicy ? { setGpuIdleShutdown: idlePolicySetter } : {})
   };
   const assets = { get: vi.fn<ComfyServiceOptions['assets']['get']>(), read: vi.fn<ComfyServiceOptions['assets']['read']>() };
   const results = { save: vi.fn<ComfyServiceOptions['results']['save']>(), read: vi.fn<ComfyServiceOptions['results']['read']>() };
@@ -60,7 +60,7 @@ function fixture(overrides: Partial<Configuration> = {}, filename?: string, enab
       image: { filename: 'frame.png', contentType: 'image/png', sha256: 'a'.repeat(64) }
     } });
   const submit = (key = 'capacity') => service.submit(input(key)).job;
-  return { filename, db, store, configuration, service, clients, client: clients['1']!, platform, statuses, assets, results, input, submit, idlePolicyClearer };
+  return { filename, db, store, configuration, service, clients, client: clients['1']!, platform, statuses, assets, results, input, submit, idlePolicySetter };
 }
 
 beforeEach(() => { vi.spyOn(Date, 'now').mockReturnValue(startedAt); });
@@ -396,8 +396,8 @@ describe('capacity scheduling with SQLite and mock clients', () => {
   });
 
   it.each(['already-ready', 'newly-opened'])(
-    'clears GPU idle shutdown once before allocating or generating on an %s instance', async lifecycle => {
-      const { service, submit, platform, statuses, store, idlePolicyClearer, client } = fixture({}, undefined, true);
+    'applies idle shutdown once before allocating or generating on an %s instance', async lifecycle => {
+      const { service, submit, platform, statuses, store, idlePolicySetter, client } = fixture({}, undefined, true);
       if (lifecycle === 'already-ready') {
         statuses.set('1', '2');
         store.updateInstance('1', { state: 'ready' });
@@ -406,47 +406,47 @@ describe('capacity scheduling with SQLite and mock clients', () => {
       await service.tick();
       if (lifecycle === 'newly-opened') {
         expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
-        expect(idlePolicyClearer).not.toHaveBeenCalled();
+        expect(idlePolicySetter).not.toHaveBeenCalled();
         expect(service.get(job.id).stage).toBe('queued');
         await service.tick();
       }
-      expect(idlePolicyClearer).toHaveBeenCalledExactlyOnceWith('1');
-      expect(store.instance('1')).toMatchObject({ state: 'busy', idle_policy_applied_at: null });
+      expect(idlePolicySetter).toHaveBeenCalledExactlyOnceWith('1');
+      expect(store.instance('1')).toMatchObject({ state: 'busy', idle_policy_applied_at: startedAt });
       expect(service.get(job.id).stage).toBe('awaiting_upload');
       await service.tick();
       await service.tick();
-      expect(idlePolicyClearer).toHaveBeenCalledTimes(1);
+      expect(idlePolicySetter).toHaveBeenCalledTimes(1);
       service.completeInputs(job.id, { image: { name: 'frame.png', subfolder: job.id, type: 'input' } });
       await service.tick();
       await service.tick();
       expect(client.submit).toHaveBeenCalledTimes(1);
-      expect(idlePolicyClearer.mock.invocationCallOrder[0]!).toBeLessThan(client.submit.mock.invocationCallOrder[0]!);
-      expect(idlePolicyClearer).toHaveBeenCalledTimes(1);
+      expect(idlePolicySetter.mock.invocationCallOrder[0]!).toBeLessThan(client.submit.mock.invocationCallOrder[0]!);
+      expect(idlePolicySetter).toHaveBeenCalledTimes(1);
       expect(platform.closeInstance).not.toHaveBeenCalled();
     }
   );
 
-  it('clears GPU idle shutdown on an explicitly opened instance without inventing a generation job', async () => {
-    const { service, store, platform, idlePolicyClearer, client, db } = fixture({}, undefined, true);
+  it('sets the policy on an explicitly opened instance without inventing a generation job', async () => {
+    const { service, store, platform, idlePolicySetter, client, db } = fixture({}, undefined, true);
     service.control('1', 'open');
     await service.tick();
     expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
-    expect(idlePolicyClearer).not.toHaveBeenCalled();
+    expect(idlePolicySetter).not.toHaveBeenCalled();
     await service.tick();
     await service.tick();
-    expect(idlePolicyClearer).toHaveBeenCalledExactlyOnceWith('1');
-    expect(store.instance('1')).toMatchObject({ state: 'ready', idle_policy_applied_at: null, job_id: null });
+    expect(idlePolicySetter).toHaveBeenCalledExactlyOnceWith('1');
+    expect(store.instance('1')).toMatchObject({ state: 'ready', idle_policy_applied_at: startedAt, job_id: null });
     expect(db.prepare('SELECT COUNT(*) AS count FROM comfy_jobs').get()).toEqual({ count: 0 });
     expect(client.submit).not.toHaveBeenCalled();
     expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 
-  it('clears GPU idle shutdown again after external shutdown and reopening, but not during continued polling', async () => {
-    const { service, submit, statuses, store, platform, idlePolicyClearer } = fixture({}, undefined, true);
+  it('reapplies the policy after external shutdown and reopening, but not during continued polling', async () => {
+    const { service, submit, statuses, store, platform, idlePolicySetter } = fixture({}, undefined, true);
     statuses.set('1', '2');
     const first = submit('before-idle-shutdown');
     await service.tick();
-    expect(idlePolicyClearer).toHaveBeenCalledTimes(1);
+    expect(idlePolicySetter).toHaveBeenCalledTimes(1);
     service.cancel(first.id);
     await service.tick();
     expect(store.instance('1')!.job_id).toBeNull();
@@ -458,24 +458,23 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     await service.tick();
     expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
     expect(store.instance('1')).toMatchObject({ state: 'starting', idle_policy_applied_at: null });
-    expect(idlePolicyClearer).toHaveBeenCalledTimes(1);
+    expect(idlePolicySetter).toHaveBeenCalledTimes(1);
     await service.tick();
-    expect(idlePolicyClearer).toHaveBeenCalledTimes(2);
-    expect(store.instance('1')!.idle_policy_applied_at).toBeNull();
+    expect(idlePolicySetter).toHaveBeenCalledTimes(2);
+    expect(store.instance('1')!.idle_policy_applied_at).toBe(startedAt + 1_800_001);
     expect(service.get(second.id).stage).toBe('awaiting_upload');
     await service.tick();
     await service.tick();
-    expect(idlePolicyClearer).toHaveBeenCalledTimes(2);
+    expect(idlePolicySetter).toHaveBeenCalledTimes(2);
     expect(platform.closeInstance).not.toHaveBeenCalled();
   });
 
-  it('clears GPU idle shutdown again after service and SQLite connection restarts', async () => {
+  it('reapplies the platform idle safeguard after service and SQLite connection restarts despite the old timestamp', async () => {
     const first = fixture({}, undefined, true);
     first.statuses.set('1', '2');
     const job = first.submit('before-restart');
     await first.service.tick();
-    expect(first.idlePolicyClearer).toHaveBeenCalledTimes(1);
-    first.store.updateInstance('1', { idle_policy_applied_at: startedAt });
+    expect(first.idlePolicySetter).toHaveBeenCalledTimes(1);
     first.service.cancel(job.id);
     await first.service.tick();
     await first.service.close();
@@ -486,35 +485,35 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     await restarted.service.tick();
     expect(restarted.service.get(next.id).stage).toBe('awaiting_upload');
     expect(restarted.store.instance('1')!.idle_policy_applied_at).toBe(startedAt);
-    expect(restarted.idlePolicyClearer).toHaveBeenCalledExactlyOnceWith('1');
+    expect(restarted.idlePolicySetter).toHaveBeenCalledExactlyOnceWith('1');
     expect(restarted.platform.openInstance).not.toHaveBeenCalled();
     expect(restarted.platform.closeInstance).not.toHaveBeenCalled();
   });
 
   it.each(['already-ready', 'newly-opened'])(
-    'continues allocation and generation when GPU idle cancellation fails on an %s instance', async lifecycle => {
-      const { service, submit, platform, statuses, store, idlePolicyClearer, client, assets, results } = fixture({}, undefined, true);
+    'continues allocation and generation when the platform idle setter fails on an %s instance', async lifecycle => {
+      const { service, submit, platform, statuses, store, idlePolicySetter, client, assets, results } = fixture({}, undefined, true);
       if (lifecycle === 'already-ready') {
         statuses.set('1', '2');
         store.updateInstance('1', { state: 'ready' });
       }
-      idlePolicyClearer.mockRejectedValue({ code: 'NETWORK_ERROR' });
+      idlePolicySetter.mockRejectedValue({ code: 'BUSINESS_REJECTED' });
       const job = submit();
       await service.tick();
       await service.tick();
       await service.tick();
-      expect(idlePolicyClearer).toHaveBeenCalledTimes(1);
+      expect(idlePolicySetter).toHaveBeenCalledTimes(1);
       expect(store.instance('1')).toMatchObject({ job_id: job.id, idle_policy_applied_at: null, error_code: null });
       expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1' });
-      expect(store.events.list({ instanceId: '1' }).some(event => event.code === 'COMFY_GPU_IDLE_CLEAR_FAILED')).toBe(true);
+      expect(store.events.list({ instanceId: '1' }).some(event => event.code === 'COMFY_GPU_IDLE_SET_FAILED')).toBe(true);
       for (const operation of [client.submit, client.upload, client.download, assets.read, results.save, platform.closeInstance]) expect(operation).not.toHaveBeenCalled();
       expect(platform.openInstance).toHaveBeenCalledTimes(lifecycle === 'already-ready' ? 0 : 1);
-      idlePolicyClearer.mockResolvedValue(undefined);
+      idlePolicySetter.mockResolvedValue(undefined);
       vi.mocked(Date.now).mockReturnValue(startedAt + 30_000);
       await service.tick();
       expect(service.get(job.id).stage).toBe('awaiting_upload');
-      expect(store.instance('1')).toMatchObject({ idle_policy_applied_at: null, error_code: null });
-      expect(idlePolicyClearer).toHaveBeenCalledTimes(2);
+      expect(store.instance('1')).toMatchObject({ idle_policy_applied_at: Date.now(), error_code: null });
+      expect(idlePolicySetter).toHaveBeenCalledTimes(2);
       service.completeInputs(job.id, { image: { name: 'frame.png', subfolder: job.id, type: 'input' } });
       await service.tick();
       expect(client.submit).toHaveBeenCalledTimes(1);
@@ -522,14 +521,14 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     }
   );
 
-  it('keeps GPU idle cancellation optional for legacy mock platforms', async () => {
-    const { service, submit, statuses, platform, idlePolicyClearer } = fixture();
-    expect(platform.clearGpuIdleShutdown).toBeUndefined();
+  it('keeps the idle setter optional for legacy mock platforms', async () => {
+    const { service, submit, statuses, platform, idlePolicySetter } = fixture();
+    expect(platform.setGpuIdleShutdown).toBeUndefined();
     statuses.set('1', '2');
     const job = submit();
     await service.tick();
     expect(service.get(job.id).stage).toBe('awaiting_upload');
-    expect(idlePolicyClearer).not.toHaveBeenCalled();
+    expect(idlePolicySetter).not.toHaveBeenCalled();
   });
 
   it('never implements programmatic idle-close after the external idle-shutdown interval', async () => {

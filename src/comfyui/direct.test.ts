@@ -525,26 +525,26 @@ describe('direct upload reservation recovery after external GPU shutdown', () =>
     expect(restarted.client.submit).not.toHaveBeenCalled();
   });
 
-  it('restores health and clears GPU idle shutdown before returning to busy, then submits the original job exactly once', async () => {
+  it('restores health and sets the low-GPU fallback before returning to busy, then submits the original job exactly once', async () => {
     const { service, store, platform, client, job, receipt, startedAt } = await reservedUpload();
-    const clear = vi.fn<NonNullable<ComfyServiceOptions['platform']['clearGpuIdleShutdown']>>().mockResolvedValue(undefined);
-    service.options.platform.clearGpuIdleShutdown = clear;
+    const set = vi.fn<NonNullable<ComfyServiceOptions['platform']['setGpuIdleShutdown']>>().mockResolvedValue(undefined);
+    service.options.platform.setGpuIdleShutdown = set;
     await service.tick();
-    expect(clear).not.toHaveBeenCalled();
+    expect(set).not.toHaveBeenCalled();
     platform.getInstanceStatus.mockResolvedValue('11');
     await service.tick();
     platform.getInstanceStatus.mockResolvedValue('2');
     vi.mocked(Date.now).mockReturnValue(startedAt + 1_000);
     await service.tick();
     expect(client.health).toHaveBeenCalledTimes(1);
-    expect(clear).toHaveBeenCalledExactlyOnceWith('1');
+    expect(set).toHaveBeenCalledExactlyOnceWith('1');
     expect(store.instance('1')).toMatchObject({ state: 'busy', job_id: job.id,
-      action_started_at: null, idle_policy_applied_at: null });
+      action_started_at: null, idle_policy_applied_at: startedAt + 1_000 });
     expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', direct_inputs: null, prompt_id: job.prompt_id });
     expect(client.submit).not.toHaveBeenCalled();
     await service.tick();
-    expect(client.health).toHaveBeenCalledTimes(2);
-    expect(clear).toHaveBeenCalledTimes(1);
+    expect(client.health).toHaveBeenCalledTimes(1);
+    expect(set).toHaveBeenCalledTimes(1);
     service.completeInputs(job.id, receipt(job.id));
     await service.tick();
     service.completeInputs(job.id, receipt(job.id));

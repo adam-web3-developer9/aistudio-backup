@@ -76,7 +76,7 @@ test('an expired upload reservation gives the slot to another job without changi
   expect(() => service.completeInputs(waiting.id, {})).toThrow();
 });
 
-test('upload reservation retries are bounded and platform GPU idle shutdown is cleared once', async () => {
+test('upload reservation retries are bounded and the platform GPU idle policy is applied once', async () => {
   const { service, store, platform, configuration, submit } = fixture();
   const setGpuIdleShutdown = vi.fn().mockResolvedValue(undefined);
   Object.assign(platform, { setGpuIdleShutdown });
@@ -84,39 +84,42 @@ test('upload reservation retries are bounded and platform GPU idle shutdown is c
   expect(configuration.scheduler!.idleStopAfterMs).toBe(300_000);
   const job = submit('upload', true);
   await service.tick();
-  expect(store.instance('1')!.idle_policy_applied_at).toBeNull();
+  const appliedAt = store.instance('1')!.idle_policy_applied_at;
+  expect(appliedAt).toEqual(expect.any(Number));
   await service.tick();
-  expect(platform.clearGpuIdleShutdown).toHaveBeenCalledExactlyOnceWith('1');
+  expect(store.instance('1')!.idle_policy_applied_at).toBe(appliedAt);
   store.updateJob(job.id, { reservation_started_at: Date.now() - 60_001 });
   await service.tick();
   expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_UPLOAD_TIMEOUT' });
   expect(store.instance('1')!.job_id).toBeNull();
-  expect(setGpuIdleShutdown).not.toHaveBeenCalled();
-  expect(platform.clearGpuIdleShutdown).toHaveBeenCalledExactlyOnceWith('1');
+  expect(setGpuIdleShutdown).toHaveBeenCalledExactlyOnceWith('1');
+  expect(platform.clearGpuIdleShutdown).not.toHaveBeenCalled();
 });
 
-test('platform GPU idle shutdown is cleared once per boot, not once per upload tick', async () => {
+test('the platform GPU idle policy is applied once per boot, not once per upload tick', async () => {
   const { service, store, platform, clients, submit } = fixture();
   const setGpuIdleShutdown = vi.fn().mockResolvedValue(undefined);
   Object.assign(platform, { setGpuIdleShutdown });
   const job = submit('upload-reboot', true);
   await service.tick();
   await service.tick();
-  expect(platform.clearGpuIdleShutdown).toHaveBeenCalledExactlyOnceWith('1');
+  expect(setGpuIdleShutdown).toHaveBeenCalledExactlyOnceWith('1');
   platform.getInstanceStatus.mockResolvedValue('22');
   await service.tick();
   await service.tick();
   expect(platform.openInstance).toHaveBeenCalledExactlyOnceWith('1');
   expect(store.instance('1')!.idle_policy_applied_at).toBeNull();
-  expect(platform.clearGpuIdleShutdown).toHaveBeenCalledTimes(1);
+  expect(setGpuIdleShutdown).toHaveBeenCalledTimes(1);
   platform.getInstanceStatus.mockResolvedValue('2');
   await service.tick();
-  expect(store.instance('1')!.idle_policy_applied_at).toBeNull();
+  const appliedAt = store.instance('1')!.idle_policy_applied_at;
+  expect(appliedAt).toEqual(expect.any(Number));
   await service.tick();
-  expect(platform.clearGpuIdleShutdown.mock.calls).toEqual([['1'], ['1']]);
+  expect(setGpuIdleShutdown.mock.calls).toEqual([['1'], ['1']]);
+  expect(store.instance('1')!.idle_policy_applied_at).toBe(appliedAt);
   expect(service.get(job.id)).toMatchObject({ stage: 'awaiting_upload', instance_id: '1' });
   expect(clients[0]!.submit).not.toHaveBeenCalled();
-  expect(setGpuIdleShutdown).not.toHaveBeenCalled();
+  expect(platform.clearGpuIdleShutdown).not.toHaveBeenCalled();
 });
 
 test('a stopped instance with an uncertain submission is woken for the original attempt only', async () => {
@@ -279,43 +282,45 @@ test.each([
   const job = submit('timer');
   await service.tick();
   expect(service.get(job.id).stage).toBe('running');
-  expect(setGpuIdleShutdown).not.toHaveBeenCalled();
+  expect(setGpuIdleShutdown).toHaveBeenCalledExactlyOnceWith('1');
   const promptId = service.get(job.id).prompt_id;
   store.updateJob(job.id, { stage, provider_confirmed: 0 });
   store.updateInstance('1', { idle_policy_applied_at: null });
+  setGpuIdleShutdown.mockRejectedValue(new AigateError('BUSINESS_REJECTED', 'Timer configuration rejected'));
   await service.tick();
   expect(service.get(job.id)).toMatchObject({ stage: 'running', prompt_id: promptId, provider_confirmed: 1 });
   expect(clients[0]!.history).toHaveBeenCalledExactlyOnceWith(promptId);
   expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
   expect(clients[0]!.findAttempt).not.toHaveBeenCalled();
   expect(store.instance('1')!.job_id).toBe(job.id);
-  expect(setGpuIdleShutdown).not.toHaveBeenCalled();
-  expect(clearGpuIdleShutdown).toHaveBeenCalledTimes(scenario === 'missing' ? 0 : 1);
+  expect(setGpuIdleShutdown).toHaveBeenCalledTimes(1);
+  expect(clearGpuIdleShutdown).not.toHaveBeenCalled();
 });
 
-test('transient GPU idle cancellation failure does not block dispatch or query and recovers on its next retry', async () => {
+test('a rejected platform GPU idle safeguard does not block dispatch or query and recovers after its retry interval', async () => {
   const { service, store, platform, clients, submit } = fixture();
   const now = Date.now();
   vi.spyOn(Date, 'now').mockReturnValue(now);
-  const setGpuIdleShutdown = vi.fn();
+  const setGpuIdleShutdown = vi.fn().mockRejectedValueOnce(new AigateError('BUSINESS_REJECTED', 'Timer configuration rejected'))
+    .mockResolvedValue(undefined);
   Object.assign(platform, { setGpuIdleShutdown });
-  platform.clearGpuIdleShutdown.mockRejectedValueOnce(new AigateError('NETWORK_ERROR', 'Timer cancellation connection failed'));
   const job = submit('timer-recovery');
   await service.tick();
   expect(store.instance('1')).toMatchObject({ idle_policy_applied_at: null, error_code: null });
   expect(service.get(job.id).stage).toBe('running');
   expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
-  expect(store.events.list({ instanceId: '1' }).some(event => event.code === 'COMFY_GPU_IDLE_CLEAR_FAILED')).toBe(true);
+  expect(store.events.list({ instanceId: '1' }).some(event => event.code === 'COMFY_GPU_IDLE_SET_FAILED')).toBe(true);
   await service.tick();
   expect(clients[0]!.history).toHaveBeenCalledTimes(1);
-  expect(platform.clearGpuIdleShutdown).toHaveBeenCalledTimes(1);
+  expect(setGpuIdleShutdown).toHaveBeenCalledTimes(1);
   vi.mocked(Date.now).mockReturnValue(now + 30_000);
   await service.tick();
+  expect(store.instance('1')!.idle_policy_applied_at).toEqual(expect.any(Number));
   expect(service.get(job.id).stage).toBe('running');
-  expect(platform.clearGpuIdleShutdown.mock.calls).toEqual([['1'], ['1']]);
-  expect(setGpuIdleShutdown).not.toHaveBeenCalled();
+  await service.tick();
+  expect(setGpuIdleShutdown.mock.calls).toEqual([['1'], ['1']]);
   expect(clients[0]!.submit).toHaveBeenCalledTimes(1);
-  expect(store.events.list({ instanceId: '1' }).some(event => event.code === 'COMFY_GPU_IDLE_CLEARED')).toBe(true);
+  expect(platform.clearGpuIdleShutdown).not.toHaveBeenCalled();
 });
 
 test('expired preparation releases its slot even while the instance is backing off', async () => {
