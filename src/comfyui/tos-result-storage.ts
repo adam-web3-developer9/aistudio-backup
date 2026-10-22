@@ -1,4 +1,5 @@
 import { TosClient } from '@volcengine/tos-sdk';
+import { createHash, createHmac } from 'node:crypto';
 
 export interface ArchiveFile {
   size: number;
@@ -27,7 +28,7 @@ export interface TosResultStorageOptions {
 }
 
 type ArchiveClient = {
-  [Method in 'getPreSignedUrl' | 'headObject' | 'deleteObject']: OmitThisParameter<TosClient[Method]>;
+  [Method in 'headObject' | 'deleteObject']: OmitThisParameter<TosClient[Method]>;
 };
 
 function failure(code: string): Error & { code: string } {
@@ -48,11 +49,48 @@ function validKey(value: string): boolean {
     && value.split('/').every(part => part !== '' && part !== '.' && part !== '..');
 }
 
+function encodeSignaturePart(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g,
+    character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function signPut(origin: string, key: string, headers: Record<string, string>,
+  region: string, accessKeyId: string, accessKeySecret: string): string {
+  const datetime = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const date = datetime.slice(0, 8);
+  const scope = `${date}/${region}/tos/request`;
+  const path = '/' + key.split('/').map(encodeSignaturePart).join('/');
+  const signed = Object.entries({ ...headers, host: new URL(origin).host })
+    .map(([name, value]) => [name.toLowerCase(), value] as const)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  const signedHeaders = signed.map(([name]) => name).join(';');
+  const query = Object.entries({
+    'X-Tos-Algorithm': 'TOS4-HMAC-SHA256',
+    'X-Tos-Credential': `${accessKeyId}/${scope}`,
+    'X-Tos-Date': datetime,
+    'X-Tos-Expires': '900',
+    'X-Tos-SignedHeaders': signedHeaders,
+  }).map(([name, value]) => `${encodeSignaturePart(name)}=${encodeSignaturePart(value)}`).sort().join('&');
+  const canonical = ['PUT', path, query, signed.map(([name, value]) => `${name}:${value}\n`).join(''),
+    signedHeaders, 'UNSIGNED-PAYLOAD'].join('\n');
+  const toSign = ['TOS4-HMAC-SHA256', datetime, scope,
+    createHash('sha256').update(canonical).digest('hex')].join('\n');
+  let signingKey = Buffer.from(accessKeySecret, 'utf8');
+  for (const value of [date, region, 'tos', 'request']) {
+    signingKey = createHmac('sha256', signingKey).update(value).digest();
+  }
+  const signature = createHmac('sha256', signingKey).update(toSign).digest('hex');
+  return `${origin}${path}?${query}&X-Tos-Signature=${signature}`;
+}
+
 export class TosResultStorage implements ResultArchiveStorage {
   readonly #client: ArchiveClient;
   readonly #bucket: string;
   readonly #publicOrigin: string;
   readonly #prefix: string;
+  readonly #region: string;
+  readonly #accessKeyId: string;
+  readonly #accessKeySecret: string;
 
   constructor(options: TosResultStorageOptions, client?: ArchiveClient) {
     const { bucket, region, endpoint, accessKeyId, accessKeySecret } = options;
@@ -69,6 +107,9 @@ export class TosResultStorage implements ResultArchiveStorage {
     this.#bucket = bucket;
     this.#publicOrigin = `https://${bucket}.tos-${region}.volces.com`;
     this.#prefix = prefix;
+    this.#region = region;
+    this.#accessKeyId = accessKeyId;
+    this.#accessKeySecret = accessKeySecret;
     try {
       this.#client = client ?? new TosClient({
         bucket, region, endpoint: `tos-${region}.volces.com`, accessKeyId, accessKeySecret,
@@ -100,7 +141,7 @@ export class TosResultStorage implements ResultArchiveStorage {
       'x-tos-acl': 'public-read',
     };
     try {
-      const url = this.#client.getPreSignedUrl({ bucket: this.#bucket, key: objectKey, method: 'PUT', expires: 900 });
+      const url = signPut(this.#publicOrigin, objectKey, headers, this.#region, this.#accessKeyId, this.#accessKeySecret);
       return { url, headers };
     } catch {
       throw failure('TOS_ARCHIVE_UPLOAD_SIGN_FAILED');

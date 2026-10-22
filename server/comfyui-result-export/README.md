@@ -78,7 +78,7 @@ Content-Type: application/json
 
 示例仅展示额外字段，不能单独提交。每次请求重新生成 `expiresAt` 和 HMAC。
 
-签名服务在可信端为精确 bucket/key 签发 **PUT** URL，并给上传留足有效期。当前 TOS adapter 使用 SDK 2.9.1、900 秒 URL、`X-Tos-SignedHeaders=host`；扩展兼容这一真实签名格式，不擅自修改签名头清单。四个上传头由本协议强制校验且被 export HMAC 覆盖，但不能宣称它们被这个 TOS URL 的签名绑定；如果后续签名服务支持，建议把四个头也纳入 TOS 签名。HMAC 请求的 120 秒窗口仅用于请求准入；已验签且准入的操作，不在哈希后或 PUT 前重查该窗口，因此慢读超过 120 秒不会仅因请求 expiresAt 过期而失败。PUT 前仍重新检查 TOS 预签名 URL 尚未过期。describe 整个请求最多 60 秒，upload 整个请求（读正文、校验、哈希及上传）最多 600 秒，均与 HTTP client 保持一致。describe 的 60 秒包含完整读盘和哈希：5 GiB 是大小上限，不保证慢盘能在期限内完成，吞吐不足返回 TIMEOUT，不自动放宽时限。扩展不能离线验真 TOS 签名或从 URL 判断其签名方法，由 TOS 验证；扩展只发送 PUT。
+签名服务在可信端为精确 bucket/key 签发 **PUT** URL，并给上传留足有效期。当前 TOS adapter 使用900秒 TOS4 URL，`X-Tos-SignedHeaders=content-md5;content-type;host;x-tos-acl;x-tos-meta-sha256`，四个上传头同时被 URL 签名和 export HMAC 绑定。扩展拒绝缺少任一必需签名头的目标。SDK 2.9.1 的公开预签名接口仅签 host，真实上传会被 TOS 以403拒绝；PUT签名不再使用该接口，HEAD/DELETE仍使用SDK。HMAC 请求的 120 秒窗口仅用于请求准入；已验签且准入的操作，不在哈希后或 PUT 前重查该窗口，因此慢读超过 120 秒不会仅因请求 expiresAt 过期而失败。PUT 前仍重新检查 TOS 预签名 URL 尚未过期。describe 整个请求最多 60 秒，upload 整个请求（读正文、校验、哈希及上传）最多 600 秒，均与 HTTP client 保持一致。describe 的 60 秒包含完整读盘和哈希：5 GiB 是大小上限，不保证慢盘能在期限内完成，吞吐不足返回 TIMEOUT，不自动放宽时限。扩展不能离线验真 TOS 签名或从 URL 判断其签名方法，由 TOS 验证；扩展只发送 PUT。
 
 只接受标准 bucket 虚拟主机名 `*.tos-<region>.volces.com`：不接受 IP、自定义域名、内网 endpoint、用户信息、显式端口（包括 443）、片段或跳转。DNS 解析结果也必须是公网地址，连接使用经过检查的解析结果，不经环境代理。保留预签名 URL 的原始编码，不自动重编码。
 

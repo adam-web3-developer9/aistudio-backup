@@ -183,6 +183,16 @@ class TargetTests(unittest.TestCase):
             del destination["headers"][missing]
             with self.subTest(missing=missing), self.assertRaisesRegex(exporter.ExportError, "INVALID_TARGET"):
                 exporter.validate_target(destination, file_info(), CURRENT_MS)
+
+    def test_all_upload_headers_must_be_signed(self):
+        original = target()
+        for headers in ["host", "content-md5;content-type;host;x-tos-acl",
+                        "content-md5;content-type;host;x-tos-meta-sha256"]:
+            destination = dict(original, url=original["url"].replace(
+                "content-md5%3Bcontent-type%3Bhost%3Bx-tos-acl%3Bx-tos-meta-sha256",
+                headers.replace(";", "%3B")))
+            with self.subTest(headers=headers), self.assertRaisesRegex(exporter.ExportError, "INVALID_TARGET"):
+                exporter.validate_target(destination, file_info(), CURRENT_MS)
         for acl in ["private", "public-read-write", "", "PUBLIC-READ", "public-read\r\nHost: evil"]:
             destination = target()
             destination["headers"]["x-tos-acl"] = acl
@@ -634,13 +644,14 @@ process.stdout.write(JSON.stringify({ target, downloadUrl, generatedAt: Date.now
         self.assertEqual(download.fragment, "")
         self.assertNotIn("offline-test", fixture["downloadUrl"])
         self.assertEqual(query["X-Tos-Expires"], "900")
-        self.assertEqual(query["X-Tos-SignedHeaders"], "host")
-        self.assertEqual(query["X-Tos-Content-Sha256"], "UNSIGNED-PAYLOAD")
+        self.assertEqual(query["X-Tos-SignedHeaders"],
+                         "content-md5;content-type;host;x-tos-acl;x-tos-meta-sha256")
+        self.assertEqual(query.get("X-Tos-Content-Sha256", "UNSIGNED-PAYLOAD"), "UNSIGNED-PAYLOAD")
         self.assertIn(query["X-Tos-Credential"].split("/")[2], ["cn-beijing", "tos-cn-beijing.volces.com"])
         self.assertIn("%", parsed.path)
-        for changed_url in [url.replace("UNSIGNED-PAYLOAD", "untrusted"),
+        for changed_url in [url + "&X-Tos-Content-Sha256=untrusted",
                             url.replace("tos-cn-beijing.volces.com%2Ftos", "tos-cn-shanghai.volces.com%2Ftos"),
-                            url + "&X-Tos-Content-Sha256=UNSIGNED-PAYLOAD"]:
+                            url + "&X-Tos-Content-Sha256=UNSIGNED-PAYLOAD&X-Tos-Content-Sha256=UNSIGNED-PAYLOAD"]:
             if changed_url == url:
                 continue
             with self.assertRaisesRegex(exporter.ExportError, "INVALID_TARGET"):

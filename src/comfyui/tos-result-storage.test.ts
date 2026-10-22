@@ -47,12 +47,14 @@ describe('TosResultStorage', () => {
   it('returns public-read MP4 PUT headers and a 900-second target without exposing the client', () => {
     const { storage, client } = fixture();
     const target = storage.uploadTarget('job/video.mp4', file);
-    expect(target).toEqual({ url: 'https://signed.example.test/object', headers: {
+    expect(target.headers).toEqual({
       'Content-MD5': file.md5, 'Content-Type': 'video/mp4', 'x-tos-meta-sha256': file.sha256, 'x-tos-acl': 'public-read',
-    } });
-    expect(client.getPreSignedUrl).toHaveBeenCalledWith({
-      bucket: options.bucket, key: 'archive/results/job/video.mp4', method: 'PUT', expires: 900,
     });
+    const url = new URL(target.url);
+    expect(url.pathname).toBe('/archive/results/job/video.mp4');
+    expect(url.searchParams.get('X-Tos-Expires')).toBe('900');
+    expect(url.searchParams.get('X-Tos-SignedHeaders')).toBe('content-md5;content-type;host;x-tos-acl;x-tos-meta-sha256');
+    expect(client.getPreSignedUrl).not.toHaveBeenCalled();
     for (const value of [JSON.stringify(storage), inspect(storage), JSON.stringify(target.headers)]) {
       expect(value).not.toContain(options.accessKeyId);
       expect(value).not.toContain(options.accessKeySecret);
@@ -187,13 +189,11 @@ describe('TosResultStorage', () => {
     const { storage, client } = fixture();
     const secret = `https://host/?signature=secret ${options.accessKeyId} ${options.accessKeySecret}`;
     const unsafe = Object.assign(new Error(secret), { statusCode: 403, code: secret, config: { url: secret } });
-    client.getPreSignedUrl.mockImplementation(() => { throw unsafe; });
     client.headObject.mockRejectedValue(unsafe);
     client.deleteObject.mockRejectedValue(unsafe);
     expect(storage.downloadUrl('video.mp4', 60))
       .toBe('https://public-results.tos-cn-beijing.volces.com/archive/results/video.mp4');
     const operations = [
-      [() => storage.uploadTarget('video.mp4', file), 'TOS_ARCHIVE_UPLOAD_SIGN_FAILED'],
       [() => storage.head('video.mp4'), 'TOS_ARCHIVE_HEAD_FAILED'],
       [() => storage.delete('video.mp4'), 'TOS_ARCHIVE_DELETE_FAILED'],
     ] as const;
@@ -207,7 +207,7 @@ describe('TosResultStorage', () => {
     }
   });
 
-  it('creates real SDK signatures offline without exporting the secret key', () => {
+  it('creates header-bound PUT signatures offline without exporting the secret key', () => {
     const storage = new TosResultStorage({ ...options, endpoint: options.endpoint + '/' });
     const target = storage.uploadTarget('job/视频 +.mp4', file);
     const url = new URL(target.url);
@@ -227,7 +227,72 @@ describe('TosResultStorage', () => {
     expect(download.pathname).toBe(url.pathname);
     expect(download.search).toBe('');
     expect(target.headers['x-tos-acl']).toBe('public-read');
-    expect(url.searchParams.get('X-Tos-SignedHeaders')).toBe('host');
+    expect(url.searchParams.get('X-Tos-SignedHeaders')).toBe('content-md5;content-type;host;x-tos-acl;x-tos-meta-sha256');
+  });
+
+  it.each([
+    { key: 'job/video.mp4', path: '/archive/results/job/video.mp4',
+      signature: '2241194b7f41b6707c376aeb9dafaa1ebc904ac0c911b905f59d521e3a06e36f' },
+    { key: "job/视频 +%2F?#&=!'()*.mp4",
+      path: '/archive/results/job/%E8%A7%86%E9%A2%91%20%2B%252F%3F%23%26%3D%21%27%28%29%2A.mp4',
+      signature: '3b5a7a4c5d31bc92c9c86d35759366ecaf3fac5336bac96d6c9bfe4b9bc115f1' },
+  ])('matches Python tos 2.9.3 pre_signed_url(header, is_signed_all_headers=True) fixed vector ($key)', vector => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-22T01:02:03Z'));
+    try {
+      const { storage } = fixture();
+      const url = new URL(storage.uploadTarget(vector.key, file).url);
+      expect(url.origin).toBe('https://public-results.tos-cn-beijing.volces.com');
+      expect(url.pathname).toBe(vector.path);
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        'X-Tos-Algorithm': 'TOS4-HMAC-SHA256',
+        'X-Tos-Credential': 'test-access-key/20261022/cn-beijing/tos/request',
+        'X-Tos-Date': '20261022T010203Z',
+        'X-Tos-Expires': '900',
+        'X-Tos-SignedHeaders': 'content-md5;content-type;host;x-tos-acl;x-tos-meta-sha256',
+        'X-Tos-Signature': vector.signature,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('binds both digests, the object key and UTC date into the signature', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-22T23:59:59Z'));
+    try {
+      const { storage } = fixture();
+      const signature = (key: string, value: ArchiveFile) =>
+        new URL(storage.uploadTarget(key, value).url).searchParams.get('X-Tos-Signature');
+      const original = signature('video.mp4', file);
+      expect(signature('other.mp4', file)).not.toBe(original);
+      expect(signature('video.mp4', { ...file, sha256: 'a'.repeat(64) })).not.toBe(original);
+      expect(signature('video.mp4', { ...file, md5: 'AAAAAAAAAAAAAAAAAAAAAA==' })).not.toBe(original);
+      vi.setSystemTime(new Date('2026-10-23T00:00:00Z'));
+      expect(signature('video.mp4', file)).not.toBe(original);
+      expect(new URL(storage.uploadTarget('video.mp4', file).url).searchParams.get('X-Tos-Credential'))
+        .toBe('test-access-key/20261023/cn-beijing/tos/request');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sanitizes signing failures without exposing credentials', () => {
+    const { storage } = fixture();
+    const clock = vi.spyOn(Date.prototype, 'toISOString').mockImplementation(() => {
+      throw new Error(options.accessKeySecret);
+    });
+    try {
+      expect(() => storage.uploadTarget('video.mp4', file)).toThrow('TOS_ARCHIVE_UPLOAD_SIGN_FAILED');
+      try {
+        storage.uploadTarget('video.mp4', file);
+      } catch (error) {
+        expect(inspect(error)).not.toContain(options.accessKeySecret);
+        expect(error).not.toHaveProperty('cause');
+      }
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('configures bounded SDK requests without retries or CRC and preserves already-prefixed keys', () => {

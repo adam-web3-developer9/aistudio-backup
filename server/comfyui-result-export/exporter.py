@@ -274,7 +274,7 @@ def validate_target(target, file, current_ms=None):
         if not 1 <= expiry <= 604800 or signed_at > current + 120 or signed_at + expiry <= current:
             raise ValueError()
         signed_headers = query["X-Tos-SignedHeaders"].split(";")
-        if (signed_headers != sorted(set(signed_headers)) or "host" not in signed_headers
+        if (signed_headers != sorted(set(signed_headers)) or not (REQUIRED_HEADERS | {"host"}).issubset(signed_headers)
                 or set(signed_headers) - REQUIRED_HEADERS - {"host", "content-length"}):
             raise ValueError()
     except (ValueError, ExportError):
