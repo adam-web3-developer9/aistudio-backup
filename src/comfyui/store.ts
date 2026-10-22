@@ -184,6 +184,24 @@ export class ComfyStore {
       for (const instance of instances) this.updateInstance(instance.id, { job_id: null, state: instance.draining ? 'offline' : 'ready' });
     })();
   }
+  terminalSlot(instanceId: string): ComfyJob | undefined {
+    const id = this.instance(instanceId)?.job_id;
+    const job = id ? this.get(id) : undefined;
+    return job && ['failed', 'cancelled'].includes(job.stage) && !job.result && !job.result_pending
+      ? job : undefined;
+  }
+  settleStoppedSlot(instanceId: string): boolean {
+    return this.db.transaction(() => {
+      const instance = this.instance(instanceId);
+      const job = this.terminalSlot(instanceId);
+      if (!instance || !job) return false;
+      // The platform has stopped execution. Retain the last native observations rather than inventing render failures.
+      this.updateInstance(instanceId, { state: 'offline', stopped_at: instance.stopped_at ?? Date.now(),
+        job_id: null, error_code: null, next_action_at: null, action_started_at: null, action_sent: 0 });
+      this.events.record({ type: 'job.updated', jobId: job.id, instanceId, stage: job.stage, code: 'COMFY_EXECUTION_SLOT_RELEASED' });
+      return true;
+    })();
+  }
   selectNativeResult(id: string, promptId: string): boolean {
     return this.db.transaction(() => {
       const job = this.get(id)!;

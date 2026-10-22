@@ -176,8 +176,12 @@ export class ComfyService {
     if (!job || job.owner !== this.options.owner) throw new SystemError(404, 'JOB_NOT_FOUND', 'Unknown job');
     return job;
   }
+  private originalResourceState(job: ComfyJob) {
+    return job.instance_id ? this.store.resources().find(resource => resource.instance_id === job.instance_id)?.state : undefined;
+  }
   publicJob(job: ComfyJob) {
     const input = JSON.parse(job.input) as FrozenComfyInput;
+    const executionReleased = job.stage === 'failed' && job.error_code === 'COMFY_REMOTE_UNCONFIRMED' && this.originalResourceState(job) === 'released';
     const native = job.native_checkpoint ? nativeCheckpoint(job) : undefined;
     const archived = this.archive?.result(job.id);
     const archiveState = this.archive?.get(job.id);
@@ -196,7 +200,8 @@ export class ComfyService {
     const events = this.store.events.recent(job.id, 12);
     const waitingTargets = [...new Set(waiting.map(instance => this.options.configuration.instances.find(candidate => candidate.id === instance.id))
       .map(instance => [instance?.areaName, instance?.gpuModel].filter(Boolean).join(' / ')).filter(Boolean))];
-    const message = resultUnavailable ? unavailableArchive ? '视频归档存储暂不可用，请联系管理员；不会重新生成' : '视频临时保存已超过24小时，结果已过期；不会重新生成' :
+    const message = executionReleased ? `${job.finished_at !== null && job.finished_at >= job.deadline ? '任务已超时失败' : '原生提交未确认，任务已失败'}；原GPU实例已释放，不再等待原生回执或结果` :
+      resultUnavailable ? unavailableArchive ? '视频归档存储暂不可用，请联系管理员；不会重新生成' : '视频临时保存已超过24小时，结果已过期；不会重新生成' :
       assigned?.job_id === job.id && assigned.error_code === 'COMFY_RECOVERY_PAUSED' ? '已暂停自动开机恢复，保留原任务与素材，等待人工核对远端结果；不会重新生成' :
       uploadRecovery && starting ? '原GPU实例已离线，正在唤醒原实例；保留原任务和已上传素材' :
       capacityWaiting && !job.cancel_requested ? uploadRecovery && assigned ? '原GPU实例开机暂缺可分配GPU，正在轮询恢复；保留原任务和已上传素材' :
@@ -235,6 +240,7 @@ export class ComfyService {
   }
   async requestResultAvailability(id: string): Promise<ComfyJob> {
     let job = this.get(id);
+    if (this.originalResourceState(job) === 'released') return job;
     if (job.stage === 'failed' && job.error_code === 'COMFY_REMOTE_UNCONFIRMED' && job.instance_id &&
       !this.active && !this.processing.has(job.instance_id) && !this.collecting.has(id)) {
       // A released execution slot no longer receives background observation.
@@ -316,6 +322,9 @@ export class ComfyService {
       const job = this.get(id);
       const checkpoint = nativeCheckpoint(job);
       if (checkpoint.windowKey === requestKey || checkpoint.windowKeys?.includes(requestKey)) return job;
+      if (['releasing', 'released'].includes(this.originalResourceState(job) ?? '')) {
+        throw new SystemError(410, 'COMFY_EXECUTION_CLOSED', 'The original execution instance is being released or has already been released');
+      }
       if (job.stage !== 'failed' || job.error_code !== 'COMFY_REMOTE_UNCONFIRMED' || job.cancel_requested || job.result) {
         throw new SystemError(409, 'COMFY_RETRY_UNAVAILABLE', 'Only the original unconfirmed execution can be resumed');
       }

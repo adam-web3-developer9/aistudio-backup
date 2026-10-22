@@ -156,9 +156,9 @@ test('a malformed successful output cannot win selection ahead of a valid siblin
   expect(JSON.parse(service.get(job.id).result!).output.filename).toBe('valid.mp4');
 });
 
-test('manual native retry reclaims only its original slot and every old window key remains idempotent', async () => {
+test('manual native retry reclaims its original slot, keeps old keys idempotent and closes recovery after resource release', async () => {
   const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
-  const { service, store, client, job } = await fixture();
+  const { service, store, client, job, options } = await fixture();
   for (const elapsed of [0, 10_000, 30_000, 30_000]) {
     now.mockReturnValue(Date.now() + elapsed);
     await service.tick();
@@ -189,6 +189,31 @@ test('manual native retry reclaims only its original slot and every old window k
   expect(service.resumeSubmission(job.id, 'manual-window-1').deadline).toBe(second.deadline);
   expect(service.resumeSubmission(job.id, 'manual-window-2').deadline).toBe(second.deadline);
   expect(nativeCheckpoint(service.get(job.id)).windowKeys).toEqual(['manual-window-1', 'manual-window-2']);
+  now.mockReturnValue(second.deadline + 1);
+  store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
+  const closedJob = service.get(job.id);
+  const resource = { key: 'original-resource', name: 'original', state: 'releasing' as const, instance_id: '1',
+    configuration: null, template_id: 'fixture', hourly_cost: 1, storage_hourly_cost: 0.1,
+    created_at: Date.now(), updated_at: Date.now(), error_code: null };
+  store.saveResource(resource);
+  expect(() => service.resumeSubmission(job.id, 'manual-window-3')).toThrowError(expect.objectContaining({ statusCode: 410, code: 'COMFY_EXECUTION_CLOSED' }));
+  expect(service.resumeSubmission(job.id, 'manual-window-1')).toEqual(closedJob);
+  expect(service.get(job.id)).toEqual(closedJob);
+  store.saveResource({ ...resource, state: 'released' });
+  options.configuration.instances.splice(0);
+  const observedReads = client.history.mock.calls.length;
+  expect(await service.requestResultAvailability(job.id)).toEqual(closedJob);
+  expect(client.history).toHaveBeenCalledTimes(observedReads);
+  expect(() => service.resumeSubmission(job.id, 'manual-window-3')).toThrowError(expect.objectContaining({ statusCode: 410, code: 'COMFY_EXECUTION_CLOSED' }));
+  expect(service.resumeSubmission(job.id, 'manual-window-2')).toEqual(closedJob);
+  expect(service.get(job.id)).toEqual(closedJob);
+  const publicJob = service.publicJob(service.get(job.id));
+  expect(publicJob).toMatchObject({ status: 'failed', stage: 'failed', error: { code: 'COMFY_REMOTE_UNCONFIRMED', providerTerminal: false } });
+  expect(publicJob.progress.message).toContain('任务已超时失败');
+  expect(publicJob.progress.message).toContain('原GPU实例已释放');
+  expect(publicJob.progress.message).toContain('不再等待');
+  expect(client.submit).toHaveBeenCalledTimes(4);
+  expect(options.platform.openInstance).not.toHaveBeenCalled();
 });
 
 test('GET availability recovers a late original success after its empty slot was released without reopening submission', async () => {

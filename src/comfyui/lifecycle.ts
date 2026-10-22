@@ -309,6 +309,14 @@ export class ComfyLifecycle {
     const { store, platform } = this.options;
     let instance = store.instance(configuration.id)!;
     if (instance.state === 'closing' || instance.state === 'starting' || instance.state === 'waiting_capacity' || instance.draining) return;
+    if (store.terminalSlot(instance.id)) {
+      const status = await platform.getInstanceStatus(instance.id);
+      this.options.assertWorker();
+      if (status === '22' || status === '26') {
+        // Recompute the existing stopped-retention tier on the next tick after releasing this slot.
+        if (store.settleStoppedSlot(instance.id)) return;
+      }
+    }
     const policy = schedulerPolicy(this.options.configuration);
     if (store.hasComputeWork(instance.id) || this.compatible(configuration).length) {
       if (instance.idle_since !== null) store.updateInstance(instance.id, { idle_since: null });

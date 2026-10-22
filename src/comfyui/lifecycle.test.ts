@@ -773,13 +773,15 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(context.platform.releaseInstance).not.toHaveBeenCalled();
   });
 
-  it('stops GPU for a terminal unconfirmed result without releasing its recovery disk or execution identity', async () => {
+  it('closes an expired unconfirmed execution after confirmed stop and releases its disk after the original retention deadline', async () => {
     const context = fixture({ autoOpen: false });
     context.configuration.instances[0]!.lifecycle = { allowRelease: true, rebuildVerified: true, hourlyCost: 1, storageHourlyCost: 0.1 };
     const job = context.submit();
     expect(context.store.claim('1', ['render'], clock)?.id).toBe(job.id);
     context.store.updateJob(job.id, { stage: 'failed', provider_confirmed: 1,
-      error_code: 'COMFY_REMOTE_UNCONFIRMED', deadline: clock - 1 });
+      error_code: 'COMFY_REMOTE_UNCONFIRMED', deadline: clock - 1,
+      native_checkpoint: JSON.stringify({ attempts: [{ number: 1, marker: job.id, plannedId: job.prompt_id,
+        promptId: job.prompt_id, confirmed: true, state: 'running' }], windowStart: 0, nextAt: clock }) });
     const originalJob = context.store.get(job.id);
     await context.lifecycle.tick();
     expect(context.store.instance('1')?.idle_since).toBe(clock);
@@ -798,11 +800,38 @@ describe('ComfyLifecycle idle and release safety', () => {
     context.store.updateInstance('1', { state: 'offline', stopped_at: clock });
     clock += context.configuration.elastic!.releaseAfterMs;
     await context.lifecycle.tick();
-    expect(context.store.hasUnresolvedWork('1')).toBe(true);
-    expect(context.store.instance('1')?.job_id).toBe(job.id);
+    expect(context.store.hasUnresolvedWork('1')).toBe(false);
+    expect(context.store.instance('1')).toMatchObject({ state: 'offline', job_id: null,
+      stopped_at: clock - context.configuration.elastic!.releaseAfterMs });
+    expect(context.store.get(job.id)).toEqual(originalJob);
     expect(context.configuration.instances.map(instance => instance.id)).toEqual(['1']);
     expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledExactlyOnceWith('1');
     expect(context.platform.closeInstance).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears a failed stopped slot before checking new queued demand and recomputes the stopped retention tier', async () => {
+    const context = releasableFixture();
+    context.configuration.elastic!.releaseAfterMs = 1_800_000;
+    context.configuration.elastic!.stoppedRetention = { maxInstances: 1, excessReleaseAfterMs: 60_000 };
+    const stoppedAt = clock - 60_001;
+    const job = context.submit();
+    context.store.updateInstance('1', { state: 'ready' });
+    context.store.claim('1', ['render'], clock);
+    context.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED', deadline: clock + 60_000 });
+    context.store.updateInstance('1', { state: 'offline', stopped_at: stoppedAt });
+    const next = context.submit();
+    await context.lifecycle.tick();
+    expect(context.store.instance('1')).toMatchObject({ state: 'offline', job_id: null, stopped_at: stoppedAt });
+    expect(context.store.get(job.id)?.stage).toBe('failed');
+    expect(context.store.get(next.id)?.stage).toBe('queued');
+    context.store.updateJob(next.id, { stage: 'cancelled' });
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+    clock = stoppedAt + 1_800_000;
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledExactlyOnceWith('1');
   });
 
   it('retains the configured minimum number of warm instances', async () => {
