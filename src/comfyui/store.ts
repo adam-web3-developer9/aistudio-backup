@@ -20,7 +20,7 @@ export interface ComfyJob {
   stage: ComfyStage; instance_id: string | null; prompt_id: string; created_at: number;
   deadline: number; updated_at: number; error_code: string | null; result: string | null; result_pending: number; cancel_requested: number; provider_confirmed: number; direct_inputs: string | null;
   result_wake_requested: number; result_checked_at: number | null;
-  finished_at: number | null;
+  finished_at: number | null; collected_at: number | null;
   upload_reservations: number; eligible_at: number | null; queue_deadline: number | null; reservation_started_at: number | null;
 }
 export interface ComfyInstanceRow {
@@ -66,11 +66,19 @@ export class ComfyStore {
       CREATE TABLE IF NOT EXISTS comfy_resource_observations (
         resource_key TEXT PRIMARY KEY, status TEXT NOT NULL, observed_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS comfy_result_archives (
+        job_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, object_key TEXT NOT NULL UNIQUE, storage_identity TEXT NOT NULL,
+        output TEXT NOT NULL, ready_at INTEGER NOT NULL, state TEXT NOT NULL,
+        file TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL,
+        uploaded_at INTEGER, expires_at INTEGER, error_code TEXT
+      );
+      CREATE INDEX IF NOT EXISTS comfy_result_archives_due ON comfy_result_archives(state,next_at);
     `);
     for (const [table, columns] of Object.entries({
-      comfy_jobs: { direct_inputs: 'TEXT', result_wake_requested: 'INTEGER NOT NULL DEFAULT 0', result_checked_at: 'INTEGER', finished_at: 'INTEGER',
+      comfy_jobs: { direct_inputs: 'TEXT', result_wake_requested: 'INTEGER NOT NULL DEFAULT 0', result_checked_at: 'INTEGER', finished_at: 'INTEGER', collected_at: 'INTEGER',
         upload_reservations: 'INTEGER NOT NULL DEFAULT 0', eligible_at: 'INTEGER', queue_deadline: 'INTEGER', reservation_started_at: 'INTEGER' },
       comfy_instances: { capacity_started_at: 'INTEGER', next_action_at: 'INTEGER', idle_policy_applied_at: 'INTEGER', idle_since: 'INTEGER', stopped_at: 'INTEGER' },
+      comfy_result_archives: { storage_identity: "TEXT NOT NULL DEFAULT ''" },
     })) {
       const existing = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name));
       for (const [name, type] of Object.entries(columns)) if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
@@ -130,15 +138,15 @@ export class ComfyStore {
         details: { fromState: prior.state, toState: current.state, ...details } });
     }
   }
-  updateJob(id: string, patch: Partial<Pick<ComfyJob, 'stage' | 'prompt_id' | 'error_code' | 'result' | 'result_pending' | 'cancel_requested' | 'provider_confirmed' | 'direct_inputs' | 'deadline' | 'result_wake_requested' | 'result_checked_at' | 'upload_reservations' | 'eligible_at' | 'queue_deadline' | 'reservation_started_at'>>, details?: ComfyEventDetails): void {
+  updateJob(id: string, patch: Partial<Pick<ComfyJob, 'stage' | 'prompt_id' | 'error_code' | 'result' | 'result_pending' | 'cancel_requested' | 'provider_confirmed' | 'direct_inputs' | 'deadline' | 'result_wake_requested' | 'result_checked_at' | 'upload_reservations' | 'eligible_at' | 'queue_deadline' | 'reservation_started_at' | 'collected_at'>>, details?: ComfyEventDetails): void {
     const prior = this.get(id);
     const terminal = patch.stage && ['succeeded', 'failed', 'cancelled'].includes(patch.stage);
     const fields = Object.entries({ ...patch, updated_at: Date.now(), ...(patch.stage && prior?.stage !== patch.stage ? { finished_at: terminal ? Date.now() : null } : {}) });
     this.db.prepare(`UPDATE comfy_jobs SET ${fields.map(([key]) => `${key}=?`).join(',')} WHERE id=?`).run(...fields.map(([, value]) => value), id);
     const current = this.get(id);
-    if (prior && current && ['stage', 'error_code', 'provider_confirmed', 'cancel_requested', 'direct_inputs', 'result_pending', 'result_wake_requested'].some(key => prior[key as keyof ComfyJob] !== current[key as keyof ComfyJob])) {
+    if (prior && current && ['stage', 'error_code', 'provider_confirmed', 'cancel_requested', 'direct_inputs', 'result_pending', 'result_wake_requested', 'collected_at'].some(key => prior[key as keyof ComfyJob] !== current[key as keyof ComfyJob])) {
       this.events.record({ type: 'job.updated', jobId: id, ...(current.instance_id ? { instanceId: current.instance_id } : {}), stage: current.stage,
-        ...(current.error_code ? { code: current.error_code } : {}), details: { fromStage: prior.stage, toStage: current.stage, ...details } });
+        ...(current.error_code ? { code: current.error_code } : current.collected_at !== prior.collected_at ? { code: 'COMFY_CLIENT_COLLECTED' } : {}), details: { fromStage: prior.stage, toStage: current.stage, ...details } });
     }
   }
   claim(instanceId: string, workflowIds: string[], now = Date.now()): ComfyJob | undefined {
@@ -165,6 +173,10 @@ export class ComfyStore {
   pendingResults(instanceId: string): ComfyJob[] {
     return this.db.prepare('SELECT * FROM comfy_jobs WHERE instance_id=? AND result_pending=1').all(instanceId) as ComfyJob[];
   }
+  unarchivedResults(owner: string): ComfyJob[] {
+    return this.db.prepare(`SELECT * FROM comfy_jobs WHERE owner=? AND stage='succeeded' AND result_pending=1
+      AND result IS NOT NULL AND NOT EXISTS (SELECT 1 FROM comfy_result_archives WHERE job_id=comfy_jobs.id)`).all(owner) as ComfyJob[];
+  }
   requeueUpload(id: string, retryDelayMs: number, now = Date.now()): boolean {
     return this.db.transaction(() => {
       const job = this.get(id);
@@ -179,7 +191,8 @@ export class ComfyStore {
   }
   hasUnresolvedWork(instanceId: string): boolean {
     return !!this.instance(instanceId)?.job_id || !!this.db.prepare(`SELECT 1 FROM comfy_jobs WHERE instance_id=?
-      AND (result_pending=1 OR stage IN ('queued','preparing','awaiting_upload','submitting','running','collecting')) LIMIT 1`).get(instanceId);
+      AND (result_pending=1 OR stage IN ('queued','preparing','awaiting_upload','submitting','running','collecting')) LIMIT 1`).get(instanceId)
+      || !!this.db.prepare("SELECT 1 FROM comfy_result_archives WHERE instance_id=? AND state='transferring' LIMIT 1").get(instanceId);
   }
   resources(): ComfyResource[] { return this.db.prepare('SELECT * FROM comfy_resources ORDER BY key').all() as ComfyResource[]; }
   resource(key: string): ComfyResource | undefined { return this.db.prepare('SELECT * FROM comfy_resources WHERE key=?').get(key) as ComfyResource | undefined; }

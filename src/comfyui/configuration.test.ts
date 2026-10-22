@@ -4,8 +4,11 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { loadComfyConfiguration } from './configuration.js';
 import { compileWorkflow } from './workflow.js';
+import { comfyOptionsFromEnv } from './runtime.js';
 
 const directories: string[] = [];
+const resultArchive = { bucket: 'public-results', region: 'cn-beijing', endpoint: 'https://tos-cn-beijing.volces.com',
+  publicReadApproved: true, gpuExporterVerified: true };
 const schedulerDefaults = {
   uploadReservationTimeoutMs: 600_000, uploadRetryDelayMs: 60_000, maxUploadReservations: 3,
   idleStopAfterMs: 300_000, minWarmInstances: 0, maxConcurrentInstances: 6,
@@ -60,6 +63,34 @@ afterEach(async () => {
 });
 
 describe('loadComfyConfiguration', () => {
+  it('keeps result archiving opt-in and requires explicit public read approval and exporter verification', async () => {
+    const legacy = await loadConfiguration(configuration());
+    expect(legacy.resultArchive).toBeUndefined();
+    const enabled = await loadConfiguration({ ...configuration(), resultArchive });
+    expect(enabled.resultArchive).toEqual({ ...resultArchive, keyPrefix: 'comfy-results' });
+  });
+
+  it.each([
+    { publicReadApproved: false }, { gpuExporterVerified: false }, { region: 'cn-shanghai' },
+    { endpoint: 'http://tos-cn-beijing.volces.com' }, { endpoint: 'https://127.0.0.1' },
+    { endpoint: 'https://tos-cn-beijing.volces.com.evil.test' }, { bucket: '../private' },
+    { keyPrefix: '../results' }, { keyPrefix: '/results' }, { accessKeySecret: 'must-not-be-in-json' },
+  ])('rejects unsafe archive configuration %#', async patch => {
+    await expect(loadConfiguration({ ...configuration(), resultArchive: { ...resultArchive, ...patch } })).rejects.toThrow();
+  });
+
+  it('loads archive secrets only from the explicit server environment', async () => {
+    const file = await fixture({ ...configuration(), resultArchive });
+    const environment = { SYSTEM_COMFYUI_CONFIG: file, AIGATE_ACCESS_TOKEN: 'fixture-aigate', COMFY_TEST_SECRET: 'test-secret',
+      COMFY_TOS_ACCESS_KEY_ID: 'fixture-id', COMFY_TOS_ACCESS_KEY_SECRET: 'fixture-secret', COMFY_RESULT_EXPORT_SECRET: 'x'.repeat(32) };
+    const loaded = await comfyOptionsFromEnv(environment);
+    expect(loaded?.archiveSecrets).toEqual({ accessKeyId: 'fixture-id', accessKeySecret: 'fixture-secret', exporterSecret: 'x'.repeat(32) });
+    expect(JSON.stringify(loaded?.configuration)).not.toContain('fixture-secret');
+    for (const field of ['COMFY_TOS_ACCESS_KEY_ID', 'COMFY_TOS_ACCESS_KEY_SECRET', 'COMFY_RESULT_EXPORT_SECRET']) {
+      await expect(comfyOptionsFromEnv({ ...environment, [field]: '' })).rejects.toThrow('credentials');
+    }
+  });
+
   it('loads a relative API graph fixture, resolves explicit secrets, and applies pool defaults', async () => {
     const file = await fixture();
     const loaded = await loadComfyConfiguration(file, { COMFY_TEST_SECRET: 'Bearer fixture-secret' });

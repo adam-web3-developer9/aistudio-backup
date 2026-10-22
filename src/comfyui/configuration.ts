@@ -60,6 +60,14 @@ const configurationSchema = z.object({
   capacityWaitTimeoutMs: z.number().int().min(60_000).max(604_800_000).default(21_600_000),
   capacityErrorCodes: z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$/)).max(100).default([]),
   scheduler: schedulerSchema.prefault({}),
+  resultArchive: z.object({
+    bucket: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/),
+    region: z.string().regex(/^[a-z]{2}(?:-[a-z0-9]+)+$/),
+    endpoint: z.string().regex(/^https:\/\/tos-[a-z]{2}(?:-[a-z0-9]+)+\.volces\.com$/),
+    keyPrefix: z.string().regex(/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/).default('comfy-results'),
+    publicReadApproved: z.literal(true),
+    gpuExporterVerified: z.literal(true),
+  }).strict().optional(),
   elastic: elasticSchema.optional(),
   instances: z.array(z.object({
     id: z.string().regex(/^\d{1,30}$/), baseUrl: z.url(),
@@ -84,6 +92,7 @@ export interface ComfyPoolConfiguration {
   capacityPollIntervalMs?: number; capacityWaitTimeoutMs?: number; capacityErrorCodes?: string[];
   scheduler?: ComfySchedulerConfiguration;
   elastic?: ComfyElasticConfiguration;
+  resultArchive?: z.infer<typeof configurationSchema>['resultArchive'];
   instances: Array<{ id: string; baseUrl: string; areaName?: '华东一区' | '华东二区'; gpuModel?: '5090' | '4090'; headers?: Record<string, string>; workflowIds: string[]; lifecycle?: ComfyInstanceLifecycleConfiguration }>;
   workflows: WorkflowProfile[];
 }
@@ -96,6 +105,9 @@ export async function loadComfyConfiguration(file: string, environment = process
     throw new Error('Instance allowRelease requires rebuildVerified');
   }
   const elastic = parsed.elastic;
+  if (parsed.resultArchive && parsed.resultArchive.endpoint !== `https://tos-${parsed.resultArchive.region}.volces.com`) {
+    throw new Error('Result archive endpoint must match its region');
+  }
   if (elastic) {
     if (new Set(elastic.templates.map(template => template.id)).size !== elastic.templates.length) throw new Error('Duplicate ComfyUI elastic template ID');
     if (elastic.templates.some(template => template.workflowIds.some(id => !parsed.workflows.some(profile => profile.id === id)))) {

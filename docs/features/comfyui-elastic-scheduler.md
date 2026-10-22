@@ -64,6 +64,8 @@ elastic 默认不配置/不启用。启用必须提供：
 
 ## 磁盘释放
 
+可选的已生成未收取结果兜底见 `comfyui-result-archive.md`：10分钟未收取时由GPU直传公开可读的TOS对象，核验并持久保存后才解除该结果的回收保护。默认关闭，不能把未知远端任务当成可归档结果。
+
 close 与 release 分别处理。配置 elastic.releaseAfterMs（默认停机后1小时）只提供回收时间；每台实例还必须显式 allowRelease=true 且 rebuildVerified=true。授权与镜像重建验收完成后，原有实例和弹性新增实例使用同一套关机、释放规则，不按创建来源保留磁盘。缺省值为 false 是未授权保护，不是原有实例永久豁免。
 
 可选 `elastic.stoppedRetention` 启用分层停机保留；省略则沿用所有实例相同的 `releaseAfterMs`，不自动改变旧配置。建议按以下配置仅留1台停机实例30分钟，其余确认停机后1分钟释放：

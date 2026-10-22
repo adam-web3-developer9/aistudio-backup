@@ -12,6 +12,7 @@ import type { ComfyEventDetails } from './events.js';
 import { schedulerPolicy } from './scheduler.js';
 import { ComfyLifecycle } from './lifecycle.js';
 import { comfyPoolMetrics } from './metrics.js';
+import { ComfyResultArchive, type ResultArchiveOptions } from './result-archive.js';
 
 type InstanceConfiguration = ComfyPoolConfiguration['instances'][number];
 type DataClient = Pick<ComfyClient, 'health' | 'queue' | 'upload' | 'submit' | 'history' | 'findAttempt' | 'download'>;
@@ -24,6 +25,7 @@ export interface ComfyServiceOptions {
   results: Pick<ComfyResultStore, 'save' | 'read'>;
   ownsAsset: (id: string) => boolean;
   owner: string;
+  resultArchive?: ResultArchiveOptions;
 }
 const completeStages = new Set(['succeeded', 'failed', 'cancelled']);
 const stageMessages: Record<string, string> = {
@@ -50,6 +52,7 @@ function diagnosticDetails(error: unknown): ComfyEventDetails {
 export class ComfyService {
   readonly store: ComfyStore;
   readonly lifecycle: ComfyLifecycle;
+  readonly archive?: ComfyResultArchive;
   private readonly worker = randomUUID();
   private readonly closing = new AbortController();
   private readonly collecting = new Map<string, Promise<void>>();
@@ -61,11 +64,13 @@ export class ComfyService {
 
   constructor(readonly options: ComfyServiceOptions) {
     this.store = options.store;
+    if (options.resultArchive) this.archive = new ComfyResultArchive(this.store, options.resultArchive,
+      () => this.assertWorker(), this.closing.signal);
     this.lifecycle = new ComfyLifecycle({ store: this.store, configuration: options.configuration, platform: options.platform,
       client: options.client, assertWorker: () => this.assertWorker() });
     this.store.registerInstances(options.configuration.instances.map(instance => instance.id));
     const registered = new Set(options.configuration.instances.map(instance => instance.id));
-    if (this.store.instances().some(instance => !registered.has(instance.id) && (instance.job_id || this.store.pendingResults(instance.id).length))) {
+    if (this.store.instances().some(instance => !registered.has(instance.id) && this.store.hasUnresolvedWork(instance.id))) {
       throw new Error('Cannot remove a ComfyUI instance with unresolved work');
     }
   }
@@ -85,6 +90,7 @@ export class ComfyService {
     await Promise.allSettled(this.processing.values());
     await this.lifecycle.close();
     await Promise.allSettled(this.collecting.values());
+    await this.archive?.close();
     this.store.releaseWorker(this.worker);
   }
   private assertWorker(): void {
@@ -162,6 +168,10 @@ export class ComfyService {
   }
   publicJob(job: ComfyJob) {
     const input = JSON.parse(job.input) as FrozenComfyInput;
+    const archived = this.archive?.result(job.id);
+    const archiveState = this.archive?.get(job.id);
+    const unavailableArchive = !!job.result && (JSON.parse(job.result) as { storage?: string }).storage === 'tos' && !archived;
+    const resultUnavailable = archived?.expired || unavailableArchive;
     const candidates = this.store.instances().filter(instance => !instance.draining && this.options.configuration.instances.some(candidate => candidate.id === instance.id && candidate.workflowIds.includes(input.workflowId)));
     const assigned = job.instance_id ? this.store.instance(job.instance_id) : undefined;
     const uploadRecovery = ['awaiting_upload', 'preparing'].includes(job.stage) && input.transport === 'direct';
@@ -171,17 +181,18 @@ export class ComfyService {
     const recovering = !starting && !capacityWaiting ? (uploadRecovery && assigned?.state === 'offline' ? assigned : job.stage === 'queued' ? candidates.find(instance => !instance.job_id && instance.state === 'offline' && instance.error_code) : undefined) : undefined;
     const configuration = this.options.configuration.instances.find(instance => instance.id === (job.instance_id ?? starting?.id ?? waiting[0]?.id ?? recovering?.id));
     const wakingResult = !!job.result_wake_requested && job.stage === 'succeeded';
-    const stage = job.cancel_requested ? 'cancelled' : wakingResult ? 'preparing_result' : recovering ? 'waiting_instance' : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
+    const stage = job.cancel_requested ? 'cancelled' : resultUnavailable ? unavailableArchive ? 'result_unavailable' : 'result_expired' : wakingResult ? 'preparing_result' : recovering ? 'waiting_instance' : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
     const events = this.store.events.recent(job.id, 12);
     const waitingTargets = [...new Set(waiting.map(instance => this.options.configuration.instances.find(candidate => candidate.id === instance.id))
       .map(instance => [instance?.areaName, instance?.gpuModel].filter(Boolean).join(' / ')).filter(Boolean))];
-    const message = assigned?.job_id === job.id && assigned.error_code === 'COMFY_RECOVERY_PAUSED' ? '已暂停自动开机恢复，保留原任务与素材，等待人工核对远端结果；不会重新生成' :
+    const message = resultUnavailable ? unavailableArchive ? '视频归档存储暂不可用，请联系管理员；不会重新生成' : '视频临时保存已超过24小时，结果已过期；不会重新生成' :
+      assigned?.job_id === job.id && assigned.error_code === 'COMFY_RECOVERY_PAUSED' ? '已暂停自动开机恢复，保留原任务与素材，等待人工核对远端结果；不会重新生成' :
       uploadRecovery && starting ? '原GPU实例已离线，正在唤醒原实例；保留原任务和已上传素材' :
       capacityWaiting && !job.cancel_requested ? uploadRecovery && assigned ? '原GPU实例开机暂缺可分配GPU，正在轮询恢复；保留原任务和已上传素材' :
         `已登记实例开机暂缺可分配GPU，正在轮询候卡${waitingTargets.length ? `（${waitingTargets.join('、')}）` : ''}；尚未开始生成` :
       recovering ? recovering.error_code === 'COMFY_EXTERNAL_OCCUPANCY' ? '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交' : `GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（${recovering.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` : stageMessages[stage]!;
     return {
-      id: job.id, adapterId: 'comfyui-v1', status: wakingResult && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
+      id: job.id, adapterId: 'comfyui-v1', status: resultUnavailable ? 'failed' : wakingResult && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
       createdAt: new Date(job.created_at).toISOString(),
       updatedAt: new Date(job.updated_at).toISOString(),
       ...(job.finished_at ? { finishedAt: new Date(job.finished_at).toISOString() } : {}),
@@ -191,15 +202,19 @@ export class ComfyService {
         ...(capacityWaiting ? { nextRetryAt: new Date(Math.min(...waiting.map(instance => instance.next_action_at ?? Date.now()))).toISOString(),
           waitingSince: new Date(Math.min(...waiting.map(instance => instance.capacity_started_at ?? job.created_at))).toISOString() } : {}),
         ...(recovering ? { nextRetryAt: new Date(recovering.next_action_at ?? Date.now()).toISOString() } : {}),
+        ...(archiveState ? { archive: { state: archiveState.state, attempts: archiveState.attempts,
+          nextActionAt: archiveState.next_at, expiresAt: archiveState.expires_at, errorCode: archiveState.error_code } } : {}),
         ...(input.transport === 'direct' ? { upload: { completed: job.direct_inputs ? Object.keys(input.directMedia ?? {}).length : 0, total: Object.keys(input.directMedia ?? {}).length } } : {}),
       },
       events,
-      ...(job.result && stage === 'succeeded' ? { result: { videoUrl: input.transport === 'direct' ? (JSON.parse(job.result) as { videoUrl: string }).videoUrl : `/v1/jobs/${job.id}/result` } } : {}),
+      ...(job.result && stage === 'succeeded' ? { result: { videoUrl: archived?.videoUrl ?? (input.transport === 'direct' ? (JSON.parse(job.result) as { videoUrl: string }).videoUrl : `/v1/jobs/${job.id}/result`),
+        ...(archived ? { storage: archived.storage, expiresAt: archived.expiresAt } : {}) } } : {}),
       ...(stage === 'awaiting_upload' && assigned?.state === 'busy' && configuration && input.transport === 'direct' ? { upload: {
         baseUrl: configuration.baseUrl, subfolder: job.id,
         files: Object.entries(input.directMedia ?? {}).map(([binding, media]) => ({ binding, ...media })),
       } } : {}),
-      ...(job.error_code ? { error: { code: job.error_code, message: `${stageMessages[job.cancel_requested ? 'cancelled' : 'failed']}（${job.error_code}）`, retryable: false } } : {}),
+      ...(resultUnavailable ? { error: { code: unavailableArchive ? 'COMFY_ARCHIVE_UNAVAILABLE' : 'COMFY_RESULT_EXPIRED', message, retryable: false } }
+        : job.error_code ? { error: { code: job.error_code, message: `${stageMessages[job.cancel_requested ? 'cancelled' : 'failed']}（${job.error_code}）`, retryable: false } } : {}),
     };
   }
   async requestResultAvailability(id: string): Promise<ComfyJob> {
@@ -241,7 +256,7 @@ export class ComfyService {
     const job = this.get(id);
     const input = JSON.parse(job.input) as FrozenComfyInput;
     if (input.transport !== 'direct' || job.stage !== 'succeeded' || !job.result) throw new SystemError(409, 'COMFY_RESULT_UNAVAILABLE', 'The original direct result is not ready');
-    this.store.updateJob(id, { result_pending: 0, result_wake_requested: 0 });
+    this.store.updateJob(id, { result_pending: 0, result_wake_requested: 0, collected_at: job.collected_at ?? Date.now() });
     this.store.releaseSlot(id);
     return this.get(id);
   }
@@ -255,7 +270,7 @@ export class ComfyService {
     if (!this.options.configuration.instances.some(instance => instance.id === id)) throw new SystemError(404, 'COMFY_INSTANCE_UNKNOWN', 'Instance is not registered in this pool');
     const instance = this.store.instance(id)!;
     if (action === 'drain') { this.store.updateInstance(id, { draining: 1 }); return; }
-    if (instance.job_id || action === 'close' && this.store.pendingResults(id).length || instance.state === 'starting' || instance.state === 'closing') throw new SystemError(409, 'COMFY_INSTANCE_BUSY', 'Instance has active or unresolved work');
+    if (instance.job_id || action === 'close' && this.store.hasUnresolvedWork(id) || instance.state === 'starting' || instance.state === 'closing') throw new SystemError(409, 'COMFY_INSTANCE_BUSY', 'Instance has active or unresolved work');
     this.store.updateInstance(id, { state: action === 'open' ? 'starting' : 'closing', draining: action === 'close' ? 1 : 0,
       action_started_at: Date.now(), action_sent: 0, error_code: null, ...(action === 'open' ? { idle_policy_applied_at: null } : {}) });
   }
@@ -282,6 +297,22 @@ export class ComfyService {
     return operation;
   }
   private async runTick(): Promise<void> {
+    if (this.archive) {
+      for (const job of this.store.unarchivedResults(this.options.owner)) {
+        const result = JSON.parse(job.result!) as { output?: import('./comfy-client.js').ComfyOutput; videoUrl?: string };
+        if (result.output) this.archive.plan(job, result.output);
+        else if (result.videoUrl) {
+          const instance = this.options.configuration.instances.find(instance => instance.id === job.instance_id);
+          if (!instance) continue;
+          try {
+            const url = new URL(result.videoUrl);
+            if (url.origin + url.pathname !== instance.baseUrl.replace(/\/$/, '') + '/view' || url.username || url.password || url.hash) continue;
+            this.archive.plan(job, { filename: url.searchParams.get('filename') ?? '', subfolder: url.searchParams.get('subfolder') ?? '', type: url.searchParams.get('type') ?? '' });
+          } catch {}
+        }
+      }
+      this.archive.tick();
+    }
     for (const job of this.store.queued()) {
       if (job.owner !== this.options.owner) this.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_OWNER_UNAVAILABLE' });
       else if (job.deadline <= Date.now()) this.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_QUEUE_TIMEOUT' });
@@ -604,6 +635,7 @@ export class ComfyService {
       this.assertWorker();
     }
     const current = this.store.get(job.id)!;
+    if (current.stage === 'succeeded' && current.result && (JSON.parse(current.result) as { storage?: string }).storage === 'tos') return;
     if (history.state !== 'missing') this.store.updateJob(job.id, { provider_confirmed: 1 });
     if (history.state === 'failed') {
       this.store.updateJob(job.id, { stage: current.cancel_requested ? 'cancelled' : 'failed', error_code: current.cancel_requested ? 'COMFY_CANCELLED' : 'COMFY_RENDER_FAILED' }, history.error);
@@ -620,7 +652,7 @@ export class ComfyService {
         const configuration = this.options.configuration.instances.find(instance => instance.id === current.instance_id)!;
         const output = outputs[0]!;
         const videoUrl = `${configuration.baseUrl.replace(/\/$/, '')}/view?${new URLSearchParams({ filename: output.filename, subfolder: output.subfolder, type: output.type })}`;
-        this.store.updateJob(job.id, { stage: 'succeeded', result_pending: current.result_pending || !current.result ? 1 : 0, result: JSON.stringify({ videoUrl }), result_checked_at: Date.now(), result_wake_requested: 0, error_code: null });
+        this.store.updateJob(job.id, { stage: 'succeeded', result_pending: current.result_pending || !current.result ? 1 : 0, result: JSON.stringify({ videoUrl, output }), result_checked_at: Date.now(), result_wake_requested: 0, error_code: null });
         if (Object.values(input.profile.bindings).some(binding => binding.kind === 'output-prefix')) this.store.releaseSlot(job.id);
         return;
       }
