@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AigateClient, AigateInstance } from './aigate-client.js';
 import type { ComfyPoolConfiguration } from './configuration.js';
 import type { ComfyClient } from './comfy-client.js';
-import type { ComfyResource, ComfyStore, FrozenComfyInput } from './store.js';
+import type { ComfyJob, ComfyResource, ComfyStore, FrozenComfyInput } from './store.js';
 import { schedulerPolicy } from './scheduler.js';
 
 type InstanceConfiguration = ComfyPoolConfiguration['instances'][number];
@@ -307,6 +307,7 @@ export class ComfyLifecycle {
 
   private async idle(configuration: InstanceConfiguration, retained: Set<string>): Promise<void> {
     const { store, platform } = this.options;
+    if (await this.retireFailedWork(configuration)) return;
     let instance = store.instance(configuration.id)!;
     if (instance.state === 'closing' || instance.state === 'starting' || instance.state === 'waiting_capacity' || instance.draining) return;
     if (store.terminalSlot(instance.id)) {
@@ -369,6 +370,76 @@ export class ComfyLifecycle {
     if (queue.running.length || queue.pending.length || store.hasComputeWork(instance.id) || this.compatible(configuration).length) return;
     store.updateInstance(instance.id, { state: 'closing', action_started_at: Date.now(), action_sent: 1, idle_policy_applied_at: null });
     await platform.closeInstance(instance.id);
+  }
+
+  private async retireFailedWork(configuration: InstanceConfiguration): Promise<boolean> {
+    const { store, platform } = this.options;
+    if (!configuration.lifecycle?.allowRelease || !configuration.lifecycle.rebuildVerified || !platform.releaseInstance) return false;
+    const id = configuration.id;
+    const failed = (job: ComfyJob) => ['failed', 'cancelled'].includes(job.stage)
+      && ['COMFY_REMOTE_UNCONFIRMED', 'COMFY_EXECUTION_CLOSED', 'COMFY_ARCHIVE_TRANSFER_FAILED'].includes(job.error_code ?? '');
+    const interrupted = (job: ComfyJob) => ['queued', 'submitting', 'running'].includes(job.stage)
+      && (!!job.provider_confirmed || (job.native_checkpoint
+        ? (JSON.parse(job.native_checkpoint) as { attempts: unknown[] }).attempts.length > 0 : false));
+    if (!store.instanceJobs(id).some(job => failed(job) || interrupted(job))) return false;
+    const status = await platform.getInstanceStatus(id);
+    this.options.assertWorker();
+    const stopped = status === '22' || status === '26';
+    const jobs = store.instanceJobs(id);
+    if (!jobs.some(job => failed(job) || stopped && interrupted(job))) return false;
+    store.db.transaction(() => {
+      // A stopped GPU cannot retain an in-memory execution. End it instead of paying to reopen it.
+      for (const job of jobs.filter(job => failed(job) || stopped && interrupted(job))) {
+        if (job.error_code !== 'COMFY_ARCHIVE_TRANSFER_FAILED') {
+          store.updateJob(job.id, { stage: job.cancel_requested ? 'cancelled' : 'failed', error_code: 'COMFY_EXECUTION_CLOSED',
+            result_pending: 0, result_wake_requested: 0 });
+        }
+        if (store.instance(id)?.job_id === job.id) store.updateInstance(id, { job_id: null });
+      }
+      // Stop new claims and wakeups while any unrelated current work finishes.
+      store.updateInstance(id, { draining: 1 });
+    })();
+    if (store.hasUnresolvedWork(id)) return true;
+    let resource = store.resources().find(item => item.instance_id === id);
+    if (resource && resource.state !== 'registered') return true;
+    if (status === '2') {
+      const instance = store.instance(id)!;
+      if (instance.state === 'closing' && instance.action_sent) return true;
+      let queue: Awaited<ReturnType<ComfyClient['queue']>> | undefined;
+      try { queue = await this.options.client(configuration).queue(); }
+      catch { this.options.assertWorker(); } // An unreachable failed GPU must not retain paid compute forever.
+      this.options.assertWorker();
+      const ownPrompts = new Set(jobs.filter(failed).flatMap(job => {
+        const checkpoint = job.native_checkpoint ? JSON.parse(job.native_checkpoint) as { attempts: Array<{ plannedId: string; promptId?: string }> } : undefined;
+        return [job.prompt_id, ...(checkpoint?.attempts.flatMap(attempt => [attempt.plannedId, attempt.promptId ?? '']) ?? [])];
+      }));
+      if (queue && [...queue.running, ...queue.pending].some(item => !ownPrompts.has(item.promptId))) {
+        store.updateInstance(id, { error_code: 'COMFY_EXTERNAL_OCCUPANCY' });
+        return true;
+      }
+      if (store.hasUnresolvedWork(id)) return true;
+      store.updateInstance(id, { state: 'closing', action_started_at: Date.now(), action_sent: 1, idle_policy_applied_at: null });
+      await platform.closeInstance(id);
+      this.options.assertWorker();
+      return true;
+    }
+    if (!stopped) return true;
+    // Failure disposal bypasses warm retention and ordinary idle/release timers.
+    resource ??= { key: randomUUID(), name: 'registered-' + id, state: 'registered', instance_id: id,
+      configuration: JSON.stringify(configuration), template_id: 'registered', hourly_cost: configuration.lifecycle.hourlyCost,
+      storage_hourly_cost: configuration.lifecycle.storageHourlyCost, created_at: Date.now(), updated_at: Date.now(), error_code: null };
+    store.updateInstance(id, { state: 'offline', stopped_at: store.instance(id)!.stopped_at ?? Date.now(),
+      action_started_at: null, action_sent: 0, next_action_at: null });
+    store.saveResource({ ...resource, state: 'releasing', updated_at: Date.now(), error_code: null });
+    try {
+      await platform.releaseInstance(id);
+      this.options.assertWorker();
+    } catch (error) {
+      this.options.assertWorker();
+      const rejected = (error as { uncertain?: boolean })?.uncertain === false;
+      store.saveResource({ ...resource, state: rejected ? 'registered' : 'releasing', updated_at: Date.now(), error_code: safeCode(error) });
+    }
+    return true;
   }
 
   private released(resource: ComfyResource): void {

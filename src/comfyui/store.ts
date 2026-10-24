@@ -59,6 +59,7 @@ export class ComfyStore {
         cancel_requested INTEGER NOT NULL DEFAULT 0, provider_confirmed INTEGER NOT NULL DEFAULT 0, UNIQUE(owner, request_key)
       );
       CREATE INDEX IF NOT EXISTS comfy_jobs_queue ON comfy_jobs(stage, created_at);
+      CREATE INDEX IF NOT EXISTS comfy_jobs_instance ON comfy_jobs(instance_id);
       CREATE TABLE IF NOT EXISTS comfy_worker (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS comfy_resources (
         key TEXT PRIMARY KEY, name TEXT NOT NULL, state TEXT NOT NULL, instance_id TEXT, configuration TEXT, template_id TEXT NOT NULL,
@@ -214,6 +215,9 @@ export class ComfyStore {
   }
   pendingResults(instanceId: string): ComfyJob[] {
     return this.db.prepare('SELECT * FROM comfy_jobs WHERE instance_id=? AND result_pending=1').all(instanceId) as ComfyJob[];
+  }
+  instanceJobs(instanceId: string): ComfyJob[] {
+    return this.db.prepare('SELECT * FROM comfy_jobs WHERE instance_id=?').all(instanceId) as ComfyJob[];
   }
   unarchivedResults(owner: string): ComfyJob[] {
     return this.db.prepare(`SELECT * FROM comfy_jobs WHERE owner=? AND stage='succeeded' AND result_pending=1

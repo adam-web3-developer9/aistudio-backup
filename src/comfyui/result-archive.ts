@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ComfyOutput } from './comfy-client.js';
 import type { ComfyStore, ComfyJob, FrozenComfyInput } from './store.js';
 import type { ArchiveFile, ResultArchiveStorage } from './tos-result-storage.js';
+import type { ComfyEventDetails } from './events.js';
 
 export interface GpuResultExporter {
   describe(job: ComfyJob, output: ComfyOutput, signal: AbortSignal): Promise<ArchiveFile>;
@@ -31,6 +32,12 @@ function sameFile(left: ArchiveFile, right: ArchiveFile): boolean {
   return validArchiveFile(left) && validArchiveFile(right) && left.size === right.size
     && left.sha256 === right.sha256 && left.md5 === right.md5;
 }
+function safeErrorType(error: unknown): string {
+  const value = error as { code?: unknown; name?: unknown } | null;
+  if (typeof value?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(value.code)) return value.code;
+  if (typeof value?.name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(value.name)) return value.name;
+  return 'Error';
+}
 
 export class ComfyResultArchive {
   private readonly active = new Map<string, Promise<void>>();
@@ -48,18 +55,22 @@ export class ComfyResultArchive {
       (job_id,instance_id,object_key,storage_identity,output,ready_at,state,next_at) VALUES(?,?,?,?,?,?,'pending',?)`)
       .run(job.id, job.instance_id, `${this.options.keyPrefix}/${job.id}/${randomUUID()}.mp4`, this.options.storageIdentity, JSON.stringify(output), readyAt, readyAt + waitMs);
   }
-  private patch(id: string, values: Partial<Omit<ResultArchiveRecord, 'job_id'>>): void {
+  private patch(id: string, values: Partial<Omit<ResultArchiveRecord, 'job_id'>>, details?: ComfyEventDetails): void {
     const prior = this.get(id);
     const fields = Object.entries(values);
     this.store.db.prepare(`UPDATE comfy_result_archives SET ${fields.map(([key]) => `${key}=?`).join(',')} WHERE job_id=?`)
       .run(...fields.map(([, value]) => value), id);
-    if (prior && (values.state && values.state !== prior.state || values.error_code && values.error_code !== prior.error_code)) {
-      this.store.events.record({ type: 'job.updated', jobId: id, instanceId: prior.instance_id, stage: 'succeeded',
-        code: values.error_code ?? `COMFY_ARCHIVE_${(values.state ?? prior.state).toUpperCase()}` });
+    if (prior && (details || values.state && values.state !== prior.state || values.error_code && values.error_code !== prior.error_code)) {
+      this.store.events.record({ type: 'job.updated', jobId: id, instanceId: prior.instance_id, stage: this.store.get(id)?.stage ?? 'succeeded',
+        code: values.error_code ?? `COMFY_ARCHIVE_${(values.state ?? prior.state).toUpperCase()}`, ...(details ? { details } : {}) });
     }
   }
   tick(): void {
     this.assertWorker();
+    // Older failed archives retained result_pending forever, including rows without an expiry.
+    const abandoned = this.store.db.prepare(`SELECT * FROM comfy_result_archives WHERE
+      state='failed' OR (state='deleted' AND error_code='COMFY_ARCHIVE_TRANSFER_FAILED')`).all() as ResultArchiveRecord[];
+    for (const row of abandoned) this.abandonResult(row);
     const rows = this.store.db.prepare(`SELECT * FROM comfy_result_archives WHERE
       (state IN ('pending','transferring') AND next_at<=?) OR (state IN ('stored','skipped','failed') AND expires_at<=? AND next_at<=?)
       ORDER BY next_at,job_id`).all(Date.now(), Date.now(), Date.now()) as ResultArchiveRecord[];
@@ -77,10 +88,22 @@ export class ComfyResultArchive {
   }
   async close(): Promise<void> { await Promise.allSettled(this.active.values()); }
   async settled(): Promise<void> { await Promise.allSettled(this.active.values()); }
+  private abandonResult(row: ResultArchiveRecord): void {
+    this.store.db.transaction(() => {
+      const job = this.store.get(row.job_id);
+      if (!job || job.stage !== 'succeeded' || !job.result_pending || job.collected_at !== null) return;
+      this.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED',
+        result: null, result_pending: 0, result_wake_requested: 0 });
+      this.store.releaseSlot(job.id);
+      if (!this.store.hasUnresolvedWork(row.instance_id)) this.store.updateInstance(row.instance_id, { idle_since: 0 });
+    })();
+  }
   private async process(row: ResultArchiveRecord): Promise<void> {
+    let phase = 'archive_describe';
     try {
       this.assertWorker();
       if (row.state === 'stored' || row.state === 'skipped' || row.state === 'failed') {
+        phase = 'archive_cleanup';
         await this.options.storage.delete(row.object_key);
         this.assertWorker();
         this.patch(row.job_id, { state: 'deleted', error_code: row.state === 'failed' ? 'COMFY_ARCHIVE_TRANSFER_FAILED' : null });
@@ -93,11 +116,13 @@ export class ComfyResultArchive {
         return;
       }
       this.patch(row.job_id, { state: 'transferring', attempts: Math.min(3, row.attempts + 1) });
+      if (row.file) phase = 'archive_head';
       let file = row.file ? JSON.parse(row.file) as ArchiveFile : undefined;
       let object = file ? await this.options.storage.head(row.object_key) : null;
       this.assertWorker();
       if (!object) {
         if (row.attempts >= 3) throw new Error('Archive attempts exhausted');
+        phase = 'archive_describe';
         const exporter = this.options.exporter(row.instance_id);
         const output = JSON.parse(row.output) as ComfyOutput;
         const observed = await exporter.describe(job, output, this.signal);
@@ -110,9 +135,11 @@ export class ComfyResultArchive {
           this.patch(row.job_id, { state: 'skipped', expires_at: Date.now() + retentionMs, next_at: Date.now() + retentionMs });
           return;
         }
+        phase = 'archive_upload';
         const receipt = await exporter.upload(job, output, file, this.options.storage.uploadTarget(row.object_key, file), this.signal);
         this.assertWorker();
         if (!sameFile(file, receipt)) throw new Error('Archive receipt mismatch');
+        phase = 'archive_head';
         object = await this.options.storage.head(row.object_key);
         this.assertWorker();
       }
@@ -133,14 +160,18 @@ export class ComfyResultArchive {
           }
         }
       })();
-    } catch {
+    } catch (error) {
       if (this.signal.aborted) return;
       try { this.assertWorker(); } catch { return; }
       const cleanup = ['stored', 'skipped', 'failed'].includes(row.state);
       const failed = !cleanup && row.attempts >= 3;
-      this.patch(row.job_id, { state: cleanup ? row.state : failed ? 'failed' : 'pending',
-        ...(failed && this.get(row.job_id)?.file ? { expires_at: Date.now() + retentionMs } : {}),
-        next_at: Date.now() + 60_000, error_code: cleanup ? 'COMFY_ARCHIVE_DELETE_FAILED' : 'COMFY_ARCHIVE_TRANSFER_FAILED' });
+      this.store.db.transaction(() => {
+        this.patch(row.job_id, { state: cleanup ? row.state : failed ? 'failed' : 'pending',
+          ...(failed && this.get(row.job_id)?.file ? { expires_at: Date.now() + retentionMs } : {}),
+          next_at: Date.now() + 60_000, error_code: cleanup ? 'COMFY_ARCHIVE_DELETE_FAILED' : 'COMFY_ARCHIVE_TRANSFER_FAILED' },
+        { upstreamCode: phase, errorType: safeErrorType(error) });
+        if (failed) this.abandonResult(row);
+      })();
     }
   }
   result(id: string): { videoUrl?: string; storage: 'tos'; expiresAt: number; expired: boolean } | undefined {

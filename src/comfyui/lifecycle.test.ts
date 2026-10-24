@@ -773,7 +773,7 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(context.platform.releaseInstance).not.toHaveBeenCalled();
   });
 
-  it('closes an expired unconfirmed execution after confirmed stop and releases its disk after the original retention deadline', async () => {
+  it('closes an expired unconfirmed execution immediately and releases its disk as soon as stop is confirmed', async () => {
     const context = fixture({ autoOpen: false });
     context.configuration.instances[0]!.lifecycle = { allowRelease: true, rebuildVerified: true, hourlyCost: 1, storageHourlyCost: 0.1 };
     const job = context.submit();
@@ -782,36 +782,24 @@ describe('ComfyLifecycle idle and release safety', () => {
       error_code: 'COMFY_REMOTE_UNCONFIRMED', deadline: clock - 1,
       native_checkpoint: JSON.stringify({ attempts: [{ number: 1, marker: job.id, plannedId: job.prompt_id,
         promptId: job.prompt_id, confirmed: true, state: 'running' }], windowStart: 0, nextAt: clock }) });
-    const originalJob = context.store.get(job.id);
-    await context.lifecycle.tick();
-    expect(context.store.instance('1')?.idle_since).toBe(clock);
-    expect(context.platform.closeInstance).not.toHaveBeenCalled();
-    clock += 300_000;
     context.platform.closeInstance.mockImplementation(async id => {
       expect(id).toBe('1');
-      expect(context.store.instance('1')).toMatchObject({ state: 'closing', job_id: job.id, action_sent: 1 });
+      expect(context.store.instance('1')).toMatchObject({ state: 'closing', job_id: null, draining: 1, action_sent: 1 });
     });
     await context.lifecycle.tick();
-    expect(context.client.health).toHaveBeenCalledOnce();
     expect(context.client.queue).toHaveBeenCalledOnce();
     expect(context.platform.closeInstance).toHaveBeenCalledExactlyOnceWith('1');
-    expect(context.store.get(job.id)).toEqual(originalJob);
+    expect(context.store.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_EXECUTION_CLOSED', prompt_id: job.prompt_id });
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
     context.platform.getInstanceStatus.mockResolvedValue('22');
-    context.store.updateInstance('1', { state: 'offline', stopped_at: clock });
-    clock += context.configuration.elastic!.releaseAfterMs;
     await context.lifecycle.tick();
     expect(context.store.hasUnresolvedWork('1')).toBe(false);
-    expect(context.store.instance('1')).toMatchObject({ state: 'offline', job_id: null,
-      stopped_at: clock - context.configuration.elastic!.releaseAfterMs });
-    expect(context.store.get(job.id)).toEqual(originalJob);
-    expect(context.configuration.instances.map(instance => instance.id)).toEqual(['1']);
-    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
-    await context.lifecycle.tick();
+    expect(context.store.instance('1')).toMatchObject({ state: 'offline', job_id: null, stopped_at: clock });
     expect(context.platform.releaseInstance).toHaveBeenCalledExactlyOnceWith('1');
     expect(context.platform.closeInstance).toHaveBeenCalledTimes(1);
   });
 
-  it('clears a failed stopped slot before checking new queued demand and recomputes the stopped retention tier', async () => {
+  it('clears and releases a failed stopped execution immediately while leaving new queued demand untouched', async () => {
     const context = releasableFixture();
     context.configuration.elastic!.releaseAfterMs = 1_800_000;
     context.configuration.elastic!.stoppedRetention = { maxInstances: 1, excessReleaseAfterMs: 60_000 };
@@ -826,10 +814,9 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(context.store.instance('1')).toMatchObject({ state: 'offline', job_id: null, stopped_at: stoppedAt });
     expect(context.store.get(job.id)?.stage).toBe('failed');
     expect(context.store.get(next.id)?.stage).toBe('queued');
+    expect(context.store.get(job.id)?.error_code).toBe('COMFY_EXECUTION_CLOSED');
+    expect(context.platform.releaseInstance).toHaveBeenCalledExactlyOnceWith('1');
     context.store.updateJob(next.id, { stage: 'cancelled' });
-    await context.lifecycle.tick();
-    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
-    clock = stoppedAt + 1_800_000;
     await context.lifecycle.tick();
     expect(context.platform.releaseInstance).toHaveBeenCalledExactlyOnceWith('1');
   });
@@ -1014,7 +1001,7 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(retained).toEqual(['1', '10'].slice(0, maxInstances));
   });
 
-  it('does not let protected unknown remote work consume or bypass stopped retention', async () => {
+  it('releases failed remote work immediately without consuming the normal stopped retention slot', async () => {
     const context = unifiedReleaseFixture();
     context.configuration.elastic!.stoppedRetention = { maxInstances: 1, excessReleaseAfterMs: 60_000 };
     const job = context.submit();
@@ -1023,10 +1010,10 @@ describe('ComfyLifecycle idle and release safety', () => {
     context.store.updateJob(job.id, { stage: 'failed', error_code: 'COMFY_REMOTE_UNCONFIRMED' });
     for (const instance of context.configuration.instances) context.store.updateInstance(instance.id, { state: 'offline', stopped_at: clock - 60_000 });
     await context.lifecycle.tick();
-    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(8);
-    expect(context.platform.releaseInstance).not.toHaveBeenCalledWith('1');
+    expect(context.platform.releaseInstance).toHaveBeenCalledTimes(9);
+    expect(context.platform.releaseInstance).toHaveBeenCalledWith('1');
     expect(context.platform.releaseInstance).not.toHaveBeenCalledWith('10');
-    expect(context.store.instance('1')?.job_id).toBe(job.id);
+    expect(context.store.instance('1')?.job_id).toBeNull();
   });
 
   it('does not release excess instances when work arrives during the platform check', async () => {

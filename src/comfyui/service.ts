@@ -30,6 +30,8 @@ export interface ComfyServiceOptions {
   resultArchive?: ResultArchiveOptions;
 }
 const completeStages = new Set(['succeeded', 'failed', 'cancelled']);
+const discardedExecution = (job: ComfyJob) => completeStages.has(job.stage)
+  && ['COMFY_EXECUTION_CLOSED', 'COMFY_ARCHIVE_TRANSFER_FAILED'].includes(job.error_code ?? '');
 const stageMessages: Record<string, string> = {
   queued: '任务已入队，等待分配GPU实例', waiting_capacity: '目标区域暂缺显卡，正在轮询等卡', booting: '正在启动GPU实例并等待ComfyUI就绪',
   preparing: '正在校验输入并准备工作流', awaiting_upload: 'GPU已就绪，等待客户端直传参考素材', submitting: '正在提交工作流并等待原任务回执',
@@ -180,6 +182,9 @@ export class ComfyService {
     return job.instance_id ? this.store.resources().find(resource => resource.instance_id === job.instance_id)?.state : undefined;
   }
   publicJob(job: ComfyJob) {
+    const disposalMessage = discardedExecution(job) ? job.error_code === 'COMFY_ARCHIVE_TRANSFER_FAILED'
+      ? '视频归档多次失败，已结束保留，原实例进入回收；需要重新生成'
+      : '原执行已中断或超过恢复期限，已结束等待，原实例进入回收；需要重新生成' : undefined;
     const input = JSON.parse(job.input) as FrozenComfyInput;
     const executionReleased = job.stage === 'failed' && job.error_code === 'COMFY_REMOTE_UNCONFIRMED' && this.originalResourceState(job) === 'released';
     const native = job.native_checkpoint ? nativeCheckpoint(job) : undefined;
@@ -213,7 +218,7 @@ export class ComfyService {
       createdAt: new Date(job.created_at).toISOString(),
       updatedAt: new Date(job.updated_at).toISOString(),
       ...(job.finished_at ? { finishedAt: new Date(job.finished_at).toISOString() } : {}),
-      progress: { message, phase: stage, ...(job.provider_confirmed ? { providerJobId: job.prompt_id } : {}),
+      progress: { message: disposalMessage ?? message, phase: stage, ...(job.provider_confirmed ? { providerJobId: job.prompt_id } : {}),
         elapsedMs: Math.max(0, (job.finished_at ?? Date.now()) - job.created_at), deadlineAt: new Date(job.deadline).toISOString(),
         ...(configuration && (!capacityWaiting || job.instance_id) ? { instance: { id: configuration.id, areaName: configuration.areaName, gpuModel: configuration.gpuModel } } : {}),
         ...(capacityWaiting ? { nextRetryAt: new Date(Math.min(...waiting.map(instance => instance.next_action_at ?? Date.now()))).toISOString(),
@@ -240,6 +245,7 @@ export class ComfyService {
   }
   async requestResultAvailability(id: string): Promise<ComfyJob> {
     let job = this.get(id);
+    if (discardedExecution(job)) return job;
     if (this.originalResourceState(job) === 'released') return job;
     if (job.stage === 'failed' && job.error_code === 'COMFY_REMOTE_UNCONFIRMED' && job.instance_id &&
       !this.active && !this.processing.has(job.instance_id) && !this.collecting.has(id)) {
@@ -305,6 +311,7 @@ export class ComfyService {
   }
   async reconcile(id: string): Promise<void> {
     const job = this.get(id);
+    if (discardedExecution(job)) return;
     if (job.stage === 'succeeded' && job.result) return;
     if (!job.instance_id) return;
     const instance = this.options.configuration.instances.find(candidate => candidate.id === job.instance_id);
@@ -320,6 +327,7 @@ export class ComfyService {
   resumeSubmission(id: string, requestKey: string): ComfyJob {
     return this.store.db.transaction(() => {
       const job = this.get(id);
+      if (discardedExecution(job)) throw new SystemError(410, 'COMFY_EXECUTION_CLOSED', 'The original execution has been closed for resource disposal');
       const checkpoint = nativeCheckpoint(job);
       if (checkpoint.windowKey === requestKey || checkpoint.windowKeys?.includes(requestKey)) return job;
       if (['releasing', 'released'].includes(this.originalResourceState(job) ?? '')) {
@@ -390,6 +398,8 @@ export class ComfyService {
     this.assertWorker();
     let instance = this.store.instance(configuration.id)!;
     const client = this.options.client(configuration);
+    if (instance.draining && this.store.instanceJobs(instance.id).some(discardedExecution) && instance.state !== 'closing'
+      && (!instance.job_id || discardedExecution(this.store.get(instance.job_id)!))) return;
     if (instance.job_id) {
       const job = this.store.get(instance.job_id)!;
       const policy = schedulerPolicy(this.options.configuration);
@@ -515,6 +525,7 @@ export class ComfyService {
         this.checkActionTimeout(instance.id);
         return;
       }
+      if (instance.draining && this.store.instanceJobs(instance.id).some(discardedExecution)) return;
       if (status !== '2') {
         const prior = this.opening;
         let release!: () => void;
@@ -523,6 +534,7 @@ export class ComfyService {
         try {
         this.assertWorker();
         instance = this.store.instance(configuration.id)!;
+        if (instance.draining && this.store.instanceJobs(instance.id).some(discardedExecution)) return;
         this.store.updateInstance(instance.id, { idle_policy_applied_at: null });
         const needed = this.store.queued().filter(compatible).length + resultRequests.length;
         const reserved = this.store.instances().filter(candidate => candidate.id !== instance.id && !candidate.draining && !candidate.job_id && candidate.state === 'starting'
@@ -585,6 +597,7 @@ export class ComfyService {
   }
   private async ensureUploadReady(configuration: InstanceConfiguration, client: DataClient): Promise<boolean> {
     let instance = this.store.instance(configuration.id)!;
+    if (instance.draining && (!instance.job_id || discardedExecution(this.store.get(instance.job_id)!))) return false;
     if ((instance.next_action_at ?? 0) > Date.now()) return false;
     if (instance.state === 'waiting_capacity') {
       if (instance.capacity_started_at !== null && Date.now() - instance.capacity_started_at >= (this.options.configuration.capacityWaitTimeoutMs ?? 21_600_000)) {
@@ -597,6 +610,7 @@ export class ComfyService {
     this.assertWorker();
     await this.powerPolicy.reconcile(instance.id, status);
     instance = this.store.instance(configuration.id)!;
+    if (instance.draining && (!instance.job_id || discardedExecution(this.store.get(instance.job_id)!))) return false;
     if (status !== '2') {
       if (instance.state !== 'starting') {
         this.store.updateInstance(instance.id, { state: 'starting', action_started_at: Date.now(), action_sent: 0,
@@ -705,9 +719,12 @@ export class ComfyService {
       checkpoint.windowStart = persisted.windowStart;
       checkpoint.nextAt = persisted.nextAt;
     }
-    this.store.updateJob(id, { native_checkpoint: JSON.stringify(checkpoint), ...patch });
+    const changes = discardedExecution(current)
+      ? { provider_confirmed: patch.provider_confirmed ?? current.provider_confirmed, prompt_id: patch.prompt_id ?? current.prompt_id } : patch;
+    this.store.updateJob(id, { native_checkpoint: JSON.stringify(checkpoint), ...changes });
   }
   private async submitNative(job: ComfyJob, checkpoint: NativeCheckpoint, client: DataClient): Promise<void> {
+    if (discardedExecution(this.store.get(job.id)!)) return;
     const graph = this.nativeGraph(job, checkpoint);
     if (!graph) return;
     const attempt: NativeAttempt = { number: checkpoint.attempts.length + 1,
@@ -739,11 +756,13 @@ export class ComfyService {
       this.saveNative(job.id, checkpoint);
       this.store.events.record({ type: 'job.updated', jobId: job.id, instanceId: job.instance_id!, stage: this.store.get(job.id)!.stage,
         code: rejected ? codeOf(error) : 'COMFY_SUBMISSION_UNCONFIRMED', details: { ...identity, ...diagnosticDetails(error) } });
+      if (discardedExecution(this.store.get(job.id)!)) return;
       if (rejected && checkpoint.attempts.length === 1) throw error;
       this.store.updateInstance(job.instance_id!, { error_code: 'COMFY_SUBMISSION_UNCONFIRMED' }, diagnosticDetails(error));
     }
   }
   private async observe(job: ComfyJob, client: DataClient, manual = false): Promise<void> {
+    if (discardedExecution(this.store.get(job.id)!)) return;
     let checkpoint = nativeCheckpoint(job);
     this.saveNative(job.id, checkpoint);
     const histories = new Map<string, Awaited<ReturnType<DataClient['history']>>>();
@@ -790,6 +809,7 @@ export class ComfyService {
       }
     }
     let current = this.store.get(job.id)!;
+    if (discardedExecution(current)) return;
     const frozen = JSON.parse(current.input) as FrozenComfyInput;
     const validOutput = (history: Awaited<ReturnType<DataClient['history']>>) => registeredVideoOutputs(frozen, history.outputs).length === 1;
     const firstSuccess = [...histories].find(([, history]) => history.state === 'succeeded' && validOutput(history));
@@ -842,6 +862,7 @@ export class ComfyService {
   }
   private async applyHistory(job: ComfyJob, client: DataClient, history: Awaited<ReturnType<DataClient['history']>>, manual: boolean): Promise<void> {
     const current = this.store.get(job.id)!;
+    if (discardedExecution(current)) return;
     if (current.stage === 'succeeded' && current.result && (JSON.parse(current.result) as { storage?: string }).storage === 'tos') { this.store.releaseSlot(job.id); return; }
     if (history.state !== 'missing') this.store.updateJob(job.id, { provider_confirmed: 1 });
     if (history.state === 'failed') {

@@ -148,7 +148,7 @@ describe('GPU result archive fallback', () => {
     expect(context.service.archive!.get(job.id)?.expires_at).toBe(start + 600_000 + 86_400_000);
   });
 
-  it.each(['describe', 'upload', 'head'] as const)('retains the GPU result and stops after bounded %s failures', async method => {
+  it.each(['describe', 'upload', 'head'] as const)('abandons the GPU result after bounded %s failures', async method => {
     const context = fixture();
     const job = context.succeed();
     if (method === 'head') context.storage.head.mockRejectedValue(new Error('private URL must not leak'));
@@ -156,9 +156,12 @@ describe('GPU result archive fallback', () => {
     context.advance(600_000);
     for (let attempt = 0; attempt < 6; attempt++) { await context.run(); context.advance(60_000); }
     expect(context.service.archive!.get(job.id)).toMatchObject({ state: 'failed', attempts: 3, error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED' });
-    expect(context.store.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1 });
-    expect(context.store.hasUnresolvedWork('1')).toBe(true);
-    expect(context.platform.closeInstance).not.toHaveBeenCalled();
+    expect(context.store.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED',
+      result: null, result_pending: 0, result_wake_requested: 0, collected_at: null });
+    expect(context.store.hasUnresolvedWork('1')).toBe(false);
+    expect(context.platform.closeInstance).toHaveBeenCalled();
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ status: 'failed', error: { code: 'COMFY_ARCHIVE_TRANSFER_FAILED' } });
+    expect(context.service.publicJob(context.service.get(job.id)).result).toBeUndefined();
     expect(context.exporter.upload.mock.calls.length).toBeLessThanOrEqual(3);
   });
 
@@ -170,6 +173,97 @@ describe('GPU result archive fallback', () => {
     context.advance(600_000);
     await context.run();
     expect(context.store.get(job.id)?.result_pending).toBe(1);
+    expect(context.platform.closeInstance).not.toHaveBeenCalled();
+  });
+
+  it.each(['describe', 'upload', 'head', 'cleanup'] as const)('records only safe failure details for archive %s', async phase => {
+    const context = fixture();
+    const job = context.succeed();
+    const sensitive = 'https://private.invalid/upload?signature=secret SSH password=secret';
+    const error = Object.assign(new Error(sensitive), { code: 'ECONNRESET' });
+    if (phase === 'cleanup') {
+      context.advance(600_000);
+      await context.run();
+      context.storage.delete.mockRejectedValue(error);
+      context.advance(86_400_000);
+    } else {
+      if (phase === 'head') context.storage.head.mockRejectedValue(error);
+      else context.exporter[phase].mockRejectedValue(error);
+      context.advance(600_000);
+    }
+    for (let attempt = 0; attempt < 2; attempt++) { await context.run(); context.advance(60_000); }
+    const events = context.store.events.list({ jobId: job.id, limit: 100 });
+    const failures = events.filter(event => event.details?.upstreamCode === 'archive_' + phase);
+    expect(failures).toHaveLength(2);
+    expect(failures.every(event => event.details?.errorType === 'ECONNRESET')).toBe(true);
+    expect(JSON.stringify(events)).not.toContain(sensitive);
+    expect(JSON.stringify(events)).not.toContain('private.invalid');
+    expect(failures.every(event => event.code === (phase === 'cleanup' ? 'COMFY_ARCHIVE_DELETE_FAILED' : 'COMFY_ARCHIVE_TRANSFER_FAILED'))).toBe(true);
+  });
+
+  it.each([
+    { code: 'https://secret.invalid?key=private', name: 'TypeError', expected: 'TypeError' },
+    { code: 'bad code with private data', name: 'bad name with private data', expected: 'Error' },
+  ])('sanitizes unsafe archive error code and name: $expected', async ({ code, name, expected }) => {
+    const context = fixture();
+    const job = context.succeed();
+    context.exporter.describe.mockRejectedValue({ code, name, message: 'private message' });
+    context.advance(600_000);
+    await context.run();
+    const failure = context.store.events.list({ jobId: job.id, limit: 100 }).find(event => event.details?.upstreamCode === 'archive_describe');
+    expect(failure?.details?.errorType).toBe(expected);
+    expect(JSON.stringify(failure)).not.toContain('private');
+    expect(JSON.stringify(failure)).not.toContain(code);
+  });
+
+  it.each(['failed', 'deleted'] as const)('clears a legacy %s archive hold immediately after restart without waiting for expiry', async state => {
+    const context = fixture();
+    const job = context.succeed();
+    await context.run();
+    context.db.prepare(`UPDATE comfy_result_archives SET state=?,attempts=3,error_code='COMFY_ARCHIVE_TRANSFER_FAILED',
+      expires_at=NULL,next_at=? WHERE job_id=?`).run(state, context.now() + 86_400_000, job.id);
+    context.store.updateJob(job.id, { result_wake_requested: 1 });
+    await context.restart();
+    await context.run();
+    expect(context.store.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED',
+      result: null, result_pending: 0, result_wake_requested: 0, collected_at: null });
+    expect(context.store.hasUnresolvedWork('1')).toBe(false);
+    expect(context.exporter.describe).not.toHaveBeenCalled();
+    expect(context.storage.delete).not.toHaveBeenCalled();
+    await context.service.requestResultAvailability(job.id);
+    expect(context.store.get(job.id)?.result_wake_requested).toBe(0);
+  });
+
+  it('does not abandon a result collected while its last archive check fails', async () => {
+    const context = fixture();
+    const job = context.succeed();
+    await context.run();
+    context.db.prepare('UPDATE comfy_result_archives SET attempts=3,next_at=? WHERE job_id=?').run(context.now(), job.id);
+    let fail!: (reason: Error) => void;
+    context.storage.head.mockImplementation(() => new Promise((_resolve, reject) => { fail = reject; }));
+    context.db.prepare('UPDATE comfy_result_archives SET file=? WHERE job_id=?').run(JSON.stringify(file), job.id);
+    await context.service.tick();
+    context.service.acknowledgeCollected(job.id);
+    const collectedAt = context.store.get(job.id)!.collected_at;
+    fail(new Error('HEAD unavailable'));
+    await context.service.archive!.settled();
+    expect(context.store.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 0, collected_at: collectedAt });
+    expect(context.store.get(job.id)?.result).not.toBeNull();
+  });
+
+  it('abandons an old failed archive without clearing or stopping a newer execution on the same instance', async () => {
+    const context = fixture();
+    const old = context.succeed();
+    await context.run();
+    const newer = context.succeed();
+    context.store.updateJob(newer.id, { stage: 'running', result_pending: 0, result: null });
+    context.store.updateInstance('1', { state: 'busy', job_id: newer.id });
+    context.db.prepare(`UPDATE comfy_result_archives SET state='failed',attempts=3,error_code='COMFY_ARCHIVE_TRANSFER_FAILED'
+      WHERE job_id=?`).run(old.id);
+    await context.run();
+    expect(context.store.get(old.id)).toMatchObject({ stage: 'failed', result_pending: 0, result: null });
+    expect(context.store.instance('1')?.job_id).toBe(newer.id);
+    expect(context.store.get(newer.id)?.stage).toBe('running');
     expect(context.platform.closeInstance).not.toHaveBeenCalled();
   });
 
@@ -252,7 +346,7 @@ describe('GPU result archive fallback', () => {
     expect(context.service.archive!.get(job.id)?.state).toBe('deleted');
   });
 
-  it('cleans up an unverified uploaded object after failure without releasing the original result', async () => {
+  it('cleans up an unverified uploaded object after abandoning the original result', async () => {
     const context = fixture();
     const job = context.succeed();
     context.storage.head.mockResolvedValue({ ...file, size: file.size + 1, uploadedAt: start + 600_000 });
@@ -262,9 +356,9 @@ describe('GPU result archive fallback', () => {
     context.advance(86_400_000);
     await context.run();
     expect(context.storage.delete).toHaveBeenCalledTimes(1);
-    expect(context.store.get(job.id)?.result_pending).toBe(1);
-    expect(context.platform.closeInstance).not.toHaveBeenCalled();
-    expect(context.service.publicJob(context.service.get(job.id)).result?.videoUrl).toContain('/view?');
+    expect(context.store.get(job.id)?.result_pending).toBe(0);
+    expect(context.platform.closeInstance).toHaveBeenCalled();
+    expect(context.service.publicJob(context.service.get(job.id)).result).toBeUndefined();
   });
 
   it('still reconciles a lost response on the third upload attempt without a fourth upload', async () => {
