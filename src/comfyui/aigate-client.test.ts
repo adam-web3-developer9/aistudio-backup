@@ -794,6 +794,23 @@ describe('AigateClient', () => {
     }
   );
 
+  it.each(['余额不足', '账户余额不足，无法开机'])(
+    'keeps the insufficient-balance reason as a classification without copying the message: %s', async msg => {
+      const { client } = setup({ code: 1, msg });
+      const error = await client.openInstance(instanceId).catch(error => error);
+      expect(error).toMatchObject({ code: 'BUSINESS_REJECTED', reason: 'INSUFFICIENT_BALANCE' });
+      expect(JSON.stringify(error)).not.toContain(msg);
+      expect(String(error)).not.toContain(msg);
+    }
+  );
+
+  it('classifies a generic open rejection as an instance start rejection without exposing the message', async () => {
+    const { client } = setup({ code: 1, msg: '实例启动失败，请联系平台管理员' });
+    const error = await client.openInstance(instanceId).catch(error => error);
+    expect(error).toMatchObject({ code: 'BUSINESS_REJECTED', reason: 'INSTANCE_START_REJECTED' });
+    expect(JSON.stringify(error)).not.toContain('实例启动失败');
+  });
+
   it('leaves unmatched rejections as business errors even with a configured capacity list', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ code: 1, errCode: 'TEST_ONLY_DENIED' }));
     const client = new AigateClient({ token, fetch: fetchMock, capacityErrorCodes: ['TEST_ONLY_CAPACITY_CODE'] });

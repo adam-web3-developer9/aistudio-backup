@@ -8,7 +8,7 @@ import { schedulerPolicy } from './scheduler.js';
 type InstanceConfiguration = ComfyPoolConfiguration['instances'][number];
 type ElasticTemplate = NonNullable<ComfyPoolConfiguration['elastic']>['templates'][number];
 export type ComfyLifecyclePlatform = Pick<AigateClient, 'getInstanceStatus' | 'closeInstance'> &
-  Partial<Pick<AigateClient, 'getInstance' | 'skuList' | 'createInstance' | 'releaseInstance' | 'pageInstances'>>;
+  Partial<Pick<AigateClient, 'getInstance' | 'skuList' | 'createInstance' | 'releaseInstance' | 'pageInstances' | 'findInstancesByName'>>;
 
 function safeCode(error: unknown): string {
   const value = (error as { code?: unknown })?.code;
@@ -260,6 +260,8 @@ export class ComfyLifecycle {
         }
       } else if (resource.state === 'creating' && !resource.instance_id) {
         store.saveResource({ ...resource, state: 'uncertain', updated_at: Date.now(), error_code: 'COMFY_CREATION_UNCONFIRMED' });
+      } else if (resource.state === 'uncertain' && !resource.instance_id) {
+        await this.resolveUncertainCreation(resource);
       } else if (resource.state === 'releasing' && resource.instance_id && platform.pageInstances) {
         if (platform.getInstance) {
           try {
@@ -283,6 +285,39 @@ export class ComfyLifecycle {
           this.released(resource);
         }
       }
+    }
+  }
+
+  // 创建请求网络失败时无法确认平台是否已建实例。旧逻辑把这种资源永久留在 uncertain，
+  // scale() 见到 uncertain 就整体停止扩容。这里按资源名回查平台：确认不存在就释放占位，
+  // 找到唯一实例就收养它，仍然无法判断才保持 uncertain。
+  private async resolveUncertainCreation(resource: ComfyResource): Promise<void> {
+    const { store, configuration, platform } = this.options;
+    if (Date.now() - resource.created_at < (configuration.elastic?.reconcileTimeoutMs ?? 300_000)) {
+      this.lastError = 'COMFY_CREATION_UNCONFIRMED';
+      return;
+    }
+    if (!platform.findInstancesByName) {
+      this.lastError = 'COMFY_RESOURCE_RECONCILIATION_REQUIRED';
+      return;
+    }
+    try {
+      const found = await platform.findInstancesByName(resource.name, { maxPages: 2, pageSize: 20, operationStatus: null });
+      this.options.assertWorker();
+      const matches = found.records.filter(item => item.instanceName === resource.name);
+      const match = matches.length === 1 ? matches[0] : undefined;
+      if (match) {
+        store.saveResource({ ...resource, state: 'creating', instance_id: match.id, error_code: null, updated_at: Date.now() });
+        this.lastError = 'COMFY_RESOURCE_INITIALIZING';
+      } else if (found.complete && matches.length === 0) {
+        store.saveResource({ ...resource, state: 'released', error_code: 'COMFY_CREATION_UNCONFIRMED', updated_at: Date.now() });
+        this.lastError = null;
+      } else {
+        this.lastError = 'COMFY_CREATION_AMBIGUOUS';
+      }
+    } catch (error) {
+      this.options.assertWorker();
+      this.lastError = safeCode(error);
     }
   }
 

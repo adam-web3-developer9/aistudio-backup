@@ -21,7 +21,7 @@ type DataClient = Pick<ComfyClient, 'health' | 'queue' | 'upload' | 'submit' | '
 export interface ComfyServiceOptions {
   store: ComfyStore; configuration: ComfyPoolConfiguration;
   platform: Pick<AigateClient, 'getInstanceStatus' | 'openInstance' | 'closeInstance'> & Partial<Pick<AigateClient,
-    'getInstance' | 'setGpuIdleShutdown' | 'clearGpuIdleShutdown' | 'skuList' | 'createInstance' | 'releaseInstance' | 'pageInstances'>>;
+    'getInstance' | 'setGpuIdleShutdown' | 'clearGpuIdleShutdown' | 'skuList' | 'createInstance' | 'releaseInstance' | 'pageInstances' | 'findInstancesByName'>>;
   client: (instance: InstanceConfiguration) => DataClient;
   assets: { get(id: string): AssetRecord | undefined; read(id: string): Promise<Buffer | undefined> };
   results: Pick<ComfyResultStore, 'save' | 'read'>;
@@ -34,6 +34,7 @@ const discardedExecution = (job: ComfyJob) => completeStages.has(job.stage)
   && ['COMFY_EXECUTION_CLOSED', 'COMFY_ARCHIVE_TRANSFER_FAILED'].includes(job.error_code ?? '');
 const stageMessages: Record<string, string> = {
   queued: '任务已入队，等待分配GPU实例', waiting_capacity: '目标区域暂缺显卡，正在轮询等卡', booting: '正在启动GPU实例并等待ComfyUI就绪',
+  waiting_billing: '账户余额不足，等待充值后继续', waiting_instance: 'GPU实例暂未就绪，正在退避后重新检查',
   preparing: '正在校验输入并准备工作流', awaiting_upload: 'GPU已就绪，等待客户端直传参考素材', submitting: '正在提交工作流并等待原任务回执',
   running: 'ComfyUI正在执行原工作流，等待生成完成', collecting: '生成已完成，正在保存结果', preparing_result: '正在唤醒原实例以收取已生成结果，不会重新生成',
   succeeded: '视频生成完成', failed: '任务失败，请查看原任务事件和错误码', cancelled: '已取消本地等待，未保证远端执行已停止',
@@ -55,6 +56,14 @@ function diagnosticDetails(error: unknown): ComfyEventDetails {
   const elapsedMs = value?.details?.elapsedMs;
   if (typeof elapsedMs === 'number' && Number.isSafeInteger(elapsedMs) && elapsedMs >= 0) details.elapsedMs = elapsedMs;
   return details;
+}
+// 开机被平台拒绝（余额不足 / 业务拒绝）是确定结论，不能当成“结果未确认”留在 starting：
+// 退出开机动作、记录原因并退避，任务才能显示真实等待原因。
+function startRejectionCode(error: unknown): 'COMFY_INSUFFICIENT_BALANCE' | 'COMFY_INSTANCE_START_REJECTED' | undefined {
+  const value = error as { code?: unknown; reason?: unknown } | null;
+  if (value?.reason === 'INSUFFICIENT_BALANCE') return 'COMFY_INSUFFICIENT_BALANCE';
+  if (value?.code === 'BUSINESS_REJECTED') return 'COMFY_INSTANCE_START_REJECTED';
+  return undefined;
 }
 function registeredVideoOutputs(input: FrozenComfyInput, outputs: import('./comfy-client.js').ComfyOutput[]) {
   return outputs.filter(output => input.profile.outputNodeIds.includes(output.nodeId ?? '') && /\.mp4$/i.test(output.filename)
@@ -201,7 +210,8 @@ export class ComfyService {
     const recovering = !starting && !capacityWaiting ? (uploadRecovery && assigned?.state === 'offline' ? assigned : job.stage === 'queued' ? candidates.find(instance => !instance.job_id && instance.state === 'offline' && instance.error_code) : undefined) : undefined;
     const configuration = this.options.configuration.instances.find(instance => instance.id === (job.instance_id ?? starting?.id ?? waiting[0]?.id ?? recovering?.id));
     const wakingResult = !!job.result_wake_requested && job.stage === 'succeeded';
-    const stage = job.cancel_requested ? 'cancelled' : resultUnavailable ? unavailableArchive ? 'result_unavailable' : 'result_expired' : wakingResult ? 'preparing_result' : recovering ? 'waiting_instance' : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
+    const stage = job.cancel_requested ? 'cancelled' : resultUnavailable ? unavailableArchive ? 'result_unavailable' : 'result_expired' : wakingResult ? 'preparing_result'
+      : recovering ? (recovering.error_code === 'COMFY_INSUFFICIENT_BALANCE' ? 'waiting_billing' : 'waiting_instance') : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
     const events = this.store.events.recent(job.id, 12);
     const waitingTargets = [...new Set(waiting.map(instance => this.options.configuration.instances.find(candidate => candidate.id === instance.id))
       .map(instance => [instance?.areaName, instance?.gpuModel].filter(Boolean).join(' / ')).filter(Boolean))];
@@ -211,7 +221,10 @@ export class ComfyService {
       uploadRecovery && starting ? '原GPU实例已离线，正在唤醒原实例；保留原任务和已上传素材' :
       capacityWaiting && !job.cancel_requested ? uploadRecovery && assigned ? '原GPU实例开机暂缺可分配GPU，正在轮询恢复；保留原任务和已上传素材' :
         `已登记实例开机暂缺可分配GPU，正在轮询候卡${waitingTargets.length ? `（${waitingTargets.join('、')}）` : ''}；尚未开始生成` :
-      recovering ? recovering.error_code === 'COMFY_EXTERNAL_OCCUPANCY' ? '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交' : `GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（${recovering.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` :
+      recovering ? recovering.error_code === 'COMFY_EXTERNAL_OCCUPANCY' ? '原GPU实例正在执行其他任务，等待空闲后自动重查，不抢占、不重复提交'
+        : recovering.error_code === 'COMFY_INSUFFICIENT_BALANCE' ? '账户余额不足，GPU 实例无法开机；充值后自动继续，保留原任务'
+        : recovering.error_code === 'COMFY_INSTANCE_START_REJECTED' ? 'GPU 实例开机被平台拒绝；保留原任务，稍后自动重试'
+        : `GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（${recovering.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` :
       job.stage === 'submitting' && native?.attempts.length ? '原生提交尚未确认，正在核对原任务与提交回执' : stageMessages[stage]!;
     return {
       id: job.id, adapterId: 'comfyui-v1', status: resultUnavailable ? 'failed' : wakingResult && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
@@ -549,6 +562,18 @@ export class ComfyService {
           try { await this.options.platform.openInstance(instance.id); }
           catch (error) {
             this.assertWorker();
+            const rejection = startRejectionCode(error);
+            if (rejection) {
+              // 余额不足只能由人充值解除，退避到 5 分钟，避免每 30 秒撞一次平台。
+              const retryMs = rejection === 'COMFY_INSUFFICIENT_BALANCE'
+                ? Math.max(this.options.configuration.capacityPollIntervalMs ?? 30_000, 300_000)
+                : (this.options.configuration.capacityPollIntervalMs ?? 30_000);
+              this.store.updateInstance(instance.id, { state: 'offline', action_started_at: null, action_sent: 0,
+                next_action_at: Date.now() + retryMs, error_code: rejection }, diagnosticDetails(error));
+              for (const job of this.store.queued().filter(compatible)) this.store.events.record({ type: 'job.updated', jobId: job.id, instanceId: instance.id,
+                stage: 'queued', code: rejection, details: { areaName: configuration.areaName, gpuModel: configuration.gpuModel, ...diagnosticDetails(error) } });
+              return;
+            }
             if ((error as { code?: string })?.code !== 'CAPACITY_UNAVAILABLE') throw error;
             this.store.updateInstance(instance.id, { state: 'waiting_capacity', action_started_at: null, action_sent: 0,
               capacity_started_at: instance.capacity_started_at ?? Date.now(), next_action_at: Date.now() + (this.options.configuration.capacityPollIntervalMs ?? 30_000), error_code: 'COMFY_CAPACITY_UNAVAILABLE' }, diagnosticDetails(error));
@@ -622,6 +647,15 @@ export class ComfyService {
         try { await this.options.platform.openInstance(instance.id); }
         catch (error) {
           this.assertWorker();
+          const rejection = startRejectionCode(error);
+          if (rejection) {
+            const retryMs = rejection === 'COMFY_INSUFFICIENT_BALANCE'
+              ? Math.max(this.options.configuration.capacityPollIntervalMs ?? 30_000, 300_000)
+              : (this.options.configuration.capacityPollIntervalMs ?? 30_000);
+            this.store.updateInstance(instance.id, { state: 'offline', action_started_at: null, action_sent: 0,
+              next_action_at: Date.now() + retryMs, error_code: rejection }, diagnosticDetails(error));
+            return false;
+          }
           if ((error as { code?: string })?.code !== 'CAPACITY_UNAVAILABLE') throw error;
           this.store.updateInstance(instance.id, { state: 'waiting_capacity', action_started_at: null, action_sent: 0,
             capacity_started_at: instance.capacity_started_at ?? Date.now(), next_action_at: Date.now() + (this.options.configuration.capacityPollIntervalMs ?? 30_000),

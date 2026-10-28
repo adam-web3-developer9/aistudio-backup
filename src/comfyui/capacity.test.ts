@@ -183,7 +183,7 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     expect(platform.openInstance).not.toHaveBeenCalled();
   });
 
-  it.each(['NETWORK_ERROR', 'TIMEOUT', 'BUSINESS_REJECTED'])('never repeats an uncertain or rejected open (%s)', async code => {
+  it.each(['NETWORK_ERROR', 'TIMEOUT'])('never repeats an uncertain open (%s)', async code => {
     const { service, platform, store, submit } = fixture();
     platform.openInstance.mockRejectedValue({ code });
     submit();
@@ -203,6 +203,20 @@ describe('capacity scheduling with SQLite and mock clients', () => {
     expect(platform.openInstance).toHaveBeenCalledTimes(1);
     expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_INSTANCE_ACTION_TIMEOUT',
       next_action_at: startedAt + 60_001 });
+  });
+
+  it('records a rejected open as a definite start rejection instead of leaving it booting', async () => {
+    const { service, platform, store, submit } = fixture();
+    platform.openInstance.mockRejectedValue({ code: 'BUSINESS_REJECTED', reason: 'INSUFFICIENT_BALANCE' });
+    submit();
+    await service.tick();
+    expect(store.instance('1')).toMatchObject({ state: 'offline', action_sent: 0, action_started_at: null,
+      error_code: 'COMFY_INSUFFICIENT_BALANCE', next_action_at: startedAt + 300_000 });
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
+    vi.mocked(Date.now).mockReturnValue(startedAt + 300_001);
+    await service.tick();
+    expect(platform.openInstance).toHaveBeenCalledTimes(2);
   });
 
   it('does not spend bootTimeout while waiting for capacity and grants a fresh boot window on success', async () => {

@@ -67,11 +67,22 @@ export interface AigateReconcileResult {
   pagesScanned: number;
 }
 
+// 服务端只保留“可行动的分类”，不保存平台原始 msg：原始正文里可能混着 token、HTML 或超长内容。
+// 分类足够让调度层和客户端给出明确指引（例如去充值），又不扩大泄露面。
+export type AigateRejectionReason = 'INSUFFICIENT_BALANCE' | 'INSTANCE_START_REJECTED';
+
 export class AigateError extends Error {
-  constructor(public readonly code: string, message: string, public readonly errCode?: string, public readonly uncertain = false) {
+  constructor(public readonly code: string, message: string, public readonly errCode?: string,
+    public readonly uncertain = false, public readonly reason?: AigateRejectionReason) {
     super(message);
     this.name = 'AigateError';
   }
+}
+
+function rejectionReason(msg: string, action: string): AigateRejectionReason | undefined {
+  if (/余额|欠费|充值|欠款|insufficient\s+balance|account\s+balance|arrears/i.test(msg)) return 'INSUFFICIENT_BALANCE';
+  if (action === 'open' || action === 'start' || action === 'create') return 'INSTANCE_START_REJECTED';
+  return undefined;
 }
 
 function invalidResponse(uncertain = false): never {
@@ -396,12 +407,14 @@ export class AigateClient {
           || (body.ok !== undefined && typeof body.ok !== 'boolean')) return invalidResponse();
         if (body.code !== 0 || body.ok === false) {
           const errCode = this.safeErrorCode(body.errCode);
-          const explicitlyUnavailable = typeof body.msg === 'string' && body.msg.length <= 500 &&
-            /(?:显卡|GPU|算力)(?:资源|库存)?(?:不足|已售罄|已售完|暂无库存)|(?:暂无|没有|无)可用(?:的)?(?:GPU|显卡|算力)|(?:GPU|显卡)(?:资源)?(?:暂不可用|暂时不可用)/i.test(body.msg);
+          const msg = typeof body.msg === 'string' ? body.msg : '';
+          const explicitlyUnavailable = msg.length <= 500 &&
+            /(?:显卡|GPU|算力)(?:资源|库存)?(?:不足|已售罄|已售完|暂无库存)|(?:暂无|没有|无)可用(?:的)?(?:GPU|显卡|算力)|(?:GPU|显卡)(?:资源)?(?:暂不可用|暂时不可用)/i.test(msg);
           if ((action === 'open' || action === 'start') && (errCode !== undefined && this.#capacityErrorCodes.has(errCode) || explicitlyUnavailable)) {
             throw new AigateError('CAPACITY_UNAVAILABLE', 'AIGate capacity is unavailable', errCode);
           }
-          throw new AigateError('BUSINESS_REJECTED', 'AIGate explicitly rejected the request', errCode);
+          // 只保留可行动的分类，不保存原始 msg；上层据此区分“充值能解决”和“稍后自动重试”。
+          throw new AigateError('BUSINESS_REJECTED', 'AIGate explicitly rejected the request', errCode, false, rejectionReason(msg, action));
         }
         if (action === 'status' && typeof body.data !== 'string') return invalidResponse();
         if ((action === 'open' || action === 'close' || action === 'release') && body.data !== null && typeof body.data !== 'string') {
@@ -412,7 +425,7 @@ export class AigateClient {
       })()]);
     } catch (error) {
       if (mutation && error instanceof AigateError && !['BUSINESS_REJECTED', 'CAPACITY_UNAVAILABLE'].includes(error.code)) {
-        throw new AigateError(error.code, error.message, error.errCode, true);
+        throw new AigateError(error.code, error.message, error.errCode, true, error.reason);
       }
       throw error;
     } finally {

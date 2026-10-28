@@ -44,6 +44,7 @@ function fixture(overrides: Partial<ComfyPoolConfiguration> = {}) {
     getInstance: vi.fn<AigateClient['getInstance']>().mockResolvedValue(metadata),
     releaseInstance: vi.fn<AigateClient['releaseInstance']>().mockResolvedValue(undefined),
     pageInstances: vi.fn<AigateClient['pageInstances']>().mockResolvedValue({ total: 1, records: [metadata] }),
+    findInstancesByName: vi.fn<AigateClient['findInstancesByName']>().mockResolvedValue({ records: [], complete: true, pagesScanned: 1 }),
   };
   const client = { health: vi.fn<ComfyClient['health']>().mockResolvedValue(undefined),
     queue: vi.fn<ComfyClient['queue']>().mockResolvedValue({ running: [], pending: [] }) };
@@ -275,6 +276,36 @@ describe('ComfyLifecycle elastic creation', () => {
     }
   });
 
+  it('releases an unconfirmed creation once the platform confirms the name does not exist', async () => {
+    const context = fallbackFixture();
+    context.store.saveResource(resource({ state: 'uncertain', created_at: Date.now() - 400_000, error_code: 'COMFY_CREATION_UNCONFIRMED' }));
+    await context.lifecycle.tick();
+    expect(context.platform.findInstancesByName).toHaveBeenCalledExactlyOnceWith('hailuo-resource', expect.anything());
+    expect(context.store.resources().find(item => item.key === 'resource')).toMatchObject({ state: 'released', instance_id: null, error_code: 'COMFY_CREATION_UNCONFIRMED' });
+    // 占位释放后扩容继续，不再被一条网络失败的创建记录永久挡住。
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+  });
+
+  it('adopts the single instance found by name instead of blocking expansion', async () => {
+    const context = fallbackFixture();
+    context.platform.findInstancesByName.mockResolvedValue({ complete: true, pagesScanned: 1,
+      records: [{ ...context.metadata, instanceName: 'hailuo-resource' }] });
+    context.store.saveResource(resource({ state: 'uncertain', created_at: Date.now() - 400_000, error_code: 'COMFY_CREATION_UNCONFIRMED' }));
+    await context.lifecycle.tick();
+    expect(context.store.resources()).toEqual([expect.objectContaining({ state: 'creating', instance_id: context.metadata.id })]);
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unconfirmed creation blocking when the platform listing is incomplete', async () => {
+    const context = fixture();
+    context.demand();
+    context.platform.findInstancesByName.mockResolvedValue({ complete: false, pagesScanned: 2, records: [] });
+    context.store.saveResource(resource({ state: 'uncertain', created_at: Date.now() - 3_600_000, error_code: 'COMFY_CREATION_UNCONFIRMED' }));
+    await context.lifecycle.tick();
+    expect(context.store.resources().some(item => item.state === 'uncertain')).toBe(true);
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+  });
+
   it('does not fall back after a known ID even for a confirmed initialization capacity rejection', async () => {
     const context = fallbackFixture();
     context.platform.getInstance.mockRejectedValue(new AigateError('CAPACITY_UNAVAILABLE', 'initialization failed'));
@@ -494,19 +525,22 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(restarted.configuration.instances.filter(instance => instance.id === createdId)).toHaveLength(1);
   });
 
-  it('persists a timed-out creation as uncertain and never retries it after restart or cooldown', async () => {
+  it('retries a timed-out creation only after the platform confirms the old name never existed', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
     const context = fixture();
     context.demand();
     context.platform.createInstance.mockRejectedValue(new AigateError('TIMEOUT', 'outcome unknown', undefined, true));
     await context.lifecycle.tick();
     expect(context.store.resources()).toEqual([expect.objectContaining({ state: 'uncertain', instance_id: null, error_code: 'COMFY_TIMEOUT' })]);
     const restarted = context.restart();
-    clock += 3_600_000;
+    now.mockReturnValue(1_800_000_000_000 + 3_600_000);
     context.demand();
-    for (let attempt = 0; attempt < 3; attempt++) await restarted.lifecycle.tick();
-    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
-    expect(context.platform.getInstance).not.toHaveBeenCalled();
-    expect(restarted.lifecycle.lastError).toBe('COMFY_RESOURCE_RECONCILIATION_REQUIRED');
+    await restarted.lifecycle.tick();
+    expect(context.platform.findInstancesByName).toHaveBeenCalledTimes(1);
+    expect(context.platform.findInstancesByName.mock.calls[0]?.[0]).toMatch(/^hailuo-/);
+    expect(restarted.store.resources().some(resource => resource.state === 'released')).toBe(true);
+    // 关键契约：不再让一条未确认的创建记录把扩容整体挡住。
+    expect(restarted.lifecycle.lastError).not.toBe('COMFY_RESOURCE_RECONCILIATION_REQUIRED');
   });
 
   it('turns an interrupted creating reservation without an ID into uncertain without creating again', async () => {
