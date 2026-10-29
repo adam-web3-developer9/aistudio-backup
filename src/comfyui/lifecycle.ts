@@ -148,7 +148,14 @@ export class ComfyLifecycle {
     const busy = supported.filter(instance => store.instance(instance.id)?.job_id).length;
     const desired = Math.min(policy.maxConcurrentInstances,
       busy + Math.min(demand, Math.ceil(demand * policy.estimatedJobMs / policy.targetQueueWaitMs)));
+    // Unknown creations consume count/budget reservations, but are not usable
+    // capacity. Even a single queued job may need another confirmed instance.
     return supported.length < desired;
+  }
+
+  private unregisteredResources(): ComfyResource[] {
+    return this.options.store.resources().filter(resource => resource.state !== 'released'
+      && !this.options.configuration.instances.some(instance => instance.id === resource.instance_id));
   }
 
   private async scale(): Promise<void> {
@@ -157,7 +164,7 @@ export class ComfyLifecycle {
     if (!configuration.autoOpen || !elastic?.enabled) return;
     if (!platform.skuList || !platform.createInstance || !platform.getInstance) { this.lastError = 'COMFY_ELASTIC_API_UNAVAILABLE'; return; }
     const resources = store.resources();
-    if (resources.some(resource => ['creating', 'uncertain', 'blocked', 'releasing'].includes(resource.state))) {
+    if (resources.some(resource => ['creating', 'blocked', 'releasing'].includes(resource.state))) {
       this.lastError = 'COMFY_RESOURCE_RECONCILIATION_REQUIRED'; return;
     }
     const policy = schedulerPolicy(configuration);
@@ -165,7 +172,8 @@ export class ComfyLifecycle {
     if (Date.now() - lastCreated < elastic.createCooldownMs) return;
     const committed = elastic.maxHourlyCost === undefined ? 0 : this.reservedCost();
     if (committed === null) { this.lastError = 'COMFY_COST_UNKNOWN'; return; }
-    if (configuration.instances.length >= elastic.maxInstances || configuration.instances.length >= policy.maxConcurrentInstances) return;
+    const reservedInstances = configuration.instances.length + this.unregisteredResources().length;
+    if (reservedInstances >= elastic.maxInstances || reservedInstances >= policy.maxConcurrentInstances) return;
     const templates = [...elastic.templates].sort((left, right) => (left.gpuModel === '4090' ? 1 : 0) - (right.gpuModel === '4090' ? 1 : 0) || left.hourlyCost - right.hourlyCost);
     for (const template of templates) {
       if (!template.skuPriceUnitVerified || !Number.isFinite(template.skuPriceToHourlyFactor) || template.skuPriceToHourlyFactor <= 0) {
@@ -203,7 +211,8 @@ export class ComfyLifecycle {
           && (error as { code?: string })?.code === 'CAPACITY_UNAVAILABLE';
         store.saveResource({ ...resource, state: resource.instance_id ? 'creating' : (error as { uncertain?: boolean })?.uncertain === false ? 'released' : 'uncertain',
           updated_at: Date.now(), error_code: safeCode(error) });
-        this.lastError = resource.instance_id ? 'COMFY_RESOURCE_INITIALIZING' : capacityUnavailable ? 'COMFY_CAPACITY_UNAVAILABLE' : 'COMFY_CREATION_UNCONFIRMED';
+        this.lastError = resource.instance_id ? 'COMFY_RESOURCE_INITIALIZING' : capacityUnavailable ? 'COMFY_CAPACITY_UNAVAILABLE'
+          : (error as { uncertain?: boolean })?.uncertain === false ? safeCode(error) : 'COMFY_CREATION_UNCONFIRMED';
         if (capacityUnavailable) continue;
       }
       return;
@@ -261,7 +270,9 @@ export class ComfyLifecycle {
       } else if (resource.state === 'creating' && !resource.instance_id) {
         store.saveResource({ ...resource, state: 'uncertain', updated_at: Date.now(), error_code: 'COMFY_CREATION_UNCONFIRMED' });
       } else if (resource.state === 'uncertain' && !resource.instance_id) {
-        await this.resolveUncertainCreation(resource);
+        // start has no client idempotency key or custom instance name. An empty
+        // name lookup cannot prove that this request did not create an instance.
+        this.lastError = 'COMFY_CREATION_UNCONFIRMED';
       } else if (resource.state === 'releasing' && resource.instance_id && platform.pageInstances) {
         if (platform.getInstance) {
           try {
@@ -285,39 +296,6 @@ export class ComfyLifecycle {
           this.released(resource);
         }
       }
-    }
-  }
-
-  // 创建请求网络失败时无法确认平台是否已建实例。旧逻辑把这种资源永久留在 uncertain，
-  // scale() 见到 uncertain 就整体停止扩容。这里按资源名回查平台：确认不存在就释放占位，
-  // 找到唯一实例就收养它，仍然无法判断才保持 uncertain。
-  private async resolveUncertainCreation(resource: ComfyResource): Promise<void> {
-    const { store, configuration, platform } = this.options;
-    if (Date.now() - resource.created_at < (configuration.elastic?.reconcileTimeoutMs ?? 300_000)) {
-      this.lastError = 'COMFY_CREATION_UNCONFIRMED';
-      return;
-    }
-    if (!platform.findInstancesByName) {
-      this.lastError = 'COMFY_RESOURCE_RECONCILIATION_REQUIRED';
-      return;
-    }
-    try {
-      const found = await platform.findInstancesByName(resource.name, { maxPages: 2, pageSize: 20, operationStatus: null });
-      this.options.assertWorker();
-      const matches = found.records.filter(item => item.instanceName === resource.name);
-      const match = matches.length === 1 ? matches[0] : undefined;
-      if (match) {
-        store.saveResource({ ...resource, state: 'creating', instance_id: match.id, error_code: null, updated_at: Date.now() });
-        this.lastError = 'COMFY_RESOURCE_INITIALIZING';
-      } else if (found.complete && matches.length === 0) {
-        store.saveResource({ ...resource, state: 'released', error_code: 'COMFY_CREATION_UNCONFIRMED', updated_at: Date.now() });
-        this.lastError = null;
-      } else {
-        this.lastError = 'COMFY_CREATION_AMBIGUOUS';
-      }
-    } catch (error) {
-      this.options.assertWorker();
-      this.lastError = safeCode(error);
     }
   }
 

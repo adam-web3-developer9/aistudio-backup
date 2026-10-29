@@ -267,42 +267,47 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
     expect(context.platform.skuList).toHaveBeenCalledExactlyOnceWith('华东一区');
     expect(context.store.resources()).toEqual([expect.objectContaining({ state, instance_id: null, error_code: 'COMFY_' + code })]);
-    expect(context.lifecycle.lastError).toBe('COMFY_CREATION_UNCONFIRMED');
+    expect(context.lifecycle.lastError).toBe(uncertain === false ? 'COMFY_' + code : 'COMFY_CREATION_UNCONFIRMED');
     if (uncertain !== false) {
       clock += context.configuration.elastic!.createCooldownMs;
       await context.lifecycle.tick();
       expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
-      expect(context.lifecycle.lastError).toBe('COMFY_RESOURCE_RECONCILIATION_REQUIRED');
+      expect(context.lifecycle.lastError).toBe('COMFY_CREATION_UNCONFIRMED');
     }
   });
 
-  it('releases an unconfirmed creation once the platform confirms the name does not exist', async () => {
+  it('keeps a lost receipt reserved even beyond the old reconciliation deadline', async () => {
     const context = fallbackFixture();
+    context.configuration.elastic!.maxInstances = 2;
     context.store.saveResource(resource({ state: 'uncertain', created_at: Date.now() - 400_000, error_code: 'COMFY_CREATION_UNCONFIRMED' }));
     await context.lifecycle.tick();
-    expect(context.platform.findInstancesByName).toHaveBeenCalledExactlyOnceWith('hailuo-resource', expect.anything());
-    expect(context.store.resources().find(item => item.key === 'resource')).toMatchObject({ state: 'released', instance_id: null, error_code: 'COMFY_CREATION_UNCONFIRMED' });
+    expect(context.platform.findInstancesByName).not.toHaveBeenCalled();
+    expect(context.store.resource('resource')).toMatchObject({ state: 'uncertain', instance_id: null });
     // 占位释放后扩容继续，不再被一条网络失败的创建记录永久挡住。
-    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
   });
 
-  it('adopts the single instance found by name instead of blocking expansion', async () => {
+  it('does not adopt an unrelated instance matching a name never sent to the provider', async () => {
     const context = fallbackFixture();
+    context.configuration.elastic!.maxInstances = 2;
     context.platform.findInstancesByName.mockResolvedValue({ complete: true, pagesScanned: 1,
       records: [{ ...context.metadata, instanceName: 'hailuo-resource' }] });
     context.store.saveResource(resource({ state: 'uncertain', created_at: Date.now() - 400_000, error_code: 'COMFY_CREATION_UNCONFIRMED' }));
     await context.lifecycle.tick();
-    expect(context.store.resources()).toEqual([expect.objectContaining({ state: 'creating', instance_id: context.metadata.id })]);
+    expect(context.store.resources()).toEqual([expect.objectContaining({ state: 'uncertain', instance_id: null })]);
+    expect(context.platform.findInstancesByName).not.toHaveBeenCalled();
     expect(context.platform.createInstance).not.toHaveBeenCalled();
   });
 
-  it('keeps an unconfirmed creation blocking when the platform listing is incomplete', async () => {
+  it('does not use an incomplete platform listing to discard a reservation', async () => {
     const context = fixture();
+    context.configuration.elastic!.maxInstances = 2;
     context.demand();
     context.platform.findInstancesByName.mockResolvedValue({ complete: false, pagesScanned: 2, records: [] });
     context.store.saveResource(resource({ state: 'uncertain', created_at: Date.now() - 3_600_000, error_code: 'COMFY_CREATION_UNCONFIRMED' }));
     await context.lifecycle.tick();
     expect(context.store.resources().some(item => item.state === 'uncertain')).toBe(true);
+    expect(context.platform.findInstancesByName).not.toHaveBeenCalled();
     expect(context.platform.createInstance).not.toHaveBeenCalled();
   });
 
@@ -428,12 +433,15 @@ describe('ComfyLifecycle elastic creation', () => {
     if (protection === 'elastic') context.configuration.elastic!.maxInstances = 1;
     if (protection === 'scheduler') context.configuration.scheduler!.maxConcurrentInstances = 1;
     if (protection === 'quote') context.platform.skuList.mockResolvedValue([{ ...context.sku, price: '1.01' }]);
-    if (protection === 'uncertain') context.store.saveResource(resource({ state: 'uncertain' }));
+    if (protection === 'uncertain') {
+      context.configuration.elastic!.maxInstances = 2;
+      context.store.saveResource(resource({ state: 'uncertain', created_at: clock - 120_000 }));
+    }
     context.demand();
     await context.lifecycle.tick();
     expect(context.platform.createInstance).not.toHaveBeenCalled();
     if (protection === 'quote') expect(context.lifecycle.lastError).toBe('COMFY_SKU_QUOTE_UNVERIFIED');
-    if (protection === 'uncertain') expect(context.lifecycle.lastError).toBe('COMFY_RESOURCE_RECONCILIATION_REQUIRED');
+    if (protection === 'uncertain') expect(context.lifecycle.lastError).toBe('COMFY_CREATION_UNCONFIRMED');
   });
 
   it.each(['overpriced', 'malformed', 'missing', 'wrong-area', 'wrong-sku'] as const)('rejects an unverified %s SKU quote', async scenario => {
@@ -525,29 +533,88 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(restarted.configuration.instances.filter(instance => instance.id === createdId)).toHaveLength(1);
   });
 
-  it('retries a timed-out creation only after the platform confirms the old name never existed', async () => {
-    const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
-    const context = fixture();
+  it('recovers a single queued job after an uncertain creation without waiting for reconciliation', async () => {
+    const context = fixture({ instances: [] });
+    context.configuration.elastic!.createCooldownMs = 10_000;
+    context.configuration.elastic!.reconcileTimeoutMs = 900_000;
+    context.submit();
+    context.platform.createInstance.mockRejectedValueOnce(new AigateError('TIMEOUT', 'outcome unknown', undefined, true));
+    await context.lifecycle.tick();
+    const key = context.store.resources()[0]!.key;
+    const restarted = context.restart();
+    restarted.configuration.elastic!.createCooldownMs = 10_000;
+    clock += 9_999;
+    await restarted.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
+    clock += 1;
+    await restarted.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
+    expect(context.store.resource(key)).toMatchObject({ state: 'uncertain', instance_id: null });
+    expect(context.store.resources().filter(item => item.state === 'registered')).toHaveLength(1);
+    expect(context.platform.findInstancesByName).not.toHaveBeenCalled();
+    clock += 10_000;
+    await restarted.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['elastic', 'scheduler', 'budget'] as const)('counts uncertain reservations against the %s limit after restart', async limit => {
+    const context = fixture({ instances: [] });
+    if (limit === 'elastic') context.configuration.elastic!.maxInstances = 1;
+    if (limit === 'scheduler') context.configuration.scheduler!.maxConcurrentInstances = 1;
+    if (limit === 'budget') context.configuration.elastic!.maxHourlyCost = 1.2;
+    context.store.saveResource(resource({ state: 'uncertain', created_at: clock - 120_000 }));
     context.demand();
+    // Preserve the changed policy in the restarted configuration.
+    const restarted = new ComfyLifecycle({ store: context.store, configuration: structuredClone(context.configuration),
+      platform: context.platform, client: () => context.client, assertWorker: context.assertWorker });
+    lifecycles.push(restarted);
+    await restarted.tick();
+    expect(context.platform.createInstance).not.toHaveBeenCalled();
+    expect(context.store.resource('resource')?.state).toBe('uncertain');
+  });
+
+  it.each(['elastic', 'scheduler', 'budget'] as const)('bounds repeated lost receipts by the %s limit across restart', async limit => {
+    const context = fixture({ instances: [] });
+    context.configuration.elastic!.createCooldownMs = 10_000;
+    if (limit === 'elastic') context.configuration.elastic!.maxInstances = 3;
+    if (limit === 'scheduler') context.configuration.scheduler!.maxConcurrentInstances = 3;
+    if (limit === 'budget') context.configuration.elastic!.maxHourlyCost = 2.41;
+    else delete context.configuration.elastic!.maxHourlyCost;
+    context.submit();
     context.platform.createInstance.mockRejectedValue(new AigateError('TIMEOUT', 'outcome unknown', undefined, true));
     await context.lifecycle.tick();
-    expect(context.store.resources()).toEqual([expect.objectContaining({ state: 'uncertain', instance_id: null, error_code: 'COMFY_TIMEOUT' })]);
-    const restarted = context.restart();
-    now.mockReturnValue(1_800_000_000_000 + 3_600_000);
-    context.demand();
-    await restarted.lifecycle.tick();
-    expect(context.platform.findInstancesByName).toHaveBeenCalledTimes(1);
-    expect(context.platform.findInstancesByName.mock.calls[0]?.[0]).toMatch(/^hailuo-/);
-    expect(restarted.store.resources().some(resource => resource.state === 'released')).toBe(true);
-    // 关键契约：不再让一条未确认的创建记录把扩容整体挡住。
-    expect(restarted.lifecycle.lastError).not.toBe('COMFY_RESOURCE_RECONCILIATION_REQUIRED');
+    const restarted = new ComfyLifecycle({ store: context.store, configuration: structuredClone(context.configuration),
+      platform: context.platform, client: () => context.client, assertWorker: context.assertWorker });
+    lifecycles.push(restarted);
+    for (let index = 0; index < 4; index++) { clock += 10_000; await restarted.tick(); }
+    const expected = limit === 'budget' ? 2 : 3;
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(expected);
+    expect(context.store.resources()).toHaveLength(expected);
+    expect(context.store.resources().every(item => item.state === 'uncertain' && item.instance_id === null)).toBe(true);
+    expect(context.platform.findInstancesByName).not.toHaveBeenCalled();
+  });
+
+  it('retries a confirmed unsent connection failure after normal cooldown', async () => {
+    const context = fixture({ instances: [] });
+    context.configuration.elastic!.createCooldownMs = 10_000;
+    context.submit();
+    context.platform.createInstance.mockRejectedValueOnce(new AigateError('NETWORK_ERROR', 'not sent', undefined, false));
+    await context.lifecycle.tick();
+    expect(context.store.resources()[0]).toMatchObject({ state: 'released', error_code: 'COMFY_NETWORK_ERROR' });
+    expect(context.lifecycle.lastError).toBe('COMFY_NETWORK_ERROR');
+    clock += 10_000;
+    await context.lifecycle.tick();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
+    expect(context.store.resources().filter(item => item.state === 'registered')).toHaveLength(1);
   });
 
   it('turns an interrupted creating reservation without an ID into uncertain without creating again', async () => {
     const context = fixture();
+    context.configuration.elastic!.maxInstances = 2;
     context.demand();
     context.store.saveResource(resource({ created_at: clock - 120_000 }));
     const restarted = context.restart();
+    restarted.configuration.elastic!.maxInstances = 2;
     await restarted.lifecycle.tick();
     await restarted.lifecycle.tick();
     expect(context.store.resource('resource')).toMatchObject({ state: 'uncertain', instance_id: null, error_code: 'COMFY_CREATION_UNCONFIRMED' });

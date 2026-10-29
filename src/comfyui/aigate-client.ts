@@ -73,7 +73,8 @@ export type AigateRejectionReason = 'INSUFFICIENT_BALANCE' | 'INSTANCE_START_REJ
 
 export class AigateError extends Error {
   constructor(public readonly code: string, message: string, public readonly errCode?: string,
-    public readonly uncertain = false, public readonly reason?: AigateRejectionReason) {
+    public readonly uncertain = false, public readonly reason?: AigateRejectionReason,
+    public readonly requestSent?: false) {
     super(message);
     this.name = 'AigateError';
   }
@@ -114,6 +115,14 @@ function invalidArgument(): never {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function failedBeforeSend(error: unknown): boolean {
+  if (!isRecord(error)) return false;
+  const code = isRecord(error.cause) ? error.cause.code : error.code;
+  // These failures happen before an HTTP connection exists. Socket resets, body
+  // timeouts and generic fetch failures can follow submission and stay uncertain.
+  return typeof code === 'string' && ['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'].includes(code);
 }
 
 function parsePort(value: unknown): number | undefined {
@@ -381,8 +390,10 @@ export class AigateClient {
             redirect: 'error',
             cache: 'no-store'
           });
-        } catch {
-          throw new AigateError('NETWORK_ERROR', 'AIGate network failure; outcome unknown');
+        } catch (error) {
+          const notSent = failedBeforeSend(error);
+          throw new AigateError('NETWORK_ERROR', notSent ? 'AIGate connection failed before request submission'
+            : 'AIGate network failure; outcome unknown', undefined, false, undefined, notSent ? false : undefined);
         }
         if (!response.ok) {
           throw new AigateError('HTTP_ERROR', `AIGate HTTP failure (${response.status})`);
@@ -424,7 +435,8 @@ export class AigateClient {
         return body.data;
       })()]);
     } catch (error) {
-      if (mutation && error instanceof AigateError && !['BUSINESS_REJECTED', 'CAPACITY_UNAVAILABLE'].includes(error.code)) {
+      if (mutation && error instanceof AigateError && error.requestSent !== false
+        && !['BUSINESS_REJECTED', 'CAPACITY_UNAVAILABLE'].includes(error.code)) {
         throw new AigateError(error.code, error.message, error.errCode, true, error.reason);
       }
       throw error;

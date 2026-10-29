@@ -470,6 +470,49 @@ describe('AigateClient elastic instance APIs', () => {
     }
   );
 
+  it.each(mutations.flatMap(action => ['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT']
+    .flatMap(code => [false, true].map(nested => ({ action, code, nested })))))(
+    'keeps $action $code before submission definite (nested=$nested) without leaking or retrying', async ({ action, code, nested }) => {
+      const failure = Object.assign(new Error(token), nested ? { cause: { code, message: token } } : { code });
+      const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(failure);
+      const error = await mutate(new AigateClient({ token, fetch: fetchMock }), action).catch(error => error);
+      expect(error).toMatchObject({ code: 'NETWORK_ERROR', uncertain: false, requestSent: false });
+      expect(JSON.stringify(error)).not.toContain(token);
+      expect(String(error)).not.toContain(token);
+      expect(error.cause).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each(['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT'])(
+    'keeps create %s uncertain because the request may have been submitted', async code => {
+      const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(Object.assign(new Error(token), { cause: { code } }));
+      const error = await mutate(new AigateClient({ token, fetch: fetchMock }), 'create').catch(error => error);
+      expect(error).toMatchObject({ code: 'NETWORK_ERROR', uncertain: true });
+      expect(error.requestSent).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('does not treat a response body failure as proof that create was never submitted', async () => {
+    const failure = Object.assign(new Error(token), { cause: { code: 'ENOTFOUND' } });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue({ ok: true,
+      text: () => Promise.reject(failure) } as unknown as Response);
+    const error = await mutate(new AigateClient({ token, fetch: fetchMock }), 'create').catch(error => error);
+    expect(error).toMatchObject({ code: 'NETWORK_ERROR', uncertain: true });
+    expect(error.requestSent).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not infer a definite create failure from nested or aggregate connection errors', async () => {
+    const failure = new AggregateError([Object.assign(new Error(token), { code: 'ECONNREFUSED' })], token);
+    const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(Object.assign(new Error(token), { cause: failure }));
+    const error = await mutate(new AigateClient({ token, fetch: fetchMock }), 'create').catch(error => error);
+    expect(error).toMatchObject({ code: 'NETWORK_ERROR', uncertain: true });
+    expect(error.requestSent).toBeUndefined();
+    expect(JSON.stringify(error)).not.toContain(token);
+  });
+
   it.each(mutations.flatMap(action => [302, 401, 429, 503].map(status => ({ action, status }))))(
     'marks $action HTTP $status uncertain without trusting the envelope or retrying', async ({ action, status }) => {
       const { client, fetchMock } = setup({ code: 1, msg: token }, status);
