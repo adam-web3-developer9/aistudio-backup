@@ -36,7 +36,7 @@ export function assertVideoGatewayRequest(request: FastifyRequest, enabled: bool
   const allowed = request.method === 'POST' && (pathname === '/v1/assets' || pathname === '/v1/jobs'
       || pathname === '/v1/upload-intents' || pathname === '/v1/upload-intents/staged' || intentAction === 'complete' || intentAction === 'finalize' || comfyAction === 'cancel' || comfyAction === 'reconcile' || comfyAction === 'retry' || comfyAction === 'inputs' || comfyAction === 'collected')
     || request.method === 'PUT' && (intentAction === 'manifest' || intentAction === 'manifest-stream')
-    || request.method === 'GET' && (pathname === '/v1/jobs' || pathname.startsWith('/v1/jobs/') && gatewayJobId.test(pathname.slice('/v1/jobs/'.length))
+    || request.method === 'GET' && (pathname === '/v1/jobs' || /^\/v1\/jobs\/by-request-key\/[A-Za-z0-9_-]{1,200}$/.test(pathname) || pathname.startsWith('/v1/jobs/') && gatewayJobId.test(pathname.slice('/v1/jobs/'.length))
       || uploadIntentPath || intentAction === 'status' || intentAction === 'items' || intentAction === 'diagnostics' || comfyAction === 'result' || comfyAction === 'events');
   if (!enabled || !allowed) throw new SystemError(404, 'LEGACY_API_DISABLED', 'Legacy channel HTTP API is disabled');
   assertVideoGatewayConfiguration(enabled, apiKey);

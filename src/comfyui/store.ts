@@ -12,6 +12,7 @@ export interface ComfyInput {
   values: Record<string, string | number | boolean>;
   media: Record<string, string>;
   transport?: 'direct';
+  resultDelivery?: 'archive';
   directMedia?: Record<string, { filename: string; contentType: string; sha256: string }>;
 }
 export interface FrozenComfyInput extends ComfyInput { profile: WorkflowProfile }
@@ -114,6 +115,7 @@ export class ComfyStore {
   releaseWorker(owner: string): void { this.db.prepare('DELETE FROM comfy_worker WHERE id=1 AND owner=?').run(owner); }
   submit(owner: string, input: FrozenComfyInput, timeoutMs: number, now = Date.now()): { job: ComfyJob; created: boolean } {
     const fingerprint = createHash('sha256').update(canonical({ workflowId: input.workflowId, values: input.values, media: input.media,
+      ...(input.resultDelivery ? { resultDelivery: input.resultDelivery } : {}),
       ...(input.transport ? { transport: input.transport, directMedia: input.directMedia ?? {} } : {}) })).digest('hex');
     return this.db.transaction(() => {
       const prior = this.db.prepare('SELECT * FROM comfy_jobs WHERE owner=? AND request_key=?').get(owner, input.requestKey) as ComfyJob | undefined;

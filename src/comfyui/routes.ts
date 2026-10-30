@@ -9,6 +9,7 @@ export const comfyJobSchema = z.object({
   values: z.record(z.string(), z.union([z.string(), z.number().finite(), z.boolean()])),
   media: z.record(z.string(), z.string().regex(/^asset_[A-Za-z0-9_-]+$/)).default({}),
   transport: z.literal('direct').optional(),
+  resultDelivery: z.literal('archive').optional(),
   directMedia: z.record(z.string(), z.object({
     filename: z.string().regex(/^[A-Za-z0-9_-]+\.(png|jpg|jpeg|webp|wav|mp3)$/i).max(200),
     contentType: z.enum(['image/png', 'image/jpeg', 'image/webp', 'audio/mpeg', 'audio/wav']),
@@ -17,6 +18,7 @@ export const comfyJobSchema = z.object({
 }).strict();
 
 export const comfyInputsSchema = z.object({
+  reservationId: z.string().regex(/^[A-Za-z0-9_-]{1,250}$/).optional(),
   inputs: z.record(z.string(), z.object({ name: z.string().min(1).max(200), subfolder: z.string().min(1).max(250), type: z.literal('input') }).strict()),
 }).strict();
 

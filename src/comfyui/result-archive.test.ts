@@ -11,7 +11,8 @@ const file = { size: 4096, sha256: 'a'.repeat(64), md5: Buffer.alloc(16, 1).toSt
 const output = { filename: 'video.mp4', subfolder: 'result', type: 'output', nodeId: '1' };
 const start = 1_800_000_000_000;
 
-function fixture() {
+function fixture(commercial = false) {
+  const workflowId = commercial ? 'minimax-h3-9plus3' : 'render';
   let now = start;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   const db = new Database(':memory:');
@@ -37,9 +38,10 @@ function fixture() {
     store, owner: 'owner', platform, client: () => client, assets: { get: vi.fn(), read: vi.fn() },
     results: { read: vi.fn(), save: vi.fn() }, ownsAsset: () => false,
     configuration: { autoOpen: false, pollIntervalMs: 1000, bootTimeoutMs: 30_000, jobTimeoutMs: 3_600_000,
-      instances: [{ id: '1', baseUrl: 'https://native.waas.aigate.cc', workflowIds: ['render'] }],
-      workflows: [{ id: 'render', version: '1', graph: { '1': { class_type: 'Render', inputs: { filename_prefix: '' } } },
-        bindings: { output: { nodeId: '1', input: 'filename_prefix', kind: 'output-prefix' } }, outputNodeIds: ['1'] }] },
+      instances: [{ id: '1', baseUrl: 'https://native.waas.aigate.cc', workflowIds: [workflowId] }],
+      workflows: [{ id: workflowId, version: '1', graph: { '1': { class_type: 'Render', inputs: { filename_prefix: '', duration: 5, width: 1344, height: 768 } } },
+        bindings: { output: { nodeId: '1', input: 'filename_prefix', kind: 'output-prefix' },
+          ...(commercial ? { duration: { nodeId: '1', input: 'duration', required: true }, width: { nodeId: '1', input: 'width', required: true }, height: { nodeId: '1', input: 'height', required: true } } : {}) }, outputNodeIds: ['1'] }] },
     resultArchive: { storage, exporter: () => exporter, keyPrefix: 'comfy-results', storageIdentity: 'fixture-private-bucket' },
   };
   options.configuration.scheduler = schedulerPolicy(options.configuration);
@@ -48,9 +50,10 @@ function fixture() {
   store.updateInstance('1', { state: 'ready', idle_since: now });
   let sequence = 0;
   function succeed() {
-    const job = service.submit({ adapterId: 'comfyui-v1', requestKey: 'job-' + sequence++, workflowId: 'render',
-      transport: 'direct', values: {}, media: {}, directMedia: {} }).job;
-    store.claim('1', ['render'], now);
+    const job = service.submit({ adapterId: 'comfyui-v1', requestKey: 'job-' + sequence++, workflowId,
+      transport: 'direct', values: commercial ? { duration: 5, width: 1344, height: 768 } : {}, media: {}, directMedia: {},
+      ...(commercial ? { resultDelivery: 'archive' as const } : {}) }).job;
+    store.claim('1', [workflowId], now);
     store.updateJob(job.id, { stage: 'succeeded', result_pending: 1,
       result: JSON.stringify({ videoUrl: 'https://native.waas.aigate.cc/view?filename=video.mp4&subfolder=result&type=output', output }) });
     store.releaseSlot(job.id);
@@ -68,6 +71,114 @@ afterEach(async () => {
 });
 
 describe('GPU result archive fallback', () => {
+  it('rejects commercial creation before accepting a job when archive storage is not configured', async () => {
+    const context = fixture(true);
+    const service = new ComfyService({ ...context.options, resultArchive: undefined });
+    try {
+      expect(() => service.submit({ adapterId: 'comfyui-v1', workflowId: 'minimax-h3-9plus3', requestKey: 'missing-storage', transport: 'direct', resultDelivery: 'archive',
+        values: { duration: 5, width: 1344, height: 768 }, media: {} })).toThrow(expect.objectContaining({ statusCode: 503, code: 'COMFY_ARCHIVE_UNAVAILABLE' }));
+      expect(context.store.byRequest('owner', 'missing-storage')).toBeUndefined();
+    } finally { await service.close(); }
+  });
+
+  it.each([{ duration: 4, width: 480, height: 864 }, { duration: 15, width: 1920, height: 1088 }])('accepts and freezes supported commercial boundaries: %j', values => {
+    const context = fixture(true);
+    const input = { adapterId: 'comfyui-v1' as const, workflowId: 'minimax-h3-9plus3', requestKey: 'boundary', transport: 'direct' as const, resultDelivery: 'archive' as const, values, media: {} };
+    const job = context.service.submit(input).job;
+    values.duration = 10;
+    expect(context.service.publicJob(job).billing?.requestedSeconds).toBe(JSON.parse(job.input).values.duration);
+    expect(JSON.parse(job.input).values).not.toBe(values);
+  });
+
+  it('withholds commercial success and temporary GPU URLs until an immediate verified archive is stored', async () => {
+    const context = fixture(true);
+    const job = context.succeed();
+    expect(context.service.publicJob(job)).toMatchObject({ status: 'running', stage: 'archiving', billing: { unit: 'second', requestedSeconds: 5 } });
+    expect(context.service.publicJob(job)).not.toHaveProperty('result');
+    expect(() => context.service.acknowledgeCollected(job.id)).toThrow(expect.objectContaining({ code: 'COMFY_RESULT_UNAVAILABLE' }));
+    await context.run();
+    expect(context.exporter.upload).toHaveBeenCalledTimes(1);
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ status: 'succeeded', result: { storage: 'tos', expiresAt: start + 86_400_000 } });
+    expect(context.client.download).not.toHaveBeenCalled();
+    expect(context.options.results.save).not.toHaveBeenCalled();
+    await context.restart();
+    expect(context.service.publicJob(context.service.get(job.id)).billing).toEqual({ unit: 'second', requestedSeconds: 5 });
+  });
+
+  it('retains commercial charges while archive transfer is retrying, and proves final delivery failure only after abandonment', async () => {
+    const context = fixture(true);
+    const job = context.succeed();
+    context.exporter.describe.mockRejectedValue(new Error('temporary connection failure'));
+    await context.run();
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ status: 'running', stage: 'archiving' });
+    expect(context.service.publicJob(context.service.get(job.id)).error?.providerTerminal).not.toBe(true);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      context.advance(60_000);
+      await context.run();
+    }
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ status: 'failed', error: { code: 'COMFY_ARCHIVE_TRANSFER_FAILED', providerTerminal: true } });
+  });
+
+  it('does not authorize refunds for uncertain cancellation or previously delivered expired results', async () => {
+    const context = fixture(true);
+    const job = context.succeed();
+    context.store.updateJob(job.id, { stage: 'cancelled', result: null, result_pending: 0, provider_confirmed: 1, error_code: 'COMFY_CANCELLED',
+      native_checkpoint: JSON.stringify({ attempts: [{ number: 1, marker: job.id, plannedId: job.prompt_id, sentAt: start, confirmed: true }], nextAt: start, windowStart: 0 }) });
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ error: { providerTerminal: false } });
+    context.store.updateJob(job.id, { stage: 'failed', provider_confirmed: 0, error_code: 'COMFY_REMOTE_UNCONFIRMED' });
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ error: { providerTerminal: false } });
+    const delivered = context.succeed();
+    await context.run();
+    context.advance(86_400_001);
+    expect(context.service.publicJob(context.service.get(delivered.id))).toMatchObject({ status: 'failed', error: { code: 'COMFY_RESULT_EXPIRED', providerTerminal: false } });
+  });
+
+  it.each([
+    { duration: 0 }, { duration: 3 }, { duration: 16 }, { duration: 5.5 }, { duration: '5' },
+    { width: 1921 }, { width: 481 }, { height: -768 }, { width: 1920, height: 1920 },
+  ])('rejects commercial duration or dimension multipliers before persisting: %j', values => {
+    const context = fixture(true);
+    expect(() => context.service.submit({ adapterId: 'comfyui-v1', workflowId: 'minimax-h3-9plus3', requestKey: 'invalid',
+      transport: 'direct', resultDelivery: 'archive', values: { duration: 5, width: 1344, height: 768, ...values }, media: {} })).toThrow(expect.objectContaining({ statusCode: 400 }));
+    expect(context.store.byRequest('owner', 'invalid')).toBeUndefined();
+  });
+
+  it('freezes commercial delivery in the idempotency identity and acknowledges empty media after GPU allocation', async () => {
+    const context = fixture(true);
+    const input = { adapterId: 'comfyui-v1' as const, workflowId: 'minimax-h3-9plus3', requestKey: 'empty-inputs', transport: 'direct' as const,
+      resultDelivery: 'archive' as const, values: { duration: 10, width: 1344, height: 768 }, media: {} };
+    const accepted = context.service.submit(input);
+    expect(context.service.submit(input).job.id).toBe(accepted.job.id);
+    expect(() => context.service.submit({ ...input, resultDelivery: undefined })).toThrow(expect.objectContaining({ code: 'COMFY_REQUEST_CONFLICT' }));
+    expect(() => context.service.submit({ ...input, values: { ...input.values, duration: 5 } })).toThrow(expect.objectContaining({ code: 'COMFY_REQUEST_CONFLICT' }));
+    await context.run();
+    expect(context.store.get(accepted.job.id)).toMatchObject({ stage: 'preparing', direct_inputs: '{}' });
+    expect(context.service.publicJob(context.service.get(accepted.job.id)).billing?.requestedSeconds).toBe(10);
+    const queued = context.service.submit({ ...input, requestKey: 'cancel-before-submit' }).job;
+    expect(context.service.publicJob(context.service.cancel(queued.id))).toMatchObject({ error: { providerTerminal: true } });
+  });
+
+  it('rejects stale upload acknowledgements after a new commercial reservation and accepts current receipt replays', async () => {
+    const context = fixture(true);
+    const profile = context.options.configuration.workflows[0]!;
+    (profile.graph['1'] as { inputs: Record<string, unknown> }).inputs.image = '';
+    profile.bindings.image1 = { nodeId: '1', input: 'image', kind: 'media', required: true };
+    const job = context.service.submit({ adapterId: 'comfyui-v1', workflowId: profile.id, requestKey: 'reference-input', transport: 'direct', resultDelivery: 'archive',
+      values: { duration: 5, width: 1344, height: 768 }, media: {}, directMedia: { image1: { filename: 'reference.png', contentType: 'image/png', sha256: 'b'.repeat(64) } } }).job;
+    await context.run();
+    const oldReservation = `${job.id}_1_1`;
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ stage: 'awaiting_upload', upload: { reservationId: oldReservation } });
+    expect(context.store.requeueUpload(job.id, 0)).toBe(true);
+    await context.run();
+    const receipt = { image1: { name: 'reference.png', subfolder: job.id, type: 'input' as const } };
+    expect(() => context.service.completeInputs(job.id, receipt, oldReservation)).toThrow(expect.objectContaining({ code: 'COMFY_UPLOAD_RESERVATION_STALE' }));
+    const currentReservation = `${job.id}_1_2`;
+    expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ upload: { reservationId: currentReservation } });
+    const accepted = context.service.completeInputs(job.id, receipt, currentReservation);
+    expect(context.service.completeInputs(job.id, receipt, currentReservation)).toEqual(accepted);
+    expect(context.service.publicJob(accepted).stage).toBe('preparing');
+  });
+
   it('persists the first SSH host fingerprint per known instance and rejects replacement across restart', async () => {
     const context = fixture();
     const fingerprint = 'a'.repeat(64);

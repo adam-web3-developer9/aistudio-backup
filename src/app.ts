@@ -1397,6 +1397,14 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
     };
   });
 
+  app.get('/v1/jobs/by-request-key/:key', async (request, reply) => {
+    const parsed = z.object({ key: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/) }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send(zodError(parsed.error));
+    const job = comfy?.store.byRequest(comfy.options.owner, parsed.data.key);
+    if (!comfy || !job) return reply.code(404).send(errorBody('JOB_NOT_FOUND', 'Unknown job request key'));
+    return reply.send(comfy.publicJob(job));
+  });
+
   app.get('/v1/jobs/:id', async (request, reply) => {
     const params = idParamsSchema.safeParse(request.params);
     if (!params.success) return reply.code(400).send(zodError(params.error));
@@ -1437,7 +1445,7 @@ return reply.send({ events, nextAfter: events.at(-1)?.sequence ?? parsed.data.af
 app.post('/v1/jobs/:id/inputs', async (request, reply) => {
 const parsed = comfyInputsSchema.safeParse(request.body);
 if (!parsed.success) return reply.code(400).send(errorBody('INVALID_INPUT', 'Invalid upload acknowledgement'));
-return reply.send(comfy.publicJob(comfy.completeInputs((request.params as { id: string }).id, parsed.data.inputs)));
+return reply.send(comfy.publicJob(comfy.completeInputs((request.params as { id: string }).id, parsed.data.inputs, parsed.data.reservationId)));
 });
 app.post('/v1/jobs/:id/collected', async (request, reply) => {
 return reply.send(comfy.publicJob(comfy.acknowledgeCollected((request.params as { id: string }).id)));
@@ -1556,7 +1564,8 @@ app.get('/v1/jobs/:id/result', async (request, reply) => {
         if (!input.success) return reply.code(400).send(zodError(input.error));
         const accepted = comfy.submit(input.data);
         return reply.code(accepted.created ? 202 : 200).send({ jobId: accepted.job.id,
-          status: comfy.publicJob(accepted.job).status, statusUrl: `/v1/jobs/${accepted.job.id}` });
+          status: comfy.publicJob(accepted.job).status, statusUrl: `/v1/jobs/${accepted.job.id}`,
+          ...(input.data.resultDelivery === 'archive' ? { billing: comfy.publicJob(accepted.job).billing } : {}) });
       }
       const parsed = createJobSchema.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send(zodError(parsed.error));

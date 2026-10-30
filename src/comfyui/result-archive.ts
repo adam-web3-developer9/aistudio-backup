@@ -50,10 +50,11 @@ export class ComfyResultArchive {
   plan(job: ComfyJob, output: ComfyOutput): void {
     if (!job.instance_id || job.stage !== 'succeeded' || !job.result_pending || job.cancel_requested
       || (JSON.parse(job.input) as FrozenComfyInput).transport !== 'direct') return;
+    const input = JSON.parse(job.input) as FrozenComfyInput;
     const readyAt = job.finished_at ?? Date.now();
     this.store.db.prepare(`INSERT OR IGNORE INTO comfy_result_archives
       (job_id,instance_id,object_key,storage_identity,output,ready_at,state,next_at) VALUES(?,?,?,?,?,?,'pending',?)`)
-      .run(job.id, job.instance_id, `${this.options.keyPrefix}/${job.id}/${randomUUID()}.mp4`, this.options.storageIdentity, JSON.stringify(output), readyAt, readyAt + waitMs);
+      .run(job.id, job.instance_id, `${this.options.keyPrefix}/${job.id}/${randomUUID()}.mp4`, this.options.storageIdentity, JSON.stringify(output), readyAt, readyAt + (input.resultDelivery === 'archive' ? 0 : waitMs));
   }
   private patch(id: string, values: Partial<Omit<ResultArchiveRecord, 'job_id'>>, details?: ComfyEventDetails): void {
     const prior = this.get(id);

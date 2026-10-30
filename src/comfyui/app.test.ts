@@ -137,6 +137,16 @@ test('authenticated gateway uses SQL for ComfyUI submission, query, list, cancel
     const accepted = await app.inject({ method: 'POST', url: '/v1/jobs', headers, payload: body });
     expect(accepted.statusCode).toBe(202);
     const id = accepted.json().jobId as string;
+    expect((await app.inject({ method: 'GET', url: '/v1/jobs/by-request-key/attempt-one' })).statusCode).toBe(401);
+    const recovered = await app.inject({ method: 'GET', url: '/v1/jobs/by-request-key/attempt-one', headers });
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toMatchObject({ id, status: 'queued' });
+    expect(recovered.body).not.toContain('trusted input prompt');
+    expect((await app.inject({ method: 'GET', url: '/v1/jobs/by-request-key/missing', headers })).statusCode).toBe(404);
+    const originalOwner = service.options.owner;
+    service.options.owner = 'other-operator-owner';
+    expect((await app.inject({ method: 'GET', url: '/v1/jobs/by-request-key/attempt-one', headers })).statusCode).toBe(404);
+    service.options.owner = originalOwner;
     const repeated = await app.inject({ method: 'POST', url: '/v1/jobs', headers, payload: body });
     expect(repeated.statusCode).toBe(200);
     expect(repeated.json().jobId).toBe(id);

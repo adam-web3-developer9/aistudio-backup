@@ -151,6 +151,18 @@ export class ComfyService {
     const profile = this.options.configuration.workflows.find(candidate => candidate.id === input.workflowId);
     if (!profile) throw new SystemError(400, 'COMFY_WORKFLOW_UNKNOWN', 'Unknown workflow profile');
     const direct = input.transport === 'direct';
+    if (input.resultDelivery === 'archive') {
+      if (!direct || profile.id !== 'minimax-h3-9plus3') throw new SystemError(400, 'COMFY_DELIVERY_INVALID', 'Archived delivery requires the direct H3 workflow');
+      if (!this.archive) throw new SystemError(503, 'COMFY_ARCHIVE_UNAVAILABLE', 'Archived delivery is not configured');
+      const { duration, width, height } = input.values;
+      if (typeof duration !== 'number' || !Number.isInteger(duration) || duration < 4 || duration > 15) {
+        throw new SystemError(400, 'COMFY_DURATION_INVALID', 'H3 duration must be an integer from 4 to 15 seconds');
+      }
+      if (![width, height].every(value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 480 && value <= 1920 && value % 32 === 0)
+        || Number(width) * Number(height) > 1920 * 1088) {
+        throw new SystemError(400, 'COMFY_DIMENSIONS_INVALID', 'H3 dimensions must be multiples of 32 from 480 to 1920, with at most 2088960 pixels');
+      }
+    }
     if (!direct && input.directMedia || direct && Object.keys(input.media).length) throw new SystemError(400, 'COMFY_BINDING_INVALID', 'Direct and server media cannot be mixed');
     const directInstanceAvailable = this.options.configuration.instances.some(instance => instance.workflowIds.includes(profile.id) && !Object.keys(instance.headers ?? {}).length);
     const directTemplateAvailable = !this.options.configuration.instances.length && this.options.configuration.autoOpen && this.options.configuration.elastic?.enabled
@@ -199,6 +211,13 @@ export class ComfyService {
     const native = job.native_checkpoint ? nativeCheckpoint(job) : undefined;
     const archived = this.archive?.result(job.id);
     const archiveState = this.archive?.get(job.id);
+    const neverSubmitted = !job.provider_confirmed && !job.result && (!job.native_checkpoint || native?.attempts.length === 0);
+    const attemptsFailed = !!native?.attempts.length && native.attempts.every(attempt => attempt.state === 'failed');
+    const deliveryFailed = job.error_code === 'COMFY_ARCHIVE_TRANSFER_FAILED' && archiveState?.error_code === 'COMFY_ARCHIVE_TRANSFER_FAILED'
+      && ['failed', 'deleted'].includes(archiveState.state) && !job.result_pending && !job.result;
+    const providerTerminal = ['failed', 'cancelled'].includes(job.stage) && job.error_code !== 'COMFY_REMOTE_UNCONFIRMED'
+      && (neverSubmitted || attemptsFailed || job.error_code === 'COMFY_RENDER_FAILED' || deliveryFailed
+        || job.error_code === 'COMFY_EXECUTION_CLOSED' && this.originalResourceState(job) === 'released');
     const unavailableArchive = !!job.result && (JSON.parse(job.result) as { storage?: string }).storage === 'tos' && !archived;
     const resultUnavailable = archived?.expired || unavailableArchive;
     const candidates = this.store.instances().filter(instance => !instance.draining && this.options.configuration.instances.some(candidate => candidate.id === instance.id && candidate.workflowIds.includes(input.workflowId)));
@@ -210,7 +229,8 @@ export class ComfyService {
     const recovering = !starting && !capacityWaiting ? (uploadRecovery && assigned?.state === 'offline' ? assigned : job.stage === 'queued' ? candidates.find(instance => !instance.job_id && instance.state === 'offline' && instance.error_code) : undefined) : undefined;
     const configuration = this.options.configuration.instances.find(instance => instance.id === (job.instance_id ?? starting?.id ?? waiting[0]?.id ?? recovering?.id));
     const wakingResult = !!job.result_wake_requested && job.stage === 'succeeded';
-    const stage = job.cancel_requested ? 'cancelled' : resultUnavailable ? unavailableArchive ? 'result_unavailable' : 'result_expired' : wakingResult ? 'preparing_result'
+    const archiving = input.resultDelivery === 'archive' && job.stage === 'succeeded' && !!job.result_pending && !archived;
+    const stage = job.cancel_requested ? 'cancelled' : resultUnavailable ? unavailableArchive ? 'result_unavailable' : 'result_expired' : archiving ? 'archiving' : wakingResult ? 'preparing_result'
       : recovering ? (recovering.error_code === 'COMFY_INSUFFICIENT_BALANCE' ? 'waiting_billing' : 'waiting_instance') : starting ? 'booting' : capacityWaiting ? 'waiting_capacity' : job.stage;
     const events = this.store.events.recent(job.id, 12);
     const waitingTargets = [...new Set(waiting.map(instance => this.options.configuration.instances.find(candidate => candidate.id === instance.id))
@@ -225,9 +245,10 @@ export class ComfyService {
         : recovering.error_code === 'COMFY_INSUFFICIENT_BALANCE' ? '账户余额不足，GPU 实例无法开机；充值后自动继续，保留原任务'
         : recovering.error_code === 'COMFY_INSTANCE_START_REJECTED' ? 'GPU 实例开机被平台拒绝；保留原任务，稍后自动重试'
         : `GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（${recovering.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` :
-      job.stage === 'submitting' && native?.attempts.length ? '原生提交尚未确认，正在核对原任务与提交回执' : stageMessages[stage]!;
+      archiving ? '生成已完成，正在归档并校验视频结果' : job.stage === 'submitting' && native?.attempts.length ? '原生提交尚未确认，正在核对原任务与提交回执' : stageMessages[stage]!;
     return {
-      id: job.id, adapterId: 'comfyui-v1', status: resultUnavailable ? 'failed' : wakingResult && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
+      id: job.id, adapterId: 'comfyui-v1', status: resultUnavailable ? 'failed' : (archiving || wakingResult) && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
+      ...(input.resultDelivery === 'archive' ? { billing: { unit: 'second', requestedSeconds: input.values.duration } } : {}),
       createdAt: new Date(job.created_at).toISOString(),
       updatedAt: new Date(job.updated_at).toISOString(),
       ...(job.finished_at ? { finishedAt: new Date(job.finished_at).toISOString() } : {}),
@@ -249,11 +270,13 @@ export class ComfyService {
         ...(archived ? { storage: archived.storage, expiresAt: archived.expiresAt } : {}) } } : {}),
       ...(stage === 'awaiting_upload' && assigned?.state === 'busy' && configuration && input.transport === 'direct' ? { upload: {
         baseUrl: configuration.baseUrl, subfolder: job.id,
+        ...(input.resultDelivery === 'archive' ? { reservationId: `${job.id}_${job.instance_id}_${job.upload_reservations}` } : {}),
         files: Object.entries(input.directMedia ?? {}).map(([binding, media]) => ({ binding, ...media })),
       } } : {}),
-      ...(resultUnavailable ? { error: { code: unavailableArchive ? 'COMFY_ARCHIVE_UNAVAILABLE' : 'COMFY_RESULT_EXPIRED', message, retryable: false } }
+      ...(resultUnavailable ? { error: { code: unavailableArchive ? 'COMFY_ARCHIVE_UNAVAILABLE' : 'COMFY_RESULT_EXPIRED', message, retryable: false,
+        ...(input.resultDelivery === 'archive' ? { providerTerminal: false } : {}) } }
         : job.error_code ? { error: { code: job.error_code, message: `${stageMessages[job.cancel_requested ? 'cancelled' : 'failed']}（${job.error_code}）`, retryable: false,
-          ...(job.error_code === 'COMFY_REMOTE_UNCONFIRMED' ? { providerTerminal: false } : {}) } } : {}),
+          ...(input.resultDelivery === 'archive' ? { providerTerminal } : job.error_code === 'COMFY_REMOTE_UNCONFIRMED' ? { providerTerminal: false } : {}) } } : {}),
     };
   }
   async requestResultAvailability(id: string): Promise<ComfyJob> {
@@ -280,11 +303,15 @@ export class ComfyService {
     }
     return this.get(id);
   }
-  completeInputs(id: string, inputs: Record<string, { name: string; subfolder: string; type: 'input' }>): ComfyJob {
+  completeInputs(id: string, inputs: Record<string, { name: string; subfolder: string; type: 'input' }>, reservationId?: string): ComfyJob {
     const job = this.get(id);
     const frozen = JSON.parse(job.input) as FrozenComfyInput;
     if (frozen.transport !== 'direct' || job.cancel_requested || job.deadline <= Date.now()) throw new SystemError(409, 'COMFY_UPLOAD_UNAVAILABLE', 'The original job is not accepting uploads');
     const expected = frozen.directMedia ?? {};
+    if (frozen.resultDelivery === 'archive' && Object.keys(expected).length
+      && (!job.instance_id || reservationId !== `${job.id}_${job.instance_id}_${job.upload_reservations}`)) {
+      throw new SystemError(409, 'COMFY_UPLOAD_RESERVATION_STALE', 'Fetch the current upload reservation and upload to that instance again');
+    }
     if (Object.keys(inputs).length !== Object.keys(expected).length || Object.entries(inputs).some(([name, uploaded]) =>
       !Object.hasOwn(expected, name) || uploaded.type !== 'input' || uploaded.subfolder !== job.id || uploaded.name !== expected[name]!.filename)) {
       throw new SystemError(400, 'COMFY_UPLOAD_INVALID', 'Upload acknowledgement does not match the reserved job inputs');
@@ -303,7 +330,7 @@ export class ComfyService {
   acknowledgeCollected(id: string): ComfyJob {
     const job = this.get(id);
     const input = JSON.parse(job.input) as FrozenComfyInput;
-    if (input.transport !== 'direct' || job.stage !== 'succeeded' || !job.result) throw new SystemError(409, 'COMFY_RESULT_UNAVAILABLE', 'The original direct result is not ready');
+    if (input.transport !== 'direct' || job.stage !== 'succeeded' || !job.result || input.resultDelivery === 'archive' && job.result_pending) throw new SystemError(409, 'COMFY_RESULT_UNAVAILABLE', 'The original direct result is not ready');
     this.store.updateJob(id, { result_pending: 0, result_wake_requested: 0, collected_at: job.collected_at ?? Date.now() });
     this.store.releaseSlot(id);
     return this.get(id);
@@ -616,7 +643,10 @@ export class ComfyService {
       }
       this.store.updateJob(next.id, { deadline: Date.now() + this.options.configuration.jobTimeoutMs });
       const frozen = JSON.parse(next.input) as FrozenComfyInput;
-      if (frozen.transport === 'direct') this.store.updateJob(next.id, { stage: 'awaiting_upload' });
+      if (frozen.transport === 'direct') {
+        this.store.updateJob(next.id, { stage: 'awaiting_upload' });
+        if (frozen.resultDelivery === 'archive' && !Object.keys(frozen.directMedia ?? {}).length) this.completeInputs(next.id, {});
+      }
       else await this.prepare(this.store.get(next.id)!, client);
     }
   }
