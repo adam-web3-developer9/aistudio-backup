@@ -106,10 +106,6 @@ export class ComfyLifecycle {
     const warm = configuration.instances.filter(instance => !store.instance(instance.id)?.draining
       && ['ready', 'busy', 'starting'].includes(store.instance(instance.id)!.state)).length;
     let remaining = Math.min(policy.minWarmInstances, policy.maxConcurrentInstances) - warm;
-    if (configuration.elastic?.enabled && configuration.elastic.maxHourlyCost !== undefined) {
-      const cost = this.reservedCost();
-      if (cost === null || cost > configuration.elastic.maxHourlyCost) return;
-    }
     for (const configuration of this.options.configuration.instances) {
       if (remaining <= 0) return;
       const instance = store.instance(configuration.id)!;
@@ -122,22 +118,6 @@ export class ComfyLifecycle {
     return this.pending().filter(job => (!job.instance_id || job.instance_id === instance.id)
       && instance.workflowIds.includes((JSON.parse(job.input) as FrozenComfyInput).workflowId));
   }
-  private reservedCost(): number | null {
-    let total = 0;
-    const resources = this.options.store.resources().filter(resource => resource.state !== 'released');
-    for (const instance of this.options.configuration.instances) {
-      const resource = resources.find(item => item.instance_id === instance.id);
-      const compute = resource?.hourly_cost ?? instance.lifecycle?.hourlyCost;
-      const storage = resource?.storage_hourly_cost ?? instance.lifecycle?.storageHourlyCost;
-      if (compute === undefined || storage === undefined) return null;
-      total += compute + storage;
-    }
-    for (const resource of resources) {
-      if (!this.options.configuration.instances.some(instance => instance.id === resource.instance_id)) total += resource.hourly_cost + resource.storage_hourly_cost;
-    }
-    return total;
-  }
-
   private needsCapacity(template: ElasticTemplate): boolean {
     const { configuration, store } = this.options;
     const policy = schedulerPolicy(configuration);
@@ -170,8 +150,6 @@ export class ComfyLifecycle {
     const policy = schedulerPolicy(configuration);
     const lastCreated = Math.max(0, ...resources.map(resource => resource.created_at));
     if (Date.now() - lastCreated < elastic.createCooldownMs) return;
-    const committed = elastic.maxHourlyCost === undefined ? 0 : this.reservedCost();
-    if (committed === null) { this.lastError = 'COMFY_COST_UNKNOWN'; return; }
     const reservedInstances = configuration.instances.length + this.unregisteredResources().length;
     if (reservedInstances >= elastic.maxInstances || reservedInstances >= policy.maxConcurrentInstances) return;
     const templates = [...elastic.templates].sort((left, right) => (left.gpuModel === '4090' ? 1 : 0) - (right.gpuModel === '4090' ? 1 : 0) || left.hourlyCost - right.hourlyCost);
@@ -180,21 +158,17 @@ export class ComfyLifecycle {
         this.lastError = 'COMFY_SKU_PRICE_UNIT_UNVERIFIED'; continue;
       }
       if (!this.needsCapacity(template)) continue;
-      if (elastic.maxHourlyCost !== undefined && committed + template.hourlyCost + template.storageHourlyCost > elastic.maxHourlyCost) {
-        this.lastError = 'COMFY_ELASTIC_BUDGET_EXCEEDED'; continue;
-      }
       const skus = await platform.skuList(template.areaName);
       this.options.assertWorker();
       const sku = skus.find(item => item.areaName === template.areaName && item.skuName === template.skuName);
       if (!sku || !sku.skuName.includes(template.gpuModel) || !/^\d+(?:\.\d+)?$/.test(sku.price)
-        || !Number.isFinite(Number(sku.price) * template.skuPriceToHourlyFactor)
-        || Number(sku.price) * template.skuPriceToHourlyFactor > template.hourlyCost) {
+        || !Number.isFinite(Number(sku.price) * template.skuPriceToHourlyFactor)) {
         this.lastError = 'COMFY_SKU_QUOTE_UNVERIFIED'; continue;
       }
       if (!this.needsCapacity(template)) continue;
       const key = randomUUID();
       const resource: ComfyResource = { key, name: 'hailuo-' + key, state: 'creating', instance_id: null, configuration: null,
-        template_id: template.id, hourly_cost: template.hourlyCost, storage_hourly_cost: template.storageHourlyCost,
+        template_id: template.id, hourly_cost: Number(sku.price) * template.skuPriceToHourlyFactor, storage_hourly_cost: template.storageHourlyCost,
         created_at: Date.now(), updated_at: Date.now(), error_code: null };
       store.saveResource(resource);
       try {
@@ -232,7 +206,7 @@ export class ComfyLifecycle {
     const baseUrl = this.endpoint(service);
     const configuration: InstanceConfiguration = { id: metadata.id, baseUrl, areaName: template.areaName, gpuModel: template.gpuModel,
       workflowIds: template.workflowIds, headers: {}, lifecycle: { allowRelease: template.allowRelease, rebuildVerified: template.rebuildVerified,
-        hourlyCost: template.hourlyCost, storageHourlyCost: template.storageHourlyCost } };
+        hourlyCost: resource.hourly_cost, storageHourlyCost: resource.storage_hourly_cost } };
     if (this.options.configuration.instances.some(instance => instance.id === metadata.id)) throw { code: 'ELASTIC_INSTANCE_COLLISION' };
     this.options.store.saveResource({ ...resource, state: 'registered', configuration: JSON.stringify(configuration), updated_at: Date.now(), error_code: null });
     this.options.store.registerInstances([metadata.id]);

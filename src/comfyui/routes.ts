@@ -44,7 +44,7 @@ export function registerComfyAdminRoutes(app: FastifyInstance, runtime: SystemRu
       scheduler: service.options.configuration.scheduler,
       elastic: { enabled: service.options.configuration.elastic?.enabled ?? false,
         maxInstances: service.options.configuration.elastic?.maxInstances,
-        maxHourlyCost: service.options.configuration.elastic?.maxHourlyCost,
+        maxHourlyCost: null,
         lastError: service.lifecycle.lastError },
       metrics: service.metrics(),
       resources: service.store.resources().map(resource => {

@@ -85,7 +85,7 @@ describe('registerComfyAdminRoutes', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({
       autoOpen: false, queued: 1,
-      elastic: { enabled: false, lastError: null }, resources: [],
+      elastic: { enabled: false, maxHourlyCost: null, lastError: null }, resources: [],
       metrics: expect.objectContaining({ queued: 1, eligibleQueued: 1,
         cost: expect.objectContaining({ isEstimate: true, includesHistoricalBilling: false, unknownCostInstances: 1 }) }),
       instances: [{ id: '1', state: 'busy', draining: false, jobId: job.id, errorCode: null, pendingResults: 1, nextActionAt: null,

@@ -256,6 +256,6 @@ describe('comfyPoolMetrics cost estimates', () => {
       releaseAfterMs: 3_600_000, reconcileTimeoutMs: 300_000, templates: [] };
     instance('1', policy(6, 0.5), { state: 'ready' });
     expect(comfyPoolMetrics(store, configuration, now).cost).toEqual({ estimatedHourlyCost: 6.5,
-      unknownCostInstances: 0, isEstimate: true, includesHistoricalBilling: false, maxHourlyCost: 20 });
+      unknownCostInstances: 0, isEstimate: true, includesHistoricalBilling: false, maxHourlyCost: null });
   });
 });

@@ -44,6 +44,6 @@ export function comfyPoolMetrics(store: ComfyStore, configuration: ComfyPoolConf
     instances: { registered: instances.length, busy: instances.filter(item => item.job_id).length,
       unhealthy: instances.filter(item => item.error_code).length, stopped: instances.filter(item => item.stopped_at !== null && item.state === 'offline').length },
     cost: { estimatedHourlyCost, unknownCostInstances, isEstimate: true, includesHistoricalBilling: false,
-      maxHourlyCost: configuration.elastic?.maxHourlyCost ?? null },
+      maxHourlyCost: null },
   };
 }

@@ -26,6 +26,7 @@ const lifecycleSchema = z.object({
 const elasticSchema = z.object({
   enabled: z.boolean().default(false),
   maxInstances: z.number().int().positive().max(100).default(6),
+  // Accepted for existing configurations; scheduling no longer enforces price ceilings.
   maxHourlyCost: z.number().positive().optional(),
   createCooldownMs: durationMs.default(60_000),
   releaseAfterMs: durationMs.default(3_600_000),

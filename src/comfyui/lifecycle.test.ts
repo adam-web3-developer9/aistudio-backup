@@ -384,25 +384,21 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(context.store.resources()).toEqual([]);
   });
 
-  it('fails closed when an existing instance has unknown compute or storage cost', async () => {
+  it('creates capacity when an existing instance has unknown cost despite a legacy budget', async () => {
     const context = fixture();
     delete context.configuration.instances[0]!.lifecycle;
     context.demand();
     await context.lifecycle.tick();
-    expect(context.lifecycle.lastError).toBe('COMFY_COST_UNKNOWN');
-    expect(context.platform.skuList).not.toHaveBeenCalled();
-    expect(context.platform.createInstance).not.toHaveBeenCalled();
+    expect(context.lifecycle.lastError).toBeNull();
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
   });
 
-  it('includes existing compute and storage reservations in the hourly budget', async () => {
+  it('ignores legacy hourly budgets when creating capacity', async () => {
     const context = fixture();
     context.configuration.elastic!.maxHourlyCost = 2.29;
     context.demand();
     await context.lifecycle.tick();
-    expect(context.lifecycle.lastError).toBe('COMFY_ELASTIC_BUDGET_EXCEEDED');
-    expect(context.platform.createInstance).not.toHaveBeenCalled();
-    context.configuration.elastic!.maxHourlyCost = 2.31;
-    await context.lifecycle.tick();
+    expect(context.lifecycle.lastError).toBeNull();
     expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
   });
 
@@ -417,22 +413,21 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(context.lifecycle.lastError).toBeNull();
   });
 
-  it.each([undefined, 1, 2])('applies warm-instance hourly gating only when budget=%s is configured', async maxHourlyCost => {
+  it.each([undefined, 1, 2])('warms instances without enforcing legacy hourly budget=%s', async maxHourlyCost => {
     const context = fixture();
     context.configuration.elastic!.maxHourlyCost = maxHourlyCost;
     context.configuration.scheduler!.minWarmInstances = 1;
     context.store.updateInstance('1', { state: 'offline' });
     await context.lifecycle.tick();
-    expect(context.store.instance('1')?.state).toBe(maxHourlyCost === 1 ? 'offline' : 'starting');
+    expect(context.store.instance('1')?.state).toBe('starting');
     expect(context.platform.createInstance).not.toHaveBeenCalled();
   });
 
-  it.each(['elastic', 'scheduler', 'quote', 'uncertain'] as const)('preserves %s protection without an hourly budget', async protection => {
+  it.each(['elastic', 'scheduler', 'uncertain'] as const)('preserves %s protection without an hourly budget', async protection => {
     const context = fixture();
     delete context.configuration.elastic!.maxHourlyCost;
     if (protection === 'elastic') context.configuration.elastic!.maxInstances = 1;
     if (protection === 'scheduler') context.configuration.scheduler!.maxConcurrentInstances = 1;
-    if (protection === 'quote') context.platform.skuList.mockResolvedValue([{ ...context.sku, price: '1.01' }]);
     if (protection === 'uncertain') {
       context.configuration.elastic!.maxInstances = 2;
       context.store.saveResource(resource({ state: 'uncertain', created_at: clock - 120_000 }));
@@ -440,15 +435,13 @@ describe('ComfyLifecycle elastic creation', () => {
     context.demand();
     await context.lifecycle.tick();
     expect(context.platform.createInstance).not.toHaveBeenCalled();
-    if (protection === 'quote') expect(context.lifecycle.lastError).toBe('COMFY_SKU_QUOTE_UNVERIFIED');
     if (protection === 'uncertain') expect(context.lifecycle.lastError).toBe('COMFY_CREATION_UNCONFIRMED');
   });
 
-  it.each(['overpriced', 'malformed', 'missing', 'wrong-area', 'wrong-sku'] as const)('rejects an unverified %s SKU quote', async scenario => {
+  it.each(['malformed', 'missing', 'wrong-area', 'wrong-sku'] as const)('rejects an unverified %s SKU quote', async scenario => {
     const context = fixture();
     context.demand();
     const sku = { ...context.sku };
-    if (scenario === 'overpriced') sku.price = '1.01';
     if (scenario === 'malformed') sku.price = 'NaN';
     if (scenario === 'wrong-area') sku.areaName = '华东二区';
     if (scenario === 'wrong-sku') sku.skuName = 'RTX 4090';
@@ -481,20 +474,25 @@ describe('ComfyLifecycle elastic creation', () => {
   });
 
   it.each([
-    { price: '100', factor: 0.01, accepted: true },
-    { price: '101', factor: 0.01, accepted: false },
-    { price: '0.5', factor: 3, accepted: false },
-    { price: '1', factor: 0.5, accepted: true },
-    { price: '1' + '0'.repeat(309), factor: 1, accepted: false },
-  ])('compares converted hourly cost against the template ceiling: %j', async ({ price, factor, accepted }) => {
+    { price: '100', factor: 0.01, hourlyCost: 1 },
+    { price: '319', factor: 0.01, hourlyCost: 3.19 },
+    { price: '0.5', factor: 3, hourlyCost: 1.5 },
+    { price: '1', factor: 0.5, hourlyCost: 0.5 },
+    { price: '1' + '0'.repeat(309), factor: 1, hourlyCost: null },
+  ])('records the converted live quote without enforcing a price ceiling: %j', async ({ price, factor, hourlyCost }) => {
     const context = fixture();
     context.demand();
     context.configuration.elastic!.templates[0]!.skuPriceToHourlyFactor = factor;
+    context.configuration.elastic!.maxHourlyCost = 0.01;
     context.platform.skuList.mockResolvedValue([{ ...context.sku, price }]);
     await context.lifecycle.tick();
-    expect(context.platform.createInstance).toHaveBeenCalledTimes(accepted ? 1 : 0);
-    if (accepted) expect(context.store.resources()[0]).toMatchObject({ state: 'registered', hourly_cost: 1, storage_hourly_cost: 0.2 });
-    else {
+    expect(context.platform.createInstance).toHaveBeenCalledTimes(hourlyCost === null ? 0 : 1);
+    if (hourlyCost !== null) {
+      const created = context.store.resources()[0]!;
+      expect(created).toMatchObject({ state: 'registered', hourly_cost: hourlyCost, storage_hourly_cost: 0.2 });
+      expect(JSON.parse(created.configuration!).lifecycle.hourlyCost).toBe(hourlyCost);
+      expect(context.restart().configuration.instances.find(instance => instance.id === createdId)?.lifecycle?.hourlyCost).toBe(hourlyCost);
+    } else {
       expect(context.lifecycle.lastError).toBe('COMFY_SKU_QUOTE_UNVERIFIED');
       expect(context.store.resources()).toEqual([]);
     }
@@ -557,11 +555,10 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(context.platform.createInstance).toHaveBeenCalledTimes(2);
   });
 
-  it.each(['elastic', 'scheduler', 'budget'] as const)('counts uncertain reservations against the %s limit after restart', async limit => {
+  it.each(['elastic', 'scheduler'] as const)('counts uncertain reservations against the %s limit after restart', async limit => {
     const context = fixture({ instances: [] });
     if (limit === 'elastic') context.configuration.elastic!.maxInstances = 1;
     if (limit === 'scheduler') context.configuration.scheduler!.maxConcurrentInstances = 1;
-    if (limit === 'budget') context.configuration.elastic!.maxHourlyCost = 1.2;
     context.store.saveResource(resource({ state: 'uncertain', created_at: clock - 120_000 }));
     context.demand();
     // Preserve the changed policy in the restarted configuration.
@@ -573,13 +570,11 @@ describe('ComfyLifecycle elastic creation', () => {
     expect(context.store.resource('resource')?.state).toBe('uncertain');
   });
 
-  it.each(['elastic', 'scheduler', 'budget'] as const)('bounds repeated lost receipts by the %s limit across restart', async limit => {
+  it.each(['elastic', 'scheduler'] as const)('bounds repeated lost receipts by the %s limit across restart', async limit => {
     const context = fixture({ instances: [] });
     context.configuration.elastic!.createCooldownMs = 10_000;
     if (limit === 'elastic') context.configuration.elastic!.maxInstances = 3;
     if (limit === 'scheduler') context.configuration.scheduler!.maxConcurrentInstances = 3;
-    if (limit === 'budget') context.configuration.elastic!.maxHourlyCost = 2.41;
-    else delete context.configuration.elastic!.maxHourlyCost;
     context.submit();
     context.platform.createInstance.mockRejectedValue(new AigateError('TIMEOUT', 'outcome unknown', undefined, true));
     await context.lifecycle.tick();
@@ -587,7 +582,7 @@ describe('ComfyLifecycle elastic creation', () => {
       platform: context.platform, client: () => context.client, assertWorker: context.assertWorker });
     lifecycles.push(restarted);
     for (let index = 0; index < 4; index++) { clock += 10_000; await restarted.tick(); }
-    const expected = limit === 'budget' ? 2 : 3;
+    const expected = 3;
     expect(context.platform.createInstance).toHaveBeenCalledTimes(expected);
     expect(context.store.resources()).toHaveLength(expected);
     expect(context.store.resources().every(item => item.state === 'uncertain' && item.instance_id === null)).toBe(true);
