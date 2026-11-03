@@ -51,6 +51,8 @@ Content-Type: application/json
 
 时间值只是格式示例，实际必须满足 `当前毫秒 < expiresAt <= 当前毫秒 + 120000`。控制端和 GPU 需要时钟同步。`jobId` 必须等于提交时写入 `extra_data.hailuoAttemptId` 的值，不能擅自用另一个业务 ID 替代。`promptId` 同时匹配历史 key 和历史 `prompt[1]`；历史必须 `completed=true` 且 `status_str=success`。
 
+有独立原生尝试记录时，控制端按持久化的 `selectedPromptId` 精确找到已确认成功的尝试，将其 `marker` 作为上述 `jobId`；它通常为 `业务任务ID_native_UUID`。归档对象键和业务事件仍使用业务任务 ID。没有原生 checkpoint 的旧任务沿用原先的业务 ID 标识；已有 checkpoint 但选中记录缺失、冲突或有歧义时拒绝导出，不按前缀推断归属。SSH runner 的固定错误码（例如 `HISTORY_MISMATCH`）保留为诊断码，任意错误文本及凭据不进入诊断。
+
 仅允许 `output` 目录中普通、非空、单硬链接的 `.mp4` 文件。拒绝绝对路径、父目录穿越、反斜杠、冒号、控制字符、符号链接（包括祖先目录）、硬链接和特殊文件。逐级从根目录以只读文件描述符打开，文件名/子目录/type 必须与指定节点的历史输出描述符逐字段精确一致。`nodeId` 可省略，但此时所有节点中只能有一个匹配；有歧义就拒绝。允许历史描述符保留额外字段，不能借额外字段改变文件选择。MP4 按后缀筛选，不代表验证视频编码/容器完整性。
 
 成功响应为：

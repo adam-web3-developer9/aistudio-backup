@@ -90,6 +90,58 @@ it('rejects changed host keys before executing any remote command', async () => 
   expect(context.connection.destroy).toHaveBeenCalledOnce();
 });
 
+it('binds describe and upload to the exact selected native attempt rather than the first attempt', async () => {
+  const marker = `${job.id}_native_selected`;
+  const selected = { ...job, prompt_id: 'selected-prompt', native_checkpoint: JSON.stringify({
+    selectedPromptId: 'selected-prompt', attempts: [
+      { marker: `${job.id}_native_first`, plannedId: 'first-planned', promptId: 'first-prompt', confirmed: true, state: 'failed' },
+      { marker, plannedId: 'selected-planned', promptId: 'selected-prompt', confirmed: true, state: 'succeeded' },
+    ],
+  }) };
+  for (const operation of ['describe', 'upload'] as const) {
+    const context = fixture();
+    const signal = new AbortController().signal;
+    await expect(operation === 'describe' ? context.exporter.describe(selected, output, signal)
+      : context.exporter.upload(selected, output, file, target, signal)).resolves.toEqual(file);
+    expect(context.connection.channels[1]?.request).toMatchObject({ operation,
+      payload: { jobId: marker, promptId: 'selected-prompt' } });
+  }
+});
+
+it.each(['describe', 'upload'] as const)('keeps legacy job identity without a native checkpoint for %s', async operation => {
+  const context = fixture();
+  const signal = new AbortController().signal;
+  await (operation === 'describe' ? context.exporter.describe(job, output, signal)
+    : context.exporter.upload(job, output, file, target, signal));
+  expect(context.connection.channels[1]?.request).toMatchObject({
+    payload: { jobId: job.id, promptId: job.prompt_id },
+  });
+});
+
+it.each([
+  { attempts: [{ marker: 'selected-marker', promptId: job.prompt_id, confirmed: true }] },
+  { selectedPromptId: 'different-prompt', attempts: [{ marker: 'selected-marker', promptId: 'different-prompt', confirmed: true }] },
+  { selectedPromptId: job.prompt_id, attempts: [{ marker: 'other-marker', promptId: 'other-prompt', confirmed: true }] },
+  { selectedPromptId: job.prompt_id, attempts: [{ promptId: job.prompt_id, confirmed: true }] },
+  { selectedPromptId: job.prompt_id, attempts: [{ marker: 'selected-marker', promptId: job.prompt_id, confirmed: false, state: 'succeeded' }] },
+  { selectedPromptId: job.prompt_id, attempts: [{ marker: 'selected-marker', promptId: job.prompt_id, confirmed: true, state: 'running' }] },
+  { selectedPromptId: job.prompt_id, attempts: [
+    { marker: 'selected-marker', promptId: job.prompt_id, confirmed: true, state: 'succeeded' },
+    { marker: 'duplicate-marker', promptId: job.prompt_id, confirmed: true, state: 'succeeded' },
+  ] },
+])('rejects inconsistent persisted native selection before contacting SSH %#', async checkpoint => {
+  for (const operation of ['describe', 'upload'] as const) {
+    const context = fixture();
+    const inconsistent = { ...job, native_checkpoint: JSON.stringify(checkpoint) };
+    const signal = new AbortController().signal;
+    await expect(operation === 'describe' ? context.exporter.describe(inconsistent, output, signal)
+      : context.exporter.upload(inconsistent, output, file, target, signal)).rejects.toHaveProperty('code');
+    expect(context.credentials).not.toHaveBeenCalled();
+    expect(context.factory).not.toHaveBeenCalled();
+    expect(context.connection.commands).toEqual([]);
+  }
+});
+
 it.each([
   { stdout: '{invalid' }, { stdout: JSON.stringify({ error: password + target.url }) },
   { stdout: Buffer.from([255]) }, { stdout: 'a'.repeat(65_537) },
@@ -109,6 +161,26 @@ it.each([
     expect(error).toHaveProperty('code');
   }
   expect(context.connection.destroy).toHaveBeenCalledOnce();
+});
+
+it('preserves an allowlisted runner diagnostic using only a static safe message', async () => {
+  const context = fixture([{ stdout: JSON.stringify({ error: 'HISTORY_MISMATCH', message: password + target.url }) }]);
+  const error = await context.exporter.describe(job, output, new AbortController().signal).catch(error => error);
+  expect(error).toMatchObject({ code: 'COMFY_ARCHIVE_GPU_HISTORY_MISMATCH' });
+  expect(error.message).toMatch(/^GPU result export /);
+  expect(error.cause).toBeUndefined();
+  expect(String(error) + JSON.stringify(error)).not.toContain(password);
+  expect(String(error) + JSON.stringify(error)).not.toContain(target.url);
+});
+
+it.each([password, target.url, `HISTORY_MISMATCH ${password} ${target.url}`])
+('does not reflect an untrusted runner error %#', async diagnostic => {
+  const context = fixture([{ stdout: JSON.stringify({ error: diagnostic }) }]);
+  const error = await context.exporter.describe(job, output, new AbortController().signal).catch(error => error);
+  expect(error).toMatchObject({ code: 'COMFY_ARCHIVE_GPU_UNAVAILABLE', message: 'GPU result export unavailable' });
+  expect(error.cause).toBeUndefined();
+  expect(String(error) + JSON.stringify(error)).not.toContain(password);
+  expect(String(error) + JSON.stringify(error)).not.toContain(target.url);
 });
 
 it.each(['/opt/python;exit', '/opt/../python', 'python3', '/opt/python\n'])('rejects an unsafe discovered interpreter %s', async python => {

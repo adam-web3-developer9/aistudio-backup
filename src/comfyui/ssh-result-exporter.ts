@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { Client, type ClientChannel } from 'ssh2';
 import type { AigateSshConnection } from './aigate-client.js';
 import { ComfyError } from './comfy-client.js';
+import { nativeResultIdentity } from './native-submission.js';
 import type { GpuResultExporter } from './result-archive.js';
 
 type Job = Parameters<GpuResultExporter['describe']>[0];
@@ -12,6 +13,17 @@ type Runtime = { python: string; outputRoot: string; port: 8188; pid: number };
 const invalid = Symbol('invalid');
 const unavailable = Symbol('unavailable');
 const maxRequestBytes = 1_048_576;
+// Only fixed runner codes may cross the diagnostic boundary; never echo SSH
+// stderr, credentials, signed URLs or arbitrary remote error text.
+const runnerErrors = new Set([
+  'INVALID_REQUEST', 'REQUEST_TOO_LARGE', 'INVALID_SOURCE', 'SOURCE_TOO_LARGE',
+  'INVALID_RUNTIME', 'COMFY_NOT_FOUND', 'COMFY_AMBIGUOUS', 'RUNTIME_CHANGED',
+  'HISTORY_FAILED', 'HISTORY_TIMEOUT', 'HISTORY_TOO_LARGE', 'INVALID_HISTORY',
+  'TIMEOUT', 'RUNNER_FAILED', 'EXPORT_FAILED', 'INVALID_EXPIRY', 'INVALID_OUTPUT',
+  'INVALID_PATH', 'INVALID_FILE', 'INVALID_TARGET', 'INVALID_OUTPUT_ROOT',
+  'HISTORY_MISMATCH', 'HISTORY_NOT_SUCCEEDED', 'UNSUPPORTED_FILESYSTEM',
+  'UNSAFE_FILE', 'FILE_UNAVAILABLE', 'FILE_CHANGED', 'UPLOAD_FAILED', 'BUSY',
+]);
 const bootstrap = 'import sys,json; raw=sys.stdin.buffer.read(1048577); '
   + 'assert len(raw)<=1048576; request=json.loads(raw.decode("utf-8")); '
   + 'source=request.pop("runnerSource"); exec(compile(source,"<hailuo-ssh-runner>","exec"),{"request":request})';
@@ -25,7 +37,8 @@ export interface SshGpuResultExporterOptions {
 }
 
 function failure(reason: unknown): ComfyError {
-  const code = reason === invalid ? 'INVALID' : 'UNAVAILABLE';
+  const code = reason === invalid ? 'INVALID'
+    : typeof reason === 'string' && runnerErrors.has(reason) ? reason : 'UNAVAILABLE';
   return new ComfyError(`COMFY_ARCHIVE_GPU_${code}`, `GPU result export ${code.toLowerCase()}`);
 }
 
@@ -38,7 +51,7 @@ function parseResponse(bytes: Buffer): Record<string, unknown> {
   try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
   catch { throw invalid; }
   if (!record(value)) throw invalid;
-  if ('error' in value) throw unavailable;
+  if ('error' in value) throw typeof value.error === 'string' && runnerErrors.has(value.error) ? value.error : unavailable;
   return value;
 }
 
@@ -112,6 +125,7 @@ export class SshGpuResultExporter implements GpuResultExporter {
         signal.addEventListener('abort', onAbort, { once: true });
       });
       const execute = async (): Promise<File> => {
+        const identity = nativeResultIdentity(job);
         const [runnerSource, exporterSource] = await Promise.all([
           this.options.runnerSource ?? readFile(new URL('../../server/comfyui-result-export/ssh_runner.py', import.meta.url), { encoding: 'utf8', signal }),
           this.options.exporterSource ?? readFile(new URL('../../server/comfyui-result-export/exporter.py', import.meta.url), { encoding: 'utf8', signal }),
@@ -187,7 +201,7 @@ export class SshGpuResultExporter implements GpuResultExporter {
         });
         const inspected = runtime(await run('python3', inspectBody));
         signal.throwIfAborted();
-        const payload = { expiresAt: Date.now() + 120_000, jobId: job.id, promptId: job.prompt_id,
+        const payload = { expiresAt: Date.now() + 120_000, ...identity,
           output, ...(upload ? { file: expected, target: upload.target } : {}) };
         const response = archiveFile(await run(inspected.python, requestBody({ runnerSource, operation,
           runtime: inspected, exporterSource, payload })));

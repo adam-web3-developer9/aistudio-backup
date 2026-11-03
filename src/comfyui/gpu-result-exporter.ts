@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { ComfyError } from './comfy-client.js';
+import { nativeResultIdentity } from './native-submission.js';
 import type { GpuResultExporter } from './result-archive.js';
 
 type Job = Parameters<GpuResultExporter['describe']>[0];
@@ -64,8 +65,8 @@ export class HttpGpuResultExporter implements GpuResultExporter {
       signal.throwIfAborted();
       let body: string;
       try {
-        body = JSON.stringify({ expiresAt: Date.now() + 120_000, jobId: job.id,
-          promptId: job.prompt_id, output, ...upload });
+        body = JSON.stringify({ expiresAt: Date.now() + 120_000,
+          ...nativeResultIdentity(job), output, ...upload });
       } catch { throw invalid; }
       const aborted = new Promise<never>((_resolve, reject) => {
         onAbort = () => reject(failure('UNAVAILABLE'));

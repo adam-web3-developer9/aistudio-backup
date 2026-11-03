@@ -112,6 +112,16 @@ class RequestAndHistoryTests(unittest.TestCase):
         del request["output"]["nodeId"]
         exporter.validate_history(request, history())
 
+    def test_native_attempt_marker_requires_exact_identity_and_preserves_legacy(self):
+        request = payload()
+        selected_marker = request["jobId"] + "_native_attempt"
+        recorded = history(dict(request, jobId=selected_marker))
+        for job_id in [request["jobId"], request["jobId"] + "_native_other_attempt"]:
+            with self.subTest(job_id=job_id), self.assertRaisesRegex(exporter.ExportError, "HISTORY_MISMATCH"):
+                exporter.validate_history(dict(request, jobId=job_id), recorded)
+        exporter.validate_history(dict(request, jobId=selected_marker), recorded)
+        exporter.validate_history(request, history(request))
+
     def test_paths_rejected(self):
         for field, value in [("filename", "../result.mp4"), ("filename", "C:result.mp4"),
                              ("filename", "result.mp4\x00"), ("filename", "result.txt"),

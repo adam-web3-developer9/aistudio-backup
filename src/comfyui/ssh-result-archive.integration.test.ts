@@ -8,7 +8,8 @@ import { SshGpuResultExporter } from './ssh-result-exporter.js';
 import { schedulerPolicy } from './scheduler.js';
 import type { ArchiveObject, ResultArchiveStorage } from './tos-result-storage.js';
 
-it('archives through a real SSH transport only after ten minutes, persists the public result and expires it after one day', async () => {
+it.each(['legacy', 'selected native attempt'] as const)
+('archives %s through real SSH after ten minutes, persists the public result and expires it after one day', async identityMode => {
   let now = 1_800_000_000_000;
   const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
   const db = new Database(':memory:');
@@ -17,6 +18,8 @@ it('archives through a real SSH transport only after ten minutes, persists the p
   const objectStore = new Map<string, ArchiveObject>();
   const operations: string[] = [];
   const commands: string[] = [];
+  let expectedIdentity: { jobId: string; promptId: string };
+  const exportIdentities: Array<{ jobId: string; promptId: string }> = [];
   const keys = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const password = 'test-only-ssh-password';
   const server = new Server({ hostKeys: [keys.privateKey.export({ type: 'pkcs1', format: 'pem' })] }, connection => {
@@ -34,10 +37,13 @@ it('archives through a real SSH transport only after ten minutes, persists the p
         stream.on('end', () => {
           const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           operations.push(request.operation);
-          const result = request.operation === 'inspect'
+          const matchesIdentity = request.operation === 'inspect'
+            || request.payload.jobId === expectedIdentity.jobId && request.payload.promptId === expectedIdentity.promptId;
+          if (request.operation !== 'inspect') exportIdentities.push({ jobId: request.payload.jobId, promptId: request.payload.promptId });
+          const result = !matchesIdentity ? { error: 'HISTORY_MISMATCH' } : request.operation === 'inspect'
             ? { python: '/opt/comfy/bin/python3', outputRoot: '/output', port: 8188, pid: 123 }
             : file;
-          if (request.operation === 'upload') {
+          if (request.operation === 'upload' && matchesIdentity) {
             objectStore.set(new URL(request.payload.target.url).pathname.slice(1), { ...file, uploadedAt: now });
           }
           stream.exit(0);
@@ -82,6 +88,18 @@ it('archives through a real SSH transport only after ten minutes, persists the p
     const job = service.submit({ adapterId: 'comfyui-v1', requestKey: 'ssh-integration', workflowId: 'render',
       transport: 'direct', values: {}, media: {}, directMedia: {} }).job;
     store.claim('1', ['render'], now);
+    expectedIdentity = { jobId: job.id, promptId: job.prompt_id };
+    if (identityMode === 'selected native attempt') {
+      expectedIdentity = { jobId: `${job.id}_native_selected`, promptId: 'selected-prompt' };
+      store.updateJob(job.id, { prompt_id: expectedIdentity.promptId, native_checkpoint: JSON.stringify({
+        selectedPromptId: expectedIdentity.promptId, attempts: [
+          { number: 1, marker: `${job.id}_native_first`, plannedId: job.prompt_id, promptId: job.prompt_id,
+            sentAt: now - 1000, confirmed: true, state: 'failed' },
+          { number: 2, marker: expectedIdentity.jobId, plannedId: 'selected-planned', promptId: expectedIdentity.promptId,
+            sentAt: now, confirmed: true, state: 'succeeded' },
+        ], nextAt: now, windowStart: 0,
+      }) });
+    }
     store.updateJob(job.id, { stage: 'succeeded', result_pending: 1, result: JSON.stringify({
       videoUrl: 'https://native.waas.aigate.cc/view?filename=video.mp4&type=output',
       output: { filename: 'video.mp4', subfolder: '', type: 'output', nodeId: '1' },
@@ -96,6 +114,8 @@ it('archives through a real SSH transport only after ten minutes, persists the p
     await service.tick();
     await service.archive!.settled();
     expect(operations).toEqual(['inspect', 'describe', 'inspect', 'upload']);
+    expect(exportIdentities).toEqual([expectedIdentity, expectedIdentity]);
+    expect([...objectStore.keys()]).toEqual([expect.stringMatching(new RegExp(`^comfy-results/${job.id}/[^/]+\\.mp4$`))]);
     expect(commands.every(command => !command.includes(password) && !command.includes(job.id) && !command.includes('results.tos'))).toBe(true);
     expect(store.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 0, collected_at: null });
     const archived = service.publicJob(store.get(job.id)!);

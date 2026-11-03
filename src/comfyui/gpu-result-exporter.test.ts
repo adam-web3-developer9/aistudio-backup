@@ -42,6 +42,45 @@ describe('HttpGpuResultExporter', () => {
     expect(body).not.toContain(secret);
   });
 
+  it('binds describe and upload to the exact selected native attempt rather than the first attempt', async () => {
+    const marker = 'job-local_native_selected';
+    const selected = { ...job, id: 'job-local', prompt_id: 'selected-prompt', native_checkpoint: JSON.stringify({
+      selectedPromptId: 'selected-prompt', attempts: [
+        { marker: 'job-local_native_first', plannedId: 'first-planned', promptId: 'first-prompt', confirmed: true, state: 'failed' },
+        { marker, plannedId: 'selected-planned', promptId: 'selected-prompt', confirmed: true, state: 'succeeded' },
+      ],
+    }) };
+    for (const operation of ['describe', 'upload'] as const) {
+      const { exporter, fetcher } = setup();
+      const signal = new AbortController().signal;
+      await expect(operation === 'describe' ? exporter.describe(selected, output, signal)
+        : exporter.upload(selected, output, file, target, signal)).resolves.toEqual(file);
+      expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toMatchObject({ jobId: marker, promptId: 'selected-prompt' });
+    }
+  });
+
+  it.each([
+    { attempts: [{ marker: 'selected-marker', promptId: job.prompt_id, confirmed: true }] },
+    { selectedPromptId: 'different-prompt', attempts: [{ marker: 'selected-marker', promptId: 'different-prompt', confirmed: true }] },
+    { selectedPromptId: job.prompt_id, attempts: [{ marker: 'other-marker', promptId: 'other-prompt', confirmed: true }] },
+    { selectedPromptId: job.prompt_id, attempts: [{ promptId: job.prompt_id, confirmed: true }] },
+    { selectedPromptId: job.prompt_id, attempts: [{ marker: 'selected-marker', promptId: job.prompt_id, confirmed: false, state: 'succeeded' }] },
+    { selectedPromptId: job.prompt_id, attempts: [{ marker: 'selected-marker', promptId: job.prompt_id, confirmed: true, state: 'running' }] },
+    { selectedPromptId: job.prompt_id, attempts: [
+      { marker: 'selected-marker', promptId: job.prompt_id, confirmed: true, state: 'succeeded' },
+      { marker: 'duplicate-marker', promptId: job.prompt_id, confirmed: true, state: 'succeeded' },
+    ] },
+  ])('rejects inconsistent persisted native selection without sending HTTP %#', async checkpoint => {
+    for (const operation of ['describe', 'upload'] as const) {
+      const { exporter, fetcher } = setup();
+      const inconsistent = { ...job, native_checkpoint: JSON.stringify(checkpoint) };
+      const signal = new AbortController().signal;
+      await expect(operation === 'describe' ? exporter.describe(inconsistent, output, signal)
+        : exporter.upload(inconsistent, output, file, target, signal)).rejects.toHaveProperty('code');
+      expect(fetcher).not.toHaveBeenCalled();
+    }
+  });
+
   it.each(['http://comfy.example', 'http://127.0.0.1.evil.example', 'ftp://localhost',
     'https://user:PRIVATE@comfy.example', 'https://comfy.example?token=PRIVATE', 'https://comfy.example/#PRIVATE', 'PRIVATE'])
   ('rejects unsafe base URL %s without leaking it', baseUrl => {
