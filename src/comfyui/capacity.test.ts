@@ -208,15 +208,16 @@ describe('capacity scheduling with SQLite and mock clients', () => {
   it('records a rejected open as a definite start rejection instead of leaving it booting', async () => {
     const { service, platform, store, submit } = fixture();
     platform.openInstance.mockRejectedValue({ code: 'BUSINESS_REJECTED', reason: 'INSUFFICIENT_BALANCE' });
-    submit();
+    const job = submit();
     await service.tick();
     expect(store.instance('1')).toMatchObject({ state: 'offline', action_sent: 0, action_started_at: null,
       error_code: 'COMFY_INSUFFICIENT_BALANCE', next_action_at: startedAt + 300_000 });
+    expect(service.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_INSUFFICIENT_BALANCE' });
     await service.tick();
     expect(platform.openInstance).toHaveBeenCalledTimes(1);
     vi.mocked(Date.now).mockReturnValue(startedAt + 300_001);
     await service.tick();
-    expect(platform.openInstance).toHaveBeenCalledTimes(2);
+    expect(platform.openInstance).toHaveBeenCalledTimes(1);
   });
 
   it('does not spend bootTimeout while waiting for capacity and grants a fresh boot window on success', async () => {

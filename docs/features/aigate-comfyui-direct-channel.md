@@ -24,7 +24,8 @@ AIGATE_ACCESS_TOKEN=实际AIGate平台令牌
 ## 缺卡与闲时关机
 
 - 已明确确认缺卡的开机拒绝进入持久化 `waiting_capacity`，默认每30秒重查状态并尝试可用区域，最多等6小时。候卡不使用10分钟开机超时；真正开始开机后才使用开机超时。分配实例后任务执行期限单独重置为2小时。
-- 缺卡识别只针对 `open`：严格的缺卡语义或显式配置的 `capacityErrorCodes`。官方未公布完整缺卡错误码，不编造数值。余额不足、鉴权失败、未知业务错误不当成缺卡；网络超时等不确定开机结果只查状态，不盲目重复开机。
+- 缺卡识别针对 `open` / 新租 `start`：严格的缺卡语义或显式配置的 `capacityErrorCodes`。官方未公布完整缺卡错误码，不编造数值。明确余额不足优先于缺卡码，鉴权失败、未知业务拒绝不当成缺卡；网络超时等不确定结果继续原记录对账，不盲目重复提交。
+- 新租显卡或已有实例开机被明确拒绝时，尚无原生提交记录、生成回执或结果的相关任务立即失败：余额不足返回 `COMFY_INSUFFICIENT_BALANCE`，新租业务拒绝返回 `COMFY_INSTANCE_CREATE_REJECTED`，开机业务拒绝返回 `COMFY_INSTANCE_START_REJECTED`。原因写入任务事件与公开错误/进度，不再只留在资源表中等6小时排队超时。已提交、提交结果未确认或已有结果的任务保留原身份继续恢复；其余额阻断显示 `waiting_billing`，不冒充缺卡，不据此声明可退款。
 - 候卡提示仅描述已登记实例的开机响应，不推断平台全局库存。未分配作业列出实际候卡区域/GPU并去重，不投影单个候选为已绑定实例；已绑定作业只描述原实例恢复。任一区域进入启动后显示该启动实例，不继续显示其他区域的候卡提示。
 - 不再使用永久隔离状态。开机超时、外部占用、区域不匹配等进入持久化退避，默认30秒后重新查询；历史quarantined记录自动迁移，保留原任务、prompt ID与上传回执。外部队列忙只等待，不抢占；区域不匹配不派发；未知生成结果保留原槽位并继续查询原任务，绝不重新提交。关闭请求遇到忙卡保留关闭意图并退避，不打断外部工作。
 - 2026-10-22用户纠正后的最终决定：平台低GPU关机作为程序错误或服务故障导致空转时的独立保底保留。运行实例调用官方 `POST /api/openapi/instance/setTimerStop`，设置 `stopType="2", utilizationRate=10, leisureTime=30`，不取消旧策略。每服务启动/电源周期首次确认运行时设置一次；成功记录时间、同周期去重，失败记录并按现有间隔重试，不阻断原ID查询、派发或收取，不为设置保底主动开机。
@@ -63,6 +64,12 @@ AIGATE_ACCESS_TOKEN=实际AIGate平台令牌
 - Fastify 同时输出结构化 `comfyEvent`，可在部署服务器通过 `journalctl -u aistudio-studio.service` 查看；SQL事件以sequence稳定分页。
 - `GET /v1/jobs/:id` 带最近12条事件，以及中文 `progress.message`、细分phase、真实实例区域/GPU、候卡下次重试时间、等待起点、任务时限和经过时间。终态耗时固定，不随查询不断增长。
 - 完整作业事件：`GET /v1/jobs/:id/events?after=0&limit=50`，返回events和nextAfter；仅原作业API key可读。实例事件：`GET /api/admin/comfyui/instances/:id/events`，只允许管理员读取已登记实例。
-- 阶段明确区分queued、waiting_capacity、booting、awaiting_upload、preparing、submitting、running、preparing_result、succeeded、failed、cancelled。桌面上传时显示实际完成文件数；后端不读取上传媒体字节，不伪造逐字节进度。
+- 阶段明确区分queued、waiting_capacity、waiting_billing、waiting_instance、booting、awaiting_upload、preparing、submitting、running、preparing_result、succeeded、failed、cancelled。普通queued只说明已入队，不推断为缺卡。`progress.nextRetryAt` 为ISO日期字符串。桌面上传时显示实际完成文件数；后端不读取上传媒体字节，不伪造逐字节进度。
 - 日志只保存阶段、时间、实例/任务标识、安全错误码、HTTP状态、出错节点ID与错误类型；拒绝提示词、工作流正文、URL、密钥、原始响应正文、堆栈和本地素材路径。Native错误正文读取最多64KiB且仅提取上述白名单，不把供应商自由文本写入日志。
 - 没有原生采样进度证据时，仅显示“ComfyUI正在执行原工作流”，不编造模型加载、采样百分比或预计完成时间。取消只表示本地停止等待，不宣称已停止GPU执行。
+
+### 2026-11-10 租卡拒绝回归
+
+余额/业务拒绝修复覆盖新租、开机与直传前唤醒；仍有健康替代实例或已运行容量时，不因单次扩容/实例拒绝扩大失败范围。明确“余额不足”优先于缺卡码，“余额充足”不能归为余额错误。
+
+`rental-rejection`、`boot`、`capacity`、`lifecycle`、`aigate-client` 五份专项726项通过，`pnpm build`通过。扩大ComfyUI回归时发现9个旧失败（scheduler 4、direct 3、service 2），在未修改的 `5c5c48d9852300ec4a01af6cbb183714470d9436` 独立工作树中同样复现；未将其计为本次通过。验证使用本地SQLite和模拟平台，无真实租卡或生成消费。

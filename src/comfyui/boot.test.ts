@@ -98,15 +98,15 @@ test('an opening timeout is reconciled by reads, never by blindly repeating the 
   expect(platform.openInstance).toHaveBeenCalledTimes(1);
 });
 
-test('an insufficient-balance open rejection stops booting and surfaces a billing wait', async () => {
+test('an insufficient-balance open rejection fails unsubmitted work with a billing error', async () => {
   const { service, platform, submit, store } = fixture(true);
   const job = submit();
   platform.openInstance.mockRejectedValueOnce(new AigateError('BUSINESS_REJECTED', 'AIGate explicitly rejected the request',
     undefined, false, 'INSUFFICIENT_BALANCE'));
   await service.tick();
   expect(store.instance('1')).toMatchObject({ state: 'offline', action_sent: 0, error_code: 'COMFY_INSUFFICIENT_BALANCE' });
-  expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'queued', stage: 'waiting_billing',
-    progress: { message: '账户余额不足，GPU 实例无法开机；充值后自动继续，保留原任务' } });
+  expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'failed', stage: 'failed',
+    error: { code: 'COMFY_INSUFFICIENT_BALANCE', message: expect.stringContaining('算力租赁账户余额不足') } });
 });
 
 test('a generic open rejection is recorded as an instance start rejection instead of staying in booting', async () => {
@@ -116,8 +116,8 @@ test('a generic open rejection is recorded as an instance start rejection instea
     undefined, false, 'INSTANCE_START_REJECTED'));
   await service.tick();
   expect(store.instance('1')).toMatchObject({ state: 'offline', error_code: 'COMFY_INSTANCE_START_REJECTED' });
-  expect(service.publicJob(service.get(job.id))).toMatchObject({ stage: 'waiting_instance',
-    progress: { message: 'GPU 实例开机被平台拒绝；保留原任务，稍后自动重试' } });
+  expect(service.publicJob(service.get(job.id))).toMatchObject({ status: 'failed', stage: 'failed',
+    error: { code: 'COMFY_INSTANCE_START_REJECTED', message: expect.stringContaining('GPU开机被平台拒绝') } });
 });
 
 test.each([

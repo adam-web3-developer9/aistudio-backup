@@ -163,6 +163,14 @@ export class ComfyStore {
         ...(current.error_code ? { code: current.error_code } : current.collected_at !== prior.collected_at ? { code: 'COMFY_CLIENT_COLLECTED' } : {}), details: { fromStage: prior.stage, toStage: current.stage, ...details } });
     }
   }
+  failUnsubmitted(id: string, errorCode: string, details?: ComfyEventDetails): boolean {
+    const job = this.get(id);
+    if (!job || !['queued', 'preparing', 'awaiting_upload'].includes(job.stage) || job.cancel_requested
+      || job.provider_confirmed || job.native_checkpoint || job.result || job.result_pending) return false;
+    this.updateJob(id, { stage: 'failed', error_code: errorCode }, details);
+    this.releaseSlot(id);
+    return true;
+  }
   claim(instanceId: string, workflowIds: string[], now = Date.now()): ComfyJob | undefined {
     return this.db.transaction(() => {
       const instance = this.instance(instanceId);

@@ -58,9 +58,10 @@ function diagnosticDetails(error: unknown): ComfyEventDetails {
   return details;
 }
 // 开机被平台拒绝（余额不足 / 业务拒绝）是确定结论，不能当成“结果未确认”留在 starting：
-// 退出开机动作、记录原因并退避，任务才能显示真实等待原因。
+// 尚未提交的任务及时失败；已有执行/结果的恢复保留原身份并退避。
 function startRejectionCode(error: unknown): 'COMFY_INSUFFICIENT_BALANCE' | 'COMFY_INSTANCE_START_REJECTED' | undefined {
-  const value = error as { code?: unknown; reason?: unknown } | null;
+  const value = error as { code?: unknown; reason?: unknown; uncertain?: boolean } | null;
+  if (value?.uncertain) return undefined;
   if (value?.reason === 'INSUFFICIENT_BALANCE') return 'COMFY_INSUFFICIENT_BALANCE';
   if (value?.code === 'BUSINESS_REJECTED') return 'COMFY_INSTANCE_START_REJECTED';
   return undefined;
@@ -220,14 +221,19 @@ export class ComfyService {
         || job.error_code === 'COMFY_EXECUTION_CLOSED' && this.originalResourceState(job) === 'released');
     const unavailableArchive = !!job.result && (JSON.parse(job.result) as { storage?: string }).storage === 'tos' && !archived;
     const resultUnavailable = archived?.expired || unavailableArchive;
+    const rentalMessage = job.error_code === 'COMFY_INSUFFICIENT_BALANCE' ? '算力租赁账户余额不足，无法启动GPU，任务已失败；请联系管理员充值后重试'
+      : job.error_code === 'COMFY_INSTANCE_CREATE_REJECTED' ? 'GPU租赁被平台拒绝，任务已失败；请联系管理员检查算力账户'
+      : job.error_code === 'COMFY_INSTANCE_START_REJECTED' ? 'GPU开机被平台拒绝，任务已失败；请联系管理员检查实例状态' : undefined;
     const candidates = this.store.instances().filter(instance => !instance.draining && this.options.configuration.instances.some(candidate => candidate.id === instance.id && candidate.workflowIds.includes(input.workflowId)));
     const assigned = job.instance_id ? this.store.instance(job.instance_id) : undefined;
     const uploadRecovery = ['awaiting_upload', 'preparing'].includes(job.stage) && input.transport === 'direct';
     const starting = job.stage === 'queued' ? candidates.find(instance => instance.state === 'starting') : uploadRecovery && assigned?.state === 'starting' ? assigned : undefined;
     const waiting = (uploadRecovery && assigned ? [assigned] : candidates).filter(instance => instance.state === 'waiting_capacity');
-    const capacityWaiting = (job.stage === 'queued' || uploadRecovery) && !starting && waiting.length > 0;
-    const recovering = !starting && !capacityWaiting ? (uploadRecovery && assigned?.state === 'offline' ? assigned : job.stage === 'queued' ? candidates.find(instance => !instance.job_id && instance.state === 'offline' && instance.error_code) : undefined) : undefined;
-    const configuration = this.options.configuration.instances.find(instance => instance.id === (job.instance_id ?? starting?.id ?? waiting[0]?.id ?? recovering?.id));
+    const billing = starting ? undefined : (assigned && (uploadRecovery || ['submitting', 'running', 'collecting'].includes(job.stage)) ? [assigned] : job.stage === 'queued' ? candidates : [])
+      .find(instance => instance.state === 'offline' && instance.error_code === 'COMFY_INSUFFICIENT_BALANCE');
+    const capacityWaiting = (job.stage === 'queued' || uploadRecovery) && !starting && !billing && waiting.length > 0;
+    const recovering = billing ?? (!starting && !capacityWaiting ? (uploadRecovery && assigned?.state === 'offline' ? assigned : job.stage === 'queued' ? candidates.find(instance => !instance.job_id && instance.state === 'offline' && instance.error_code) : undefined) : undefined);
+    const configuration = this.options.configuration.instances.find(instance => instance.id === (job.instance_id ?? starting?.id ?? recovering?.id ?? waiting[0]?.id));
     const wakingResult = !!job.result_wake_requested && job.stage === 'succeeded';
     const archiving = input.resultDelivery === 'archive' && job.stage === 'succeeded' && !!job.result_pending && !archived;
     const stage = job.cancel_requested ? 'cancelled' : resultUnavailable ? unavailableArchive ? 'result_unavailable' : 'result_expired' : archiving ? 'archiving' : wakingResult ? 'preparing_result'
@@ -245,7 +251,7 @@ export class ComfyService {
         : recovering.error_code === 'COMFY_INSUFFICIENT_BALANCE' ? '账户余额不足，GPU 实例无法开机；充值后自动继续，保留原任务'
         : recovering.error_code === 'COMFY_INSTANCE_START_REJECTED' ? 'GPU 实例开机被平台拒绝；保留原任务，稍后自动重试'
         : `GPU实例暂未就绪，正在退避后重新检查；保留原任务，不重复生成（${recovering.error_code ?? 'COMFY_INSTANCE_UNAVAILABLE'}）` :
-      archiving ? '生成已完成，正在归档并校验视频结果' : job.stage === 'submitting' && native?.attempts.length ? '原生提交尚未确认，正在核对原任务与提交回执' : stageMessages[stage]!;
+      archiving ? '生成已完成，正在归档并校验视频结果' : job.stage === 'submitting' && native?.attempts.length ? '原生提交尚未确认，正在核对原任务与提交回执' : rentalMessage ?? stageMessages[stage]!;
     return {
       id: job.id, adapterId: 'comfyui-v1', status: resultUnavailable ? 'failed' : (archiving || wakingResult) && !job.cancel_requested ? 'running' : capacityWaiting && !job.cancel_requested ? 'queued' : publicStatus(job.cancel_requested ? 'cancelled' : job.stage), stage,
       ...(input.resultDelivery === 'archive' ? { billing: { unit: 'second', requestedSeconds: input.values.duration } } : {}),
@@ -275,7 +281,7 @@ export class ComfyService {
       } } : {}),
       ...(resultUnavailable ? { error: { code: unavailableArchive ? 'COMFY_ARCHIVE_UNAVAILABLE' : 'COMFY_RESULT_EXPIRED', message, retryable: false,
         ...(input.resultDelivery === 'archive' ? { providerTerminal: false } : {}) } }
-        : job.error_code ? { error: { code: job.error_code, message: `${stageMessages[job.cancel_requested ? 'cancelled' : 'failed']}（${job.error_code}）`, retryable: false,
+        : job.error_code ? { error: { code: job.error_code, message: rentalMessage ?? `${stageMessages[job.cancel_requested ? 'cancelled' : 'failed']}（${job.error_code}）`, retryable: false,
           ...(input.resultDelivery === 'archive' ? { providerTerminal } : job.error_code === 'COMFY_REMOTE_UNCONFIRMED' ? { providerTerminal: false } : {}) } } : {}),
     };
   }
@@ -597,8 +603,17 @@ export class ComfyService {
                 : (this.options.configuration.capacityPollIntervalMs ?? 30_000);
               this.store.updateInstance(instance.id, { state: 'offline', action_started_at: null, action_sent: 0,
                 next_action_at: Date.now() + retryMs, error_code: rejection }, diagnosticDetails(error));
-              for (const job of this.store.queued().filter(compatible)) this.store.events.record({ type: 'job.updated', jobId: job.id, instanceId: instance.id,
-                stage: 'queued', code: rejection, details: { areaName: configuration.areaName, gpuModel: configuration.gpuModel, ...diagnosticDetails(error) } });
+              for (const job of this.store.queued().filter(compatible)) {
+                const details = { areaName: configuration.areaName, gpuModel: configuration.gpuModel, ...diagnosticDetails(error) };
+                const workflowId = (JSON.parse(job.input) as FrozenComfyInput).workflowId;
+                const alternative = !job.instance_id && this.options.configuration.instances.some(candidate => {
+                  const row = this.store.instance(candidate.id)!;
+                  return candidate.id !== instance.id && candidate.workflowIds.includes(workflowId) && !row.draining
+                    && (rejection === 'COMFY_INSUFFICIENT_BALANCE' ? ['ready', 'busy', 'starting'].includes(row.state) : row.error_code !== 'COMFY_INSTANCE_START_REJECTED');
+                });
+                if (alternative || !this.store.failUnsubmitted(job.id, rejection, details)) this.store.events.record({ type: 'job.updated', jobId: job.id, instanceId: instance.id,
+                  stage: 'queued', code: rejection, details });
+              }
               return;
             }
             if ((error as { code?: string })?.code !== 'CAPACITY_UNAVAILABLE') throw error;
@@ -682,6 +697,7 @@ export class ComfyService {
             const retryMs = rejection === 'COMFY_INSUFFICIENT_BALANCE'
               ? Math.max(this.options.configuration.capacityPollIntervalMs ?? 30_000, 300_000)
               : (this.options.configuration.capacityPollIntervalMs ?? 30_000);
+            if (instance.job_id) this.store.failUnsubmitted(instance.job_id, rejection, diagnosticDetails(error));
             this.store.updateInstance(instance.id, { state: 'offline', action_started_at: null, action_sent: 0,
               next_action_at: Date.now() + retryMs, error_code: rejection }, diagnosticDetails(error));
             return false;

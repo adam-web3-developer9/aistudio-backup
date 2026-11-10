@@ -847,6 +847,20 @@ describe('AigateClient', () => {
     }
   );
 
+  it.each(['open', 'create'] as const)('prioritizes a balance refusal over a configured capacity code on %s', async operation => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ code: 1, errCode: '6001', msg: 'GPU资源不足：账户余额不足' }));
+    const client = new AigateClient({ token, fetch: fetchMock, capacityErrorCodes: ['6001'] });
+    const request = operation === 'open' ? client.openInstance(instanceId)
+      : client.createInstance({ areaName: '华东一区', count: 1, skuName: 'RTX 5090', imageId: '123', imageType: '3' });
+    await expect(request).rejects.toMatchObject({ code: 'BUSINESS_REJECTED', reason: 'INSUFFICIENT_BALANCE', uncertain: false });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not turn a positive balance statement into a terminal billing refusal', async () => {
+    const { client } = setup({ code: 1, msg: '账户余额充足，GPU资源不足' });
+    await expect(client.openInstance(instanceId)).rejects.toMatchObject({ code: 'CAPACITY_UNAVAILABLE' });
+  });
+
   it('classifies a generic open rejection as an instance start rejection without exposing the message', async () => {
     const { client } = setup({ code: 1, msg: '实例启动失败，请联系平台管理员' });
     const error = await client.openInstance(instanceId).catch(error => error);

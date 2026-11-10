@@ -183,10 +183,22 @@ export class ComfyLifecycle {
         this.options.assertWorker();
         const capacityUnavailable = !resource.instance_id && (error as { uncertain?: boolean })?.uncertain === false
           && (error as { code?: string })?.code === 'CAPACITY_UNAVAILABLE';
+        const rejected = !resource.instance_id && (error as { uncertain?: boolean })?.uncertain === false
+          && (error as { code?: string })?.code === 'BUSINESS_REJECTED';
+        const errorCode = rejected ? (error as { reason?: string })?.reason === 'INSUFFICIENT_BALANCE'
+          ? 'COMFY_INSUFFICIENT_BALANCE' : 'COMFY_INSTANCE_CREATE_REJECTED' : safeCode(error);
         store.saveResource({ ...resource, state: resource.instance_id ? 'creating' : (error as { uncertain?: boolean })?.uncertain === false ? 'released' : 'uncertain',
-          updated_at: Date.now(), error_code: safeCode(error) });
+          updated_at: Date.now(), error_code: errorCode });
         this.lastError = resource.instance_id ? 'COMFY_RESOURCE_INITIALIZING' : capacityUnavailable ? 'COMFY_CAPACITY_UNAVAILABLE'
-          : (error as { uncertain?: boolean })?.uncertain === false ? safeCode(error) : 'COMFY_CREATION_UNCONFIRMED';
+          : (error as { uncertain?: boolean })?.uncertain === false ? errorCode : 'COMFY_CREATION_UNCONFIRMED';
+        if (rejected) {
+          for (const job of this.compatible(template)) {
+            const workflowId = (JSON.parse(job.input) as FrozenComfyInput).workflowId;
+            const available = configuration.instances.some(candidate => candidate.workflowIds.includes(workflowId)
+              && !store.instance(candidate.id)?.draining && ['ready', 'busy', 'starting'].includes(store.instance(candidate.id)!.state));
+            if (!available) store.failUnsubmitted(job.id, errorCode, { areaName: template.areaName, gpuModel: template.gpuModel });
+          }
+        }
         if (capacityUnavailable) continue;
       }
       return;

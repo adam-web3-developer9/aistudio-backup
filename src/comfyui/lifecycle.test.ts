@@ -266,8 +266,9 @@ describe('ComfyLifecycle elastic creation', () => {
     await context.lifecycle.tick();
     expect(context.platform.createInstance).toHaveBeenCalledTimes(1);
     expect(context.platform.skuList).toHaveBeenCalledExactlyOnceWith('华东一区');
-    expect(context.store.resources()).toEqual([expect.objectContaining({ state, instance_id: null, error_code: 'COMFY_' + code })]);
-    expect(context.lifecycle.lastError).toBe(uncertain === false ? 'COMFY_' + code : 'COMFY_CREATION_UNCONFIRMED');
+    const errorCode = code === 'BUSINESS_REJECTED' ? 'COMFY_INSTANCE_CREATE_REJECTED' : 'COMFY_' + code;
+    expect(context.store.resources()).toEqual([expect.objectContaining({ state, instance_id: null, error_code: errorCode })]);
+    expect(context.lifecycle.lastError).toBe(uncertain === false ? errorCode : 'COMFY_CREATION_UNCONFIRMED');
     if (uncertain !== false) {
       clock += context.configuration.elastic!.createCooldownMs;
       await context.lifecycle.tick();
