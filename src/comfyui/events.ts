@@ -13,7 +13,7 @@ export interface ComfyEventDetails {
   completed?: number;
   total?: number;
   areaName?: '华东一区' | '华东二区';
-  gpuModel?: '5090' | '4090';
+  gpuModel?: string;
   upstreamCode?: string;
   httpStatus?: number;
   nodeId?: string;

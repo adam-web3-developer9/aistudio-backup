@@ -297,7 +297,8 @@ describe('ComfyStore lifecycle persistence', () => {
   it('upserts resource lifecycle idempotently and persists JSON without tokens', () => {
     const row: ComfyResource = { key: 'resource-1', name: 'worker', state: 'creating', instance_id: null,
       configuration: JSON.stringify({ baseUrl: 'https://worker.invalid', token: 'secret', nested: { apiToken: 'secret', workflowIds: ['fixture'] } }),
-      template_id: 'template', hourly_cost: 2, storage_hourly_cost: 0.1, created_at: now, updated_at: now, error_code: null };
+      template_id: 'template', hourly_cost: 2, storage_hourly_cost: 0.1, created_at: now, updated_at: now, error_code: null,
+      image_id: null, image_type: null, sku_name: null, area_name: null };
     store.saveResource(row);
     competitor.saveResource(row);
     const saved = { ...row, configuration: JSON.stringify({ baseUrl: 'https://worker.invalid', nested: { workflowIds: ['fixture'] } }) };

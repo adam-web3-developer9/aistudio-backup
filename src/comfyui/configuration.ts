@@ -7,6 +7,33 @@ const identifier = z.string().regex(/^[A-Za-z0-9_-]{1,100}$/);
 const durationMs = z.number().int().positive().max(604_800_000);
 const imageId = z.string().regex(/^[1-9]\d{0,18}$/).refine(value =>
   value === value.trim() && (value.length < 19 || (value.length === 19 && value <= '9223372036854775807')), 'Image ID must be a canonical positive int64 string');
+const gpuModel = z.string().regex(/^[A-Za-z0-9]{2,20}$/);
+const skuName = z.string().min(1).max(100).refine(value => value.trim().length > 0);
+const imageName = z.string().min(1).max(200).refine(value => value === value.trim() && value.length > 0);
+const elasticTemplateSchema = z.object({
+  id: identifier,
+  areaName: z.enum(['华东一区', '华东二区']),
+  // 租到的机型由实际可用 SKU 决定；这里只是排序偏好，不再限制单一型号。
+  gpuModel: gpuModel.optional(),
+  imageId: imageId.optional(),
+  imageType: z.enum(['2', '3']),
+  // 配置镜像名后按最新可用版本自动跟随；imageId 只作为平台读不到镜像列表时的兜底。
+  imageName: imageName.optional(),
+  imageVersion: z.string().regex(/^[A-Za-z0-9._+-]{1,40}$/).optional(),
+  skuName: skuName.optional(),
+  // 可租机型白名单，按优先级排列；调度只选其中当前有货的型号。
+  skuNames: z.array(skuName).min(1).max(20).optional(),
+  skuPriceToHourlyFactor: z.number().positive(),
+  skuPriceUnitVerified: z.boolean(),
+  workflowIds: z.array(identifier).min(1),
+  hourlyCost: z.number().positive().optional(),
+  storageHourlyCost: z.number().nonnegative(),
+  rebuildVerified: z.boolean(),
+  allowRelease: z.boolean(),
+}).strict()
+  .refine(template => template.imageId !== undefined || template.imageName !== undefined, 'Elastic template requires imageId or imageName')
+  .refine(template => (template.skuName === undefined) !== (template.skuNames === undefined), 'Elastic template requires exactly one of skuName or skuNames')
+  .refine(template => template.gpuModel !== undefined || template.skuName !== undefined || template.skuNames !== undefined, 'Elastic template requires a gpuModel or SKU allowlist');
 const schedulerSchema = z.object({
   uploadReservationTimeoutMs: durationMs.default(600_000),
   uploadRetryDelayMs: durationMs.default(60_000),
@@ -30,26 +57,14 @@ const elasticSchema = z.object({
   maxHourlyCost: z.number().positive().optional(),
   createCooldownMs: durationMs.default(60_000),
   releaseAfterMs: durationMs.default(3_600_000),
+  // 镜像列表/可用性缓存时长；发布者更新镜像后最迟在这个窗口内自动切换（默认 5 分钟）。
+  imageRefreshMs: durationMs.optional(),
   stoppedRetention: z.object({
     maxInstances: z.number().int().nonnegative().max(100).default(1),
     excessReleaseAfterMs: durationMs.default(60_000),
   }).strict().optional(),
   reconcileTimeoutMs: durationMs.default(300_000),
-  templates: z.array(z.object({
-    id: identifier,
-    areaName: z.enum(['华东一区', '华东二区']),
-    gpuModel: z.enum(['5090', '4090']),
-    imageId,
-    imageType: z.enum(['2', '3']),
-    skuName: z.string().min(1).max(100).refine(value => value.trim().length > 0),
-    skuPriceToHourlyFactor: z.number().positive(),
-    skuPriceUnitVerified: z.boolean(),
-    workflowIds: z.array(identifier).min(1),
-    hourlyCost: z.number().positive(),
-    storageHourlyCost: z.number().nonnegative(),
-    rebuildVerified: z.boolean(),
-    allowRelease: z.boolean(),
-  }).strict()).default([]),
+  templates: z.array(elasticTemplateSchema).default([]),
 }).strict();
 const binding = z.object({ nodeId: z.string().min(1), input: z.string().min(1), required: z.boolean().optional(), kind: z.enum(['value', 'media', 'output-prefix']).optional(), omitWhenMissing: z.boolean().optional() }).strict();
 const configurationSchema = z.object({
@@ -73,7 +88,7 @@ const configurationSchema = z.object({
   instances: z.array(z.object({
     id: z.string().regex(/^\d{1,30}$/), baseUrl: z.url(),
     areaName: z.enum(['华东一区', '华东二区']).optional(),
-    gpuModel: z.enum(['5090', '4090']).optional(),
+    gpuModel: gpuModel.optional(),
     headersEnv: z.record(z.string(), z.string().regex(/^[A-Z_][A-Z0-9_]*$/)).default({}),
     workflowIds: z.array(identifier).min(1),
     lifecycle: lifecycleSchema.optional(),
@@ -94,7 +109,8 @@ export interface ComfyPoolConfiguration {
   scheduler?: ComfySchedulerConfiguration;
   elastic?: ComfyElasticConfiguration;
   resultArchive?: z.infer<typeof configurationSchema>['resultArchive'];
-  instances: Array<{ id: string; baseUrl: string; areaName?: '华东一区' | '华东二区'; gpuModel?: '5090' | '4090'; headers?: Record<string, string>; workflowIds: string[]; lifecycle?: ComfyInstanceLifecycleConfiguration }>;
+  instances: Array<{ id: string; baseUrl: string; areaName?: '华东一区' | '华东二区'; gpuModel?: string; gpuModels?: string[];
+    headers?: Record<string, string>; workflowIds: string[]; lifecycle?: ComfyInstanceLifecycleConfiguration }>;
   workflows: WorkflowProfile[];
 }
 
@@ -115,6 +131,12 @@ export async function loadComfyConfiguration(file: string, environment = process
       throw new Error('Elastic template references an unknown workflow');
     }
     if (elastic.templates.some(template => template.allowRelease && !template.rebuildVerified)) throw new Error('Template allowRelease requires rebuildVerified');
+    if (elastic.templates.some(template => template.skuNames && new Set(template.skuNames).size !== template.skuNames.length)) {
+      throw new Error('Duplicate elastic template SKU');
+    }
+    if (elastic.templates.some(template => template.imageVersion !== undefined && template.imageName === undefined)) {
+      throw new Error('Elastic template imageVersion requires imageName');
+    }
     if (elastic.releaseAfterMs < parsed.scheduler.idleStopAfterMs) throw new Error('Elastic releaseAfterMs must cover scheduler idleStopAfterMs');
     if (elastic.stoppedRetention && elastic.stoppedRetention.excessReleaseAfterMs > elastic.releaseAfterMs) {
       throw new Error('Elastic excessReleaseAfterMs must not exceed releaseAfterMs');

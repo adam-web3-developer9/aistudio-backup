@@ -369,7 +369,7 @@ describe('loadComfyConfiguration', () => {
   });
 
   it.each([
-    { id: '' }, { id: 'invalid id' }, { areaName: '华东三区' }, { gpuModel: '3090' },
+    { id: '' }, { id: 'invalid id' }, { areaName: '华东三区' }, { gpuModel: '' }, { gpuModel: 'bad model!' },
     { imageId: '' }, { imageId: '1.5' }, { imageId: '-1' }, { imageId: '1e10' }, { imageId: 123 },
     { imageId: '0' }, { imageId: '01' }, { imageId: '+1' }, { imageId: ' 123' }, { imageId: '123 ' },
     { imageId: '1\n' }, { imageId: '1\r\n' },
@@ -408,10 +408,37 @@ describe('loadComfyConfiguration', () => {
     expect(loaded.elastic!.templates).toEqual(templates);
   });
 
-  it.each(Object.keys(elasticTemplate()))('requires template field %s', async field => {
+  it.each(Object.keys(elasticTemplate()).filter(field => !['gpuModel', 'hourlyCost'].includes(field)))('requires template field %s', async field => {
     const template: Record<string, unknown> = elasticTemplate();
     delete template[field];
     await expect(loadConfiguration({ ...configuration(), elastic: { ...elasticConfiguration(), templates: [template] } })).rejects.toThrow();
+  });
+
+  it('accepts an optional gpuModel and hourlyCost, and a SKU allowlist instead of one SKU', async () => {
+    const template: Record<string, unknown> = { ...elasticTemplate(), skuNames: ['RTX 5090', 'RTX 4090'] };
+    delete template.skuName;
+    delete template.gpuModel;
+    delete template.hourlyCost;
+    const loaded = await loadConfiguration({ ...configuration(), elastic: { ...elasticConfiguration(), templates: [template] } });
+    expect(loaded.elastic!.templates[0]).toMatchObject({ skuNames: ['RTX 5090', 'RTX 4090'] });
+    expect(loaded.elastic!.templates[0]!.skuName).toBeUndefined();
+  });
+
+  it('accepts image discovery by exact name instead of a pinned image ID', async () => {
+    const template: Record<string, unknown> = { ...elasticTemplate(), imageName: 'Minimax-H3-字字动画', imageVersion: 'v0.8.9' };
+    delete template.imageId;
+    const loaded = await loadConfiguration({ ...configuration(), elastic: { ...elasticConfiguration(), templates: [template] } });
+    expect(loaded.elastic!.templates[0]).toMatchObject({ imageName: 'Minimax-H3-字字动画', imageVersion: 'v0.8.9' });
+    expect(loaded.elastic!.templates[0]!.imageId).toBeUndefined();
+  });
+
+  it.each([
+    { imageId: undefined, imageName: undefined },
+    { skuNames: [] }, { skuNames: ['RTX 5090', 'RTX 5090'] }, { skuNames: ['RTX 5090'], skuName: 'RTX 5090' },
+    { imageName: undefined, imageVersion: 'v1' }, { imageName: ' ', imageId: undefined },
+  ])('rejects unusable template image or SKU selection %#', async parameters => {
+    await expect(loadConfiguration({ ...configuration(), elastic: { ...elasticConfiguration(),
+      templates: [{ ...elasticTemplate(), ...parameters }] } })).rejects.toThrow();
   });
 
   it.each([0, -1, NaN, Infinity, -Infinity, '1', null])('rejects invalid SKU price-to-hourly factors %#', async skuPriceToHourlyFactor => {

@@ -24,6 +24,28 @@ export interface AigateSshConnection {
   password: string;
 }
 
+export interface AigateImage {
+  id: string;
+  name: string;
+  status: string;
+  areaName?: string;
+  imageType?: string;
+  imageVersion?: string;
+  size?: string;
+  price?: string;
+  chargeType?: string;
+  comfyPort: boolean;
+}
+
+export interface AigateImageQuery {
+  imageType: '2' | '3';
+  imageName?: string;
+  areaName?: string;
+  skuName?: string;
+  imageVersion?: string;
+  maxPages?: number;
+}
+
 export interface AigateSku {
   areaName: string;
   skuName: string;
@@ -69,7 +91,7 @@ export interface AigateReconcileResult {
 
 // 服务端只保留“可行动的分类”，不保存平台原始 msg：原始正文里可能混着 token、HTML 或超长内容。
 // 分类足够让调度层和客户端给出明确指引（例如去充值），又不扩大泄露面。
-export type AigateRejectionReason = 'INSUFFICIENT_BALANCE' | 'INSTANCE_START_REJECTED';
+export type AigateRejectionReason = 'INSUFFICIENT_BALANCE' | 'IMAGE_UNAVAILABLE' | 'INSTANCE_START_REJECTED';
 
 export class AigateError extends Error {
   constructor(public readonly code: string, message: string, public readonly errCode?: string,
@@ -82,6 +104,10 @@ export class AigateError extends Error {
 
 function rejectionReason(msg: string, action: string): AigateRejectionReason | undefined {
   if (/余额(?:不足|不够|过低)|欠费|欠款|请(?:先)?充值|需要充值|insufficient\s+(?:account\s+)?(?:balance|funds)|(?:account\s+)?balance\s+(?:is\s+)?(?:insufficient|too\s+low|not\s+enough)|arrears/i.test(msg)) return 'INSUFFICIENT_BALANCE';
+  // 发布者更新/删除镜像后旧 imageId 会被平台判为不可用；这不是账户或库存问题，必须能继续自动刷新镜像。
+  if (/(?:镜像|image)[^。；;]{0,30}(?:不存在|不可用|已删除|已下架|无效|失效|not\s+(?:found|available)|unavailable|deleted|invalid|expired)/i.test(msg)) return 'IMAGE_UNAVAILABLE';
+  // 新租请求只带镜像与 SKU，平台回“数据不存在”时按镜像/机型失效处理，避免把可自愈的更新误判成账户拒绝。
+  if (action === 'start' && /数据(?:不存在|未找到|已删除|已失效)/.test(msg)) return 'IMAGE_UNAVAILABLE';
   if (action === 'open' || action === 'start' || action === 'create') return 'INSTANCE_START_REJECTED';
   return undefined;
 }
@@ -266,6 +292,77 @@ export class AigateClient {
     });
   }
 
+  async listImages(query: AigateImageQuery): Promise<AigateImage[]> {
+    if (!isRecord(query) || !['2', '3'].includes(query.imageType)) return invalidArgument();
+    if (!nonEmpty(query.imageName)) return invalidArgument();
+    if (query.imageType === '2' && (!nonEmpty(query.areaName) || !nonEmpty(query.skuName))) return invalidArgument();
+    if (query.imageVersion !== undefined && !nonEmpty(query.imageVersion)) return invalidArgument();
+    const maxPages = query.maxPages ?? 5;
+    if (!positiveInteger(maxPages, 10)) return invalidArgument();
+    const pageSize = 20;
+    const images: AigateImage[] = [];
+    for (let current = 1; current <= maxPages; current++) {
+      const body = JSON.stringify({ current, pageSize, imageType: query.imageType,
+        ...(query.imageType === '2' ? { areaName: query.areaName, skuName: query.skuName, imageName: query.imageName,
+          ...(query.imageVersion === undefined ? {} : { imageVersion: query.imageVersion }) } : {}) });
+      const data = await this.request('imagePage', undefined, undefined, body);
+      if (!isRecord(data) || typeof data.total !== 'number' || !Number.isSafeInteger(data.total) || data.total < 0
+        || !Array.isArray(data.records) || data.records.length > pageSize) return invalidResponse();
+      images.push(...data.records.map(item => this.parseImage(item)));
+      if (current * pageSize >= data.total || data.records.length < pageSize) break;
+    }
+    return images;
+  }
+
+  // 平台在镜像被删除后返回业务失败（数据不存在）。这种情况不是鉴权或网络故障，交给上层重新解析或暂缓租用。
+  async getImage(imageId: string, imageType: '2' | '3'): Promise<AigateImage | undefined> {
+    if (!isInt64(imageId) || !['2', '3'].includes(imageType)) return invalidArgument();
+    try {
+      const data = await this.request('imageGet', undefined, undefined,
+        '{"imageType":"' + imageType + '","imageId":' + imageId + '}');
+      return this.parseImage(data);
+    } catch (error) {
+      if (error instanceof AigateError && error.code === 'BUSINESS_REJECTED') return undefined;
+      throw error;
+    }
+  }
+
+  private parseImage(data: unknown): AigateImage {
+    if (!isRecord(data) || !nonEmpty(data.name) || !nonEmpty(data.status)) return invalidResponse();
+    const image: AigateImage = { id: responseId(data.worksId), name: data.name, status: data.status,
+      comfyPort: false };
+    for (const key of ['areaName', 'imageType', 'size'] as const) {
+      const value = data[key];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== 'string') return invalidResponse();
+      image[key] = value;
+    }
+    for (const key of ['imageVersion'] as const) {
+      const value = data[key];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== 'string') return invalidResponse();
+      image.imageVersion = value;
+    }
+    if (data.imageChargeInfo !== undefined && data.imageChargeInfo !== null) {
+      if (!isRecord(data.imageChargeInfo)) return invalidResponse();
+      const { chargeType, price } = data.imageChargeInfo;
+      if (chargeType !== undefined && chargeType !== null) {
+        if (typeof chargeType !== 'string') return invalidResponse();
+        image.chargeType = chargeType;
+      }
+      if (price !== undefined && price !== null) {
+        if (typeof price !== 'string') return invalidResponse();
+        image.price = price;
+      }
+    }
+    if (data.servicePort !== undefined && data.servicePort !== null) {
+      if (!Array.isArray(data.servicePort)) return invalidResponse();
+      image.comfyPort = data.servicePort.some(port => isRecord(port) && parsePort(port.port) === 8188
+        && /^https?$/i.test(String(port.protocol ?? '')));
+    }
+    return image;
+  }
+
   async createInstance(request: AigateCreateRequest): Promise<string> {
     if (!isRecord(request) || !nonEmpty(request.areaName) || !positiveInteger(request.count, 8)
       || !isInt64(request.imageId) || !['2', '3'].includes(request.imageType)
@@ -353,9 +450,9 @@ export class AigateClient {
     return code;
   }
 
-  private async request(action: 'get' | 'status' | 'open' | 'close' | 'setTimerStop' | 'clearTimerStop' | 'skuList' | 'start' | 'page' | 'release',
+  private async request(action: 'get' | 'status' | 'open' | 'close' | 'setTimerStop' | 'clearTimerStop' | 'skuList' | 'start' | 'page' | 'release' | 'imagePage' | 'imageGet',
     instanceId?: string, query?: Record<string, string>, payload?: string): Promise<unknown> {
-    const needsId = !['skuList', 'start', 'page'].includes(action);
+    const needsId = !['skuList', 'start', 'page', 'imagePage', 'imageGet'].includes(action);
     if (needsId && (typeof instanceId !== 'string' || !/^\d+$/.test(instanceId))) {
       throw new AigateError('INVALID_ARGUMENT', 'AIGate instance ID must be a decimal string');
     }
@@ -363,10 +460,12 @@ export class AigateClient {
     if ((gpuIdleShutdown || action === 'release') && !isInt64(instanceId)) {
       throw new AigateError('INVALID_ARGUMENT', 'AIGate instance ID must be a canonical non-negative int64 decimal string');
     }
-    const url = new URL('/api/openapi/instance/' + (action === 'clearTimerStop' ? 'setTimerStop' : action), this.#baseUrl);
+    const path = action === 'imagePage' ? '/api/openapi/image/page' : action === 'imageGet' ? '/api/openapi/image/get'
+      : '/api/openapi/instance/' + (action === 'clearTimerStop' ? 'setTimerStop' : action);
+    const url = new URL(path, this.#baseUrl);
     if (needsId && !gpuIdleShutdown) url.searchParams.set('instanceId', instanceId!);
     for (const [key, value] of Object.entries(query ?? {})) url.searchParams.set(key, value);
-    const post = gpuIdleShutdown || action === 'start' || action === 'page';
+    const post = gpuIdleShutdown || ['start', 'page', 'imagePage', 'imageGet'].includes(action);
     const bodyText = gpuIdleShutdown ? '{"instanceId":' + instanceId + (action === 'clearTimerStop'
       ? ',"stopType":"0"}' : ',"stopType":"2","utilizationRate":10,"leisureTime":30}') : payload;
     const mutation = action === 'start' || action === 'release' || action === 'clearTimerStop';

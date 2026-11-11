@@ -73,3 +73,9 @@ AIGATE_ACCESS_TOKEN=实际AIGate平台令牌
 余额/业务拒绝修复覆盖新租、开机与直传前唤醒；仍有健康替代实例或已运行容量时，不因单次扩容/实例拒绝扩大失败范围。明确“余额不足”优先于缺卡码，“余额充足”不能归为余额错误。
 
 `rental-rejection`、`boot`、`capacity`、`lifecycle`、`aigate-client` 五份专项726项通过，`pnpm build`通过。扩大ComfyUI回归时发现9个旧失败（scheduler 4、direct 3、service 2），在未修改的 `5c5c48d9852300ec4a01af6cbb183714470d9436` 独立工作树中同样复现；未将其计为本次通过。验证使用本地SQLite和模拟平台，无真实租卡或生成消费。
+
+### 2026-11-11 镜像更新导致租卡拒绝
+
+工坊镜像 `Minimax-H3-字字动画` 更新到 v0.8.9（worksId `1172671954467557376`），旧 worksId `1164259372090134528` / `1164470949984731136` 被删除。池内 4 台实例此前已按策略释放，配置仍钉住旧 imageId，于是 16:10–16:22 的全部扩容都返回 `COMFY_INSTANCE_CREATE_REJECTED`，经 new-api 显示为 `GPU instance rental was rejected`。
+
+修复见 `comfyui-elastic-scheduler.md` 的“镜像自动跟随与机型白名单”：模板按 `imageName` 自动解析最新可用镜像、SKU 用 `skuNames` 白名单选择当前有货型号、镜像失效只跳过模板并保留排队任务；创建时的镜像/机型/区域写入 `comfy_resources` 作为对账依据。不自动更换工作流或模型，镜像版本变化仍需运营方在新版本上验收工作流。

@@ -67,7 +67,8 @@ function fixture(overrides: Partial<ComfyPoolConfiguration> = {}) {
 
 function resource(patch: Partial<ComfyResource> = {}): ComfyResource {
   return { key: 'resource', name: 'hailuo-resource', state: 'creating', instance_id: null, configuration: null,
-    template_id: 'template', hourly_cost: 1, storage_hourly_cost: 0.2, created_at: clock, updated_at: clock, error_code: null, ...patch };
+    template_id: 'template', hourly_cost: 1, storage_hourly_cost: 0.2, created_at: clock, updated_at: clock, error_code: null,
+    image_id: null, image_type: null, sku_name: null, area_name: null, ...patch };
 }
 
 function fallbackFixture() {

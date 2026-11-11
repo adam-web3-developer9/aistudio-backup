@@ -8,16 +8,32 @@ import { schedulerPolicy } from './scheduler.js';
 type InstanceConfiguration = ComfyPoolConfiguration['instances'][number];
 type ElasticTemplate = NonNullable<ComfyPoolConfiguration['elastic']>['templates'][number];
 export type ComfyLifecyclePlatform = Pick<AigateClient, 'getInstanceStatus' | 'closeInstance'> &
-  Partial<Pick<AigateClient, 'getInstance' | 'skuList' | 'createInstance' | 'releaseInstance' | 'pageInstances' | 'findInstancesByName'>>;
+  Partial<Pick<AigateClient, 'getInstance' | 'skuList' | 'createInstance' | 'releaseInstance' | 'pageInstances' | 'findInstancesByName' | 'listImages' | 'getImage'>>;
 
 function safeCode(error: unknown): string {
   const value = (error as { code?: unknown })?.code;
   return typeof value === 'string' && /^[A-Z_]{1,80}$/.test(value) ? 'COMFY_' + value : 'COMFY_LIFECYCLE_FAILED';
 }
 
+// 实际租到的机型由可用 SKU 决定；保留 SKU 前缀与去掉 DDR 后缀的别名，供原生 GPU 名称校验使用。
+const SKU_MODELS = ['5090', '4090', '6000D', '3090', 'A10G'];
+export function skuModelAliases(skuName: string): string[] {
+  const token = skuName.split('-')[0] ?? '';
+  const family = SKU_MODELS.find(model => new RegExp(`(?:^|[^A-Za-z0-9])${model}(?:$|[^A-Za-z0-9])`, 'i').test(skuName))
+    ?? (/^[45]090D$/i.test(token) ? token : undefined) ?? token;
+  const aliases = [family];
+  if (/^[45]090D$/i.test(family)) aliases.push(family.slice(0, 4));
+  return [...new Set(aliases.filter(Boolean))];
+}
+
+function templateSkus(template: ElasticTemplate): string[] {
+  return template.skuNames ?? (template.skuName === undefined ? [] : [template.skuName]);
+}
+
 export class ComfyLifecycle {
   private active?: Promise<void>;
   private managing = false;
+  private readonly images = new Map<string, { at: number; image?: { id: string; type: '2' | '3' } }>();
   lastError: string | null = null;
   constructor(private readonly options: {
     store: ComfyStore; configuration: ComfyPoolConfiguration; platform: ComfyLifecyclePlatform;
@@ -143,6 +159,9 @@ export class ComfyLifecycle {
     const elastic = configuration.elastic;
     if (!configuration.autoOpen || !elastic?.enabled) return;
     if (!platform.skuList || !platform.createInstance || !platform.getInstance) { this.lastError = 'COMFY_ELASTIC_API_UNAVAILABLE'; return; }
+    if (elastic.templates.some(template => template.imageName !== undefined) && !platform.listImages) {
+      this.lastError = 'COMFY_IMAGE_DISCOVERY_UNAVAILABLE'; return;
+    }
     const resources = store.resources();
     if (resources.some(resource => ['creating', 'blocked', 'releasing'].includes(resource.state))) {
       this.lastError = 'COMFY_RESOURCE_RECONCILIATION_REQUIRED'; return;
@@ -152,7 +171,8 @@ export class ComfyLifecycle {
     if (Date.now() - lastCreated < elastic.createCooldownMs) return;
     const reservedInstances = configuration.instances.length + this.unregisteredResources().length;
     if (reservedInstances >= elastic.maxInstances || reservedInstances >= policy.maxConcurrentInstances) return;
-    const templates = [...elastic.templates].sort((left, right) => (left.gpuModel === '4090' ? 1 : 0) - (right.gpuModel === '4090' ? 1 : 0) || left.hourlyCost - right.hourlyCost);
+    const templates = [...elastic.templates].sort((left, right) => (left.gpuModel === '4090' ? 1 : 0) - (right.gpuModel === '4090' ? 1 : 0)
+      || (left.hourlyCost ?? Number.POSITIVE_INFINITY) - (right.hourlyCost ?? Number.POSITIVE_INFINITY));
     for (const template of templates) {
       if (!template.skuPriceUnitVerified || !Number.isFinite(template.skuPriceToHourlyFactor) || template.skuPriceToHourlyFactor <= 0) {
         this.lastError = 'COMFY_SKU_PRICE_UNIT_UNVERIFIED'; continue;
@@ -160,49 +180,123 @@ export class ComfyLifecycle {
       if (!this.needsCapacity(template)) continue;
       const skus = await platform.skuList(template.areaName);
       this.options.assertWorker();
-      const sku = skus.find(item => item.areaName === template.areaName && item.skuName === template.skuName);
-      if (!sku || !sku.skuName.includes(template.gpuModel) || !/^\d+(?:\.\d+)?$/.test(sku.price)
-        || !Number.isFinite(Number(sku.price) * template.skuPriceToHourlyFactor)) {
-        this.lastError = 'COMFY_SKU_QUOTE_UNVERIFIED'; continue;
-      }
+      // 白名单顺序即优先级；平台只返回当前有货的 SKU，售罄的自动跳过而不是判任务失败。
+      const available = templateSkus(template)
+        .map(name => skus.find(item => item.areaName === template.areaName && item.skuName === name))
+        .filter((sku): sku is NonNullable<typeof sku> => !!sku && /^\d+(?:\.\d+)?$/.test(sku.price)
+          && Number.isFinite(Number(sku.price) * template.skuPriceToHourlyFactor));
+      if (!available.length) { this.lastError = 'COMFY_SKU_QUOTE_UNVERIFIED'; continue; }
       if (!this.needsCapacity(template)) continue;
+      // 逐个型号解析镜像：某个型号没上架该镜像时继续试白名单里的下一个，而不是直接放弃这台模板。
+      let selected: { sku: (typeof available)[number]; image: { id: string; type: '2' | '3' } } | undefined;
+      for (const sku of available) {
+        const image = await this.resolveImage(template, sku.skuName);
+        this.options.assertWorker();
+        if (image) { selected = { sku, image }; break; }
+      }
+      if (!selected) { this.lastError = 'COMFY_IMAGE_UNAVAILABLE'; continue; }
+      const { sku, image } = selected;
       const key = randomUUID();
       const resource: ComfyResource = { key, name: 'hailuo-' + key, state: 'creating', instance_id: null, configuration: null,
         template_id: template.id, hourly_cost: Number(sku.price) * template.skuPriceToHourlyFactor, storage_hourly_cost: template.storageHourlyCost,
-        created_at: Date.now(), updated_at: Date.now(), error_code: null };
+        created_at: Date.now(), updated_at: Date.now(), error_code: null,
+        image_id: image.id, image_type: image.type, sku_name: sku.skuName, area_name: template.areaName };
       store.saveResource(resource);
       try {
-        const id = await platform.createInstance({ areaName: template.areaName, count: 1, skuName: template.skuName,
-          imageId: template.imageId, imageType: template.imageType });
+        const id = await platform.createInstance({ areaName: template.areaName, count: 1, skuName: sku.skuName,
+          imageId: image.id, imageType: image.type });
         this.options.assertWorker();
         resource.instance_id = id;
         store.saveResource({ ...resource, updated_at: Date.now() });
         await this.register(resource, template);
         this.lastError = null;
+        return;
       } catch (error) {
         this.options.assertWorker();
-        const capacityUnavailable = !resource.instance_id && (error as { uncertain?: boolean })?.uncertain === false
-          && (error as { code?: string })?.code === 'CAPACITY_UNAVAILABLE';
-        const rejected = !resource.instance_id && (error as { uncertain?: boolean })?.uncertain === false
-          && (error as { code?: string })?.code === 'BUSINESS_REJECTED';
-        const errorCode = rejected ? (error as { reason?: string })?.reason === 'INSUFFICIENT_BALANCE'
-          ? 'COMFY_INSUFFICIENT_BALANCE' : 'COMFY_INSTANCE_CREATE_REJECTED' : safeCode(error);
-        store.saveResource({ ...resource, state: resource.instance_id ? 'creating' : (error as { uncertain?: boolean })?.uncertain === false ? 'released' : 'uncertain',
+        const confirmed = !resource.instance_id && (error as { uncertain?: boolean })?.uncertain === false;
+        const capacityUnavailable = confirmed && (error as { code?: string })?.code === 'CAPACITY_UNAVAILABLE';
+        const rejectedRequest = confirmed && (error as { code?: string })?.code === 'BUSINESS_REJECTED';
+        const reason = (error as { reason?: string })?.reason;
+        // 镜像刚被删除/替换：清掉缓存，下一个模板或下一轮自动重新解析，不把任务判死。
+        const imageUnavailable = rejectedRequest && reason === 'IMAGE_UNAVAILABLE';
+        if (rejectedRequest) this.invalidateImages();
+        const errorCode = imageUnavailable ? 'COMFY_IMAGE_UNAVAILABLE'
+          : rejectedRequest ? (reason === 'INSUFFICIENT_BALANCE' ? 'COMFY_INSUFFICIENT_BALANCE' : 'COMFY_INSTANCE_CREATE_REJECTED') : safeCode(error);
+        store.saveResource({ ...resource, state: resource.instance_id ? 'creating' : confirmed ? 'released' : 'uncertain',
           updated_at: Date.now(), error_code: errorCode });
-        this.lastError = resource.instance_id ? 'COMFY_RESOURCE_INITIALIZING' : capacityUnavailable ? 'COMFY_CAPACITY_UNAVAILABLE'
-          : (error as { uncertain?: boolean })?.uncertain === false ? errorCode : 'COMFY_CREATION_UNCONFIRMED';
-        if (rejected) {
-          for (const job of this.compatible(template)) {
-            const workflowId = (JSON.parse(job.input) as FrozenComfyInput).workflowId;
-            const available = configuration.instances.some(candidate => candidate.workflowIds.includes(workflowId)
-              && !store.instance(candidate.id)?.draining && ['ready', 'busy', 'starting'].includes(store.instance(candidate.id)!.state));
-            if (!available) store.failUnsubmitted(job.id, errorCode, { areaName: template.areaName, gpuModel: template.gpuModel });
-          }
+        this.lastError = resource.instance_id ? 'COMFY_RESOURCE_INITIALIZING'
+          : capacityUnavailable ? 'COMFY_CAPACITY_UNAVAILABLE' : confirmed ? errorCode : 'COMFY_CREATION_UNCONFIRMED';
+        if (reason === 'INSUFFICIENT_BALANCE' || (rejectedRequest && !imageUnavailable)) {
+          // 明确的账户/业务拒绝立即结束相关排队任务（保持原有“暴露拒绝原因”语义）。
+          this.failTemplateJobs(template, errorCode);
+          return;
         }
-        if (capacityUnavailable) continue;
+        // 明确缺卡或镜像刚被删除/替换：继续尝试下一个模板或下一轮自动重新解析，不把任务判死。
+        if (capacityUnavailable || imageUnavailable) continue;
       }
       return;
     }
+  }
+
+  private failTemplateJobs(template: ElasticTemplate, errorCode: string): void {
+    const { configuration, store } = this.options;
+    for (const job of this.compatible(template)) {
+      const workflowId = (JSON.parse(job.input) as FrozenComfyInput).workflowId;
+      const available = configuration.instances.some(candidate => candidate.workflowIds.includes(workflowId)
+        && !store.instance(candidate.id)?.draining && ['ready', 'busy', 'starting'].includes(store.instance(candidate.id)!.state));
+      if (!available) store.failUnsubmitted(job.id, errorCode, { areaName: template.areaName, gpuModel: template.gpuModel });
+    }
+  }
+
+  private imageRefreshMs(): number {
+    return this.options.configuration.elastic?.imageRefreshMs ?? 300_000;
+  }
+
+  private invalidateImages(): void {
+    // 平台拒绝或回执显示镜像失效时，整表作废；下一轮重新解析最新可用版本。
+    this.images.clear();
+  }
+
+  private async resolveImage(template: ElasticTemplate, skuName: string): Promise<{ id: string; type: '2' | '3' } | undefined> {
+    const { platform } = this.options;
+    const cacheKey = template.imageName === undefined
+      ? 'id:' + template.imageId + '|' + template.imageType
+      : ['name', template.areaName, skuName, template.imageName, template.imageVersion ?? '', template.imageType].join('|');
+    const cached = this.images.get(cacheKey);
+    if (cached && Date.now() - cached.at < this.imageRefreshMs()) return cached.image;
+    try {
+      const image = template.imageName === undefined
+        ? await this.verifyPinnedImage(template)
+        : await this.discoverImage(template, skuName);
+      this.images.set(cacheKey, { at: Date.now(), image });
+      return image;
+    } catch (error) {
+      // 读不到镜像列表时保留上一次结果；没有缓存则让本轮扩容先跳过，避免用过期 ID 反复撞拒绝。
+      if (cached?.image) return cached.image;
+      throw error;
+    }
+  }
+
+  private async verifyPinnedImage(template: ElasticTemplate): Promise<{ id: string; type: '2' | '3' } | undefined> {
+    const id = template.imageId!;
+    if (!this.options.platform.getImage) return { id, type: template.imageType };
+    const image = await this.options.platform.getImage(id, template.imageType);
+    if (!image || image.status !== '1') return undefined;
+    if (image.areaName !== undefined && image.areaName !== template.areaName) return undefined;
+    return { id, type: template.imageType };
+  }
+
+  private async discoverImage(template: ElasticTemplate, skuName: string): Promise<{ id: string; type: '2' | '3' } | undefined> {
+    const images = await this.options.platform.listImages!({ imageType: template.imageType, imageName: template.imageName!,
+      areaName: template.areaName, skuName, ...(template.imageVersion === undefined ? {} : { imageVersion: template.imageVersion }), maxPages: 5 });
+    const matched = images.filter(image => image.name === template.imageName && image.status === '1'
+      && (image.imageType === undefined || image.imageType === template.imageType)
+      && (image.areaName === undefined || image.areaName === template.areaName)
+      && (image.imageVersion === undefined || template.imageVersion === undefined || image.imageVersion === template.imageVersion)
+      && image.comfyPort !== false);
+    if (!matched.length) return undefined;
+    const newest = matched.reduce((left, right) => BigInt(right.id) > BigInt(left.id) ? right : left);
+    return { id: newest.id, type: template.imageType };
   }
 
   private async register(resource: ComfyResource, template: ElasticTemplate, observed?: AigateInstance): Promise<void> {
@@ -210,13 +304,23 @@ export class ComfyLifecycle {
     this.options.assertWorker();
     if (metadata.id !== resource.instance_id) throw { code: 'RESOURCE_ID_MISMATCH' };
     this.options.store.observeResource(resource.key, metadata.operationStatus ?? metadata.status);
-    if (metadata.id !== resource.instance_id || metadata.areaName !== template.areaName || metadata.imageId !== template.imageId
-      || metadata.imageType !== template.imageType || metadata.count !== 1) throw { code: 'ELASTIC_METADATA_UNVERIFIED' };
+    const expectedImageId = resource.image_id ?? template.imageId;
+    const expectedImageType = resource.image_type ?? template.imageType;
+    const expectedArea = resource.area_name ?? template.areaName;
+    const areaName = expectedArea === '华东一区' || expectedArea === '华东二区' ? expectedArea : undefined;
+    if (metadata.id !== resource.instance_id || metadata.areaName !== expectedArea || !areaName
+      || (expectedImageId !== undefined && expectedImageId !== null && metadata.imageId !== expectedImageId)
+      || (expectedImageType !== undefined && expectedImageType !== null && metadata.imageType !== expectedImageType)
+      || metadata.count !== 1) throw { code: 'ELASTIC_METADATA_UNVERIFIED' };
     const candidates = metadata.services.filter(item => /^(?:https?)$/i.test(item.protocol ?? '') && item.httpType === '1' && item.port === 8188);
     const service = candidates.length === 1 ? candidates[0] : undefined;
     if (!service) throw { code: 'ELASTIC_ENDPOINT_PENDING' };
     const baseUrl = this.endpoint(service);
-    const configuration: InstanceConfiguration = { id: metadata.id, baseUrl, areaName: template.areaName, gpuModel: template.gpuModel,
+    const skuName = resource.sku_name ?? template.skuName ?? templateSkus(template)[0];
+    const models = skuName ? skuModelAliases(skuName) : (template.gpuModel ? [template.gpuModel] : []);
+    const configuration: InstanceConfiguration = { id: metadata.id, baseUrl, areaName,
+      ...(models.length ? { gpuModel: models[0], ...(models.length > 1 ? { gpuModels: models } : {}) }
+        : template.gpuModel ? { gpuModel: template.gpuModel } : {}),
       workflowIds: template.workflowIds, headers: {}, lifecycle: { allowRelease: template.allowRelease, rebuildVerified: template.rebuildVerified,
         hourlyCost: resource.hourly_cost, storageHourlyCost: resource.storage_hourly_cost } };
     if (this.options.configuration.instances.some(instance => instance.id === metadata.id)) throw { code: 'ELASTIC_INSTANCE_COLLISION' };

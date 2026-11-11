@@ -47,10 +47,21 @@ elastic 默认不配置/不启用。启用必须提供：
 
 1. maxInstances 和创建冷却；实例总数及并发上限均最多100。maxHourlyCost 可选；不配置时只按实例数量限制容量。
 2. 配置 maxHourlyCost 时，每个现有实例必须提供 lifecycle.hourlyCost、storageHourlyCost。费率未知时返回 COMFY_COST_UNKNOWN，禁止自动租新机器，不把未知费率当零。
-3. 至少一个已验证模板：id、areaName、gpuModel、imageId、imageType、skuName、skuPriceToHourlyFactor、skuPriceUnitVerified、workflowIds、hourlyCost、storageHourlyCost、rebuildVerified、allowRelease。
+3. 至少一个已验证模板：id、areaName、imageType、imageId 或 imageName、skuName 或 skuNames、skuPriceToHourlyFactor、skuPriceUnitVerified、workflowIds、storageHourlyCost、rebuildVerified、allowRelease。`gpuModel` 与 `hourlyCost` 可选：机型由实际租到的 SKU 决定，费用按平台实时 SKU 单价 × 换算系数计算。
 4. imageId 是保留精度的十进制 int64 字符串；imageType 仅官方的 "2"/"3"；创建使用 skuName，而不是臆造 skuId。单次只创建一台单GPU实例。
 
 按可分配、未绑定的排队工作量以及估计任务耗时计算目标容量；已绑定上传等待、结果收取不单独触发新增实例。容量足够、处于冷却、存在 creating/blocked/releasing 资源，或配置了金额预算且预算不足时不创建。无ID的 uncertain 创建占用一个潜在实例名额，并计入计算/存储预算，但不当作可用容量满足任务需求，不再全局阻断其他排队需求的扩容。官方没有明确SKU price字段的单位映射，必须由运营方核实并显式设置 skuPriceUnitVerified=true 和 skuPriceToHourlyFactor，不能默认字段就是每小时单价。每次创建前读取对应区域的官方SKU列表，使用已核实的换算系数核对型号和价格不超过模板上限。配置金额预算时，保守预留全部登记实例的计算及存储费率，包括停机实例可能重新开机的计算费用；未配置时不执行金额预算检查。
+
+### 镜像自动跟随与机型白名单
+
+发布者会在工坊直接更新镜像（保存为新版本并删除旧 worksId）。模板写死 imageId 时，旧 ID 被删除后新租会得到平台业务拒绝，`COMFY_INSTANCE_CREATE_REJECTED` 会把排队任务直接判失败（2026-11-11 的 `Minimax-H3-字字动画` 从 v0.8.x 升到 v0.8.9 即为此因）。
+
+- **按名字跟随**：模板配置 `imageName`（精确匹配，不是模糊搜索）后，每次扩容前用 `image/page` 查最新可用版本，取 `status="1"`、区域/类型匹配、`servicePort` 含 HTTP 8188 的最大 worksId；可加 `imageVersion` 锁死版本。列表结果按 `elastic.imageRefreshMs`（默认 300000ms）缓存。
+- **固定 ID 仍可用**：只配 `imageId` 时，创建前用 `image/get` 预检；镜像不存在则本轮跳过该模板，任务保持排队而不是失败。
+- **拒绝后自愈**：创建被 `IMAGE_UNAVAILABLE` 分类拒绝（平台消息含镜像不存在/已删除，或 start 返回“数据不存在”）时清空镜像缓存，跳过该模板并在下一轮重新解析，不把任务判死；账户余额类拒绝仍立即结束相关任务。
+- **机型白名单**：`skuNames` 按优先级列出可租型号，调度只选 `skuList` 中当前有货的第一个；售罄/下架自动跳过。`gpuModel` 由实际 SKU 推导（`4090D` 同时接受 `4090`），用于原生 GPU 名称校验；无法识别的型号不做型号断言。
+- **钉住创建事实**：`comfy_resources` 记录创建时的 `image_id/image_type/sku_name/area_name`，登记与对账按这份快照核对，模板后续跟随新版本不影响已租实例。
+- 自助拷贝：验证新镜像后可用 `image/save` 把运行实例保存为个人镜像（imageType 3），再按名字跟随自己的版本，发布者更新就不会打断本池。
 
 新增容量不超过实际可分配的任务数；SKU查询返回后再次核对队列和现有容量，避免等待报价期间任务已被其他实例处理，仍按旧需求租机。新资源注册后若平台已在启动或运行，继续探活至可分配，即使原队列已经消失也不遗漏启动检查；无任务时随后按业务闲置策略回收。
 

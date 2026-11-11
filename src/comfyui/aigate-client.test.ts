@@ -1043,3 +1043,83 @@ describe('AigateClient', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe('AigateClient image discovery', () => {
+  const record = { worksId: '1172671954467557376', name: 'Minimax-H3-字字动画', status: '1', areaName: '华东一区', imageType: '2',
+    imageVersion: 'v0.8.9', size: '60011053056', imageChargeInfo: { chargeType: '1', price: '10' },
+    servicePort: [{ port: 8188, protocol: 'HTTP', protocolName: 'HTTP 8188' }, { port: 22, protocol: 'TCP' }] };
+
+  it('pages community images by exact name and preserves an unquoted int64 worksId', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      JSON.stringify({ code: 0, data: { total: 1, records: [record] } })
+        .replace('"worksId":"1172671954467557376"', '"worksId":1172671954467557376')));
+    const client = new AigateClient({ token, fetch: fetchMock });
+    await expect(client.listImages({ imageType: '2', imageName: record.name, areaName: '华东一区', skuName: '5090-32GB' }))
+      .resolves.toEqual([{ id: '1172671954467557376', name: record.name, status: '1', areaName: '华东一区', imageType: '2',
+        imageVersion: 'v0.8.9', size: '60011053056', price: '10', chargeType: '1', comfyPort: true }]);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe('https://waas.aigate.cc/api/openapi/image/page');
+    expect(init).toMatchObject({ method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' } });
+    expect(JSON.parse(String(init?.body))).toEqual({ current: 1, pageSize: 20, imageType: '2',
+      areaName: '华东一区', skuName: '5090-32GB', imageName: record.name });
+  });
+
+  it('pages personal images without community filters until the total is covered', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { current: number };
+      return Response.json({ code: 0, data: { total: 21, records: Array.from({ length: body.current === 1 ? 20 : 1 },
+        (_, index) => ({ ...record, worksId: String(1000 + body.current * 10 + index), imageVersion: undefined })) } });
+    });
+    const client = new AigateClient({ token, fetch: fetchMock });
+    const images = await client.listImages({ imageType: '3', imageName: 'our-copy' });
+    expect(images).toHaveLength(21);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(fetchMock.mock.calls[1]![1]?.body))).toMatchObject({ current: 2, pageSize: 20, imageType: '3' });
+  });
+
+  it('returns undefined when a pinned image no longer exists', async () => {
+    const { client, fetchMock } = setup({ code: 1, msg: '数据不存在', data: null });
+    await expect(client.getImage('1164259372090134528', '2')).resolves.toBeUndefined();
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe('https://waas.aigate.cc/api/openapi/image/get');
+    expect(String(init?.body)).toBe('{"imageType":"2","imageId":1164259372090134528}');
+  });
+
+  it('keeps malformed image responses and transport failures visible', async () => {
+    const malformed = setup({ code: 0, data: { worksId: '1', status: '1' } });
+    await expect(malformed.client.getImage('1', '2')).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+    const http = setup({ code: 0, data: record }, 502);
+    await expect(http.client.getImage('1', '2')).rejects.toMatchObject({ code: 'HTTP_ERROR' });
+  });
+
+  it.each([
+    { imageType: '1' as '2', imageName: 'x', areaName: '华东一区', skuName: '5090-32GB' },
+    { imageType: '2' as const, imageName: 'x', skuName: '5090-32GB' },
+    { imageType: '2' as const, imageName: 'x', areaName: '华东一区' },
+    { imageType: '2' as const, imageName: ' ' , areaName: '华东一区', skuName: '5090-32GB' },
+    { imageType: '3' as const, imageName: 'x', maxPages: 0 },
+    { imageType: '3' as const, imageName: 'x', maxPages: 11 },
+  ])('rejects invalid image queries before transport %#', async query => {
+    const { client, fetchMock } = setup();
+    await expect(client.listImages(query as never)).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['镜像不存在', '镜像已删除', 'image not found', '镜像不可用'])(
+    'classifies a stale image rejection as an image problem instead of an account problem: %s', async msg => {
+      const { client } = setup({ code: 1, msg });
+      const error = await client.createInstance({ areaName: '华东一区', count: 1, skuName: '5090-32GB', imageId: '123', imageType: '2' })
+        .catch(error => error);
+      expect(error).toMatchObject({ code: 'BUSINESS_REJECTED', reason: 'IMAGE_UNAVAILABLE', uncertain: false });
+      expect(JSON.stringify(error)).not.toContain(msg);
+    }
+  );
+
+  it('treats a generic creation data-not-found response as an image problem', async () => {
+    const { client } = setup({ code: 1, msg: '数据不存在' });
+    await expect(client.createInstance({ areaName: '华东一区', count: 1, skuName: '5090-32GB', imageId: '123', imageType: '2' }))
+      .rejects.toMatchObject({ code: 'BUSINESS_REJECTED', reason: 'IMAGE_UNAVAILABLE' });
+    const existing = setup({ code: 1, msg: '数据不存在' });
+    await expect(existing.client.getInstance(instanceId)).rejects.toMatchObject({ code: 'BUSINESS_REJECTED' });
+  });
+});

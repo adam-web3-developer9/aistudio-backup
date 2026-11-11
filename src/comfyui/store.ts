@@ -37,6 +37,8 @@ export interface ComfyResource {
   key: string; name: string; state: 'creating' | 'uncertain' | 'registered' | 'releasing' | 'released' | 'blocked';
   instance_id: string | null; configuration: string | null; template_id: string;
   hourly_cost: number; storage_hourly_cost: number; created_at: number; updated_at: number; error_code: string | null;
+  // 创建时实际提交给平台的镜像/机型，用来核对平台回执，避免模板自动更新后被误判为不匹配。
+  image_id?: string | null; image_type?: string | null; sku_name?: string | null; area_name?: string | null;
 }
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -64,7 +66,8 @@ export class ComfyStore {
       CREATE TABLE IF NOT EXISTS comfy_worker (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS comfy_resources (
         key TEXT PRIMARY KEY, name TEXT NOT NULL, state TEXT NOT NULL, instance_id TEXT, configuration TEXT, template_id TEXT NOT NULL,
-        hourly_cost REAL NOT NULL, storage_hourly_cost REAL NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, error_code TEXT
+        hourly_cost REAL NOT NULL, storage_hourly_cost REAL NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, error_code TEXT,
+        image_id TEXT, image_type TEXT, sku_name TEXT, area_name TEXT
       );
       CREATE TABLE IF NOT EXISTS comfy_resource_observations (
         resource_key TEXT PRIMARY KEY, status TEXT NOT NULL, observed_at INTEGER NOT NULL
@@ -84,6 +87,7 @@ export class ComfyStore {
       comfy_jobs: { direct_inputs: 'TEXT', result_wake_requested: 'INTEGER NOT NULL DEFAULT 0', result_checked_at: 'INTEGER', finished_at: 'INTEGER', collected_at: 'INTEGER',
         upload_reservations: 'INTEGER NOT NULL DEFAULT 0', eligible_at: 'INTEGER', queue_deadline: 'INTEGER', reservation_started_at: 'INTEGER', native_checkpoint: 'TEXT' },
       comfy_instances: { capacity_started_at: 'INTEGER', next_action_at: 'INTEGER', idle_policy_applied_at: 'INTEGER', idle_since: 'INTEGER', stopped_at: 'INTEGER' },
+      comfy_resources: { image_id: 'TEXT', image_type: 'TEXT', sku_name: 'TEXT', area_name: 'TEXT' },
       comfy_result_archives: { storage_identity: "TEXT NOT NULL DEFAULT ''" },
     })) {
       const existing = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name));
@@ -273,11 +277,12 @@ export class ComfyStore {
   saveResource(row: ComfyResource): void {
     const configuration = row.configuration === null ? null : JSON.stringify(JSON.parse(row.configuration),
       (key, value: unknown) => /token|authorization|password|secret|headers|api.?key/i.test(key) ? undefined : value);
-    this.db.prepare(`INSERT INTO comfy_resources(key,name,state,instance_id,configuration,template_id,hourly_cost,storage_hourly_cost,created_at,updated_at,error_code)
-      VALUES(@key,@name,@state,@instance_id,@configuration,@template_id,@hourly_cost,@storage_hourly_cost,@created_at,@updated_at,@error_code)
+    this.db.prepare(`INSERT INTO comfy_resources(key,name,state,instance_id,configuration,template_id,hourly_cost,storage_hourly_cost,created_at,updated_at,error_code,image_id,image_type,sku_name,area_name)
+      VALUES(@key,@name,@state,@instance_id,@configuration,@template_id,@hourly_cost,@storage_hourly_cost,@created_at,@updated_at,@error_code,@image_id,@image_type,@sku_name,@area_name)
       ON CONFLICT(key) DO UPDATE SET name=excluded.name,state=excluded.state,instance_id=excluded.instance_id,configuration=excluded.configuration,
         template_id=excluded.template_id,hourly_cost=excluded.hourly_cost,storage_hourly_cost=excluded.storage_hourly_cost,
-        updated_at=excluded.updated_at,error_code=excluded.error_code`).run({ ...row, configuration });
+        updated_at=excluded.updated_at,error_code=excluded.error_code,image_id=excluded.image_id,image_type=excluded.image_type,
+        sku_name=excluded.sku_name,area_name=excluded.area_name`).run({ image_id: null, image_type: null, sku_name: null, area_name: null, ...row, configuration });
   }
   queued(): ComfyJob[] { return this.db.prepare("SELECT * FROM comfy_jobs WHERE stage='queued' ORDER BY created_at,id").all() as ComfyJob[]; }
 }

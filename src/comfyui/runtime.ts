@@ -51,14 +51,15 @@ export function createComfyService(options: ComfyRuntimeOptions & {
     },
   } : undefined;
   const clients = new Map(options.configuration.instances.map(instance => [instance.id,
-    new ComfyClient({ baseUrl: instance.baseUrl, headers: instance.headers, fetch: options.fetch, allowedGpuModels: instance.gpuModel ? [instance.gpuModel] : ['5090', '4090'] })]));
+    new ComfyClient({ baseUrl: instance.baseUrl, headers: instance.headers, fetch: options.fetch,
+      allowedGpuModels: instance.gpuModels ?? (instance.gpuModel ? [instance.gpuModel] : undefined) })]));
   return new ComfyService({
     store, configuration: options.configuration, platform,
     client: instance => {
       let client = clients.get(instance.id);
       if (!client) {
         client = new ComfyClient({ baseUrl: instance.baseUrl, headers: instance.headers, fetch: options.fetch,
-          allowedGpuModels: instance.gpuModel ? [instance.gpuModel] : ['5090', '4090'] });
+          allowedGpuModels: instance.gpuModels ?? (instance.gpuModel ? [instance.gpuModel] : undefined) });
         clients.set(instance.id, client);
       }
       return client;
