@@ -1063,6 +1063,38 @@ describe('ComfyLifecycle idle and release safety', () => {
     expect(context.platform.releaseInstance).toHaveBeenCalledTimes(1);
   });
 
+  it('returns an unneeded capacity wait to stopped retention and releases it when due', async () => {
+    const context = releasableFixture();
+    context.configuration.elastic!.stoppedRetention = { maxInstances: 0, excessReleaseAfterMs: 60_000 };
+    context.store.updateInstance('1', { state: 'waiting_capacity', stopped_at: clock - 60_000,
+      capacity_started_at: clock - 30_000, next_action_at: clock + 30_000 });
+    await context.lifecycle.tick();
+    expect(context.store.instance('1')).toMatchObject({ state: 'offline', stopped_at: clock - 60_000,
+      capacity_started_at: null, next_action_at: null });
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+    await context.lifecycle.tick();
+    expect(context.platform.releaseInstance).toHaveBeenCalledExactlyOnceWith('1');
+  });
+
+  it.each(['queued', 'pending result', 'running platform', 'new demand'])('protects a capacity wait with %s', async reason => {
+    const context = releasableFixture();
+    context.store.updateInstance('1', { state: 'waiting_capacity', stopped_at: clock - 3_600_000 });
+    if (reason === 'queued') context.submit();
+    if (reason === 'pending result') {
+      const job = context.submit();
+      context.store.updateInstance('1', { state: 'ready' });
+      context.store.claim('1', ['render'], clock);
+      context.store.updateJob(job.id, { stage: 'succeeded', result_pending: 1, result: '{}' });
+      context.store.releaseSlot(job.id);
+      context.store.updateInstance('1', { state: 'waiting_capacity' });
+    }
+    if (reason === 'running platform') context.platform.getInstanceStatus.mockResolvedValue('2');
+    if (reason === 'new demand') context.platform.getInstanceStatus.mockImplementation(async () => { context.submit(); return '22'; });
+    await context.lifecycle.tick();
+    expect(context.store.instance('1')?.state).toBe('waiting_capacity');
+    expect(context.platform.releaseInstance).not.toHaveBeenCalled();
+  });
+
   it('retains only the newest stopped instance and releases excess after one minute, not five', async () => {
     const context = unifiedReleaseFixture();
     context.configuration.elastic!.releaseAfterMs = 1_800_000;

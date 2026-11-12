@@ -412,7 +412,20 @@ export class ComfyLifecycle {
     const { store, platform } = this.options;
     if (await this.retireFailedWork(configuration)) return;
     let instance = store.instance(configuration.id)!;
-    if (instance.state === 'closing' || instance.state === 'starting' || instance.state === 'waiting_capacity' || instance.draining) return;
+    if (instance.state === 'closing' || instance.state === 'starting' || instance.draining) return;
+    if (instance.state === 'waiting_capacity') {
+      if (store.hasUnresolvedWork(instance.id) || this.compatible(configuration).length) return;
+      const status = await platform.getInstanceStatus(instance.id);
+      this.options.assertWorker();
+      instance = store.instance(configuration.id)!;
+      if (instance.state === 'waiting_capacity' && !instance.draining && ['22', '26'].includes(status)
+        && !store.hasUnresolvedWork(instance.id) && !this.compatible(configuration).length) {
+        // Recompute stopped retention on the next tick before deciding whether to release.
+        store.updateInstance(instance.id, { state: 'offline', stopped_at: instance.stopped_at ?? Date.now(),
+          capacity_started_at: null, next_action_at: null, error_code: null });
+      }
+      return;
+    }
     if (store.terminalSlot(instance.id)) {
       const status = await platform.getInstanceStatus(instance.id);
       this.options.assertWorker();
