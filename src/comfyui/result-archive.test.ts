@@ -266,14 +266,31 @@ describe('GPU result archive fallback', () => {
     else context.exporter[method].mockRejectedValue(new Error('private URL must not leak'));
     context.advance(600_000);
     for (let attempt = 0; attempt < 6; attempt++) { await context.run(); context.advance(60_000); }
-    expect(context.service.archive!.get(job.id)).toMatchObject({ state: 'failed', attempts: 3, error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED' });
+    expect(context.service.archive!.get(job.id)).toMatchObject({ state: 'failed', attempts: 4, error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED' });
     expect(context.store.get(job.id)).toMatchObject({ stage: 'failed', error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED',
       result: null, result_pending: 0, result_wake_requested: 0, collected_at: null });
     expect(context.store.hasUnresolvedWork('1')).toBe(false);
     expect(context.platform.closeInstance).toHaveBeenCalled();
     expect(context.service.publicJob(context.service.get(job.id))).toMatchObject({ status: 'failed', error: { code: 'COMFY_ARCHIVE_TRANSFER_FAILED' } });
     expect(context.service.publicJob(context.service.get(job.id)).result).toBeUndefined();
-    expect(context.exporter.upload.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(context.exporter.upload.mock.calls.length).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps retrying transient GPU/SSH unavailability instead of abandoning the paid result', async () => {
+    const context = fixture();
+    const job = context.succeed();
+    const unavailable = Object.assign(new Error('gpu export unavailable'), { code: 'COMFY_ARCHIVE_GPU_UNAVAILABLE' });
+    context.exporter.describe.mockRejectedValue(unavailable);
+    context.advance(600_000);
+    await context.run();
+    for (let attempt = 0; attempt < 4; attempt++) { context.advance(300_000); await context.run(); }
+    expect(context.service.archive!.get(job.id)).toMatchObject({ state: 'pending', attempts: 5, error_code: 'COMFY_ARCHIVE_TRANSFER_FAILED' });
+    expect(context.store.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 1 });
+    context.exporter.describe.mockResolvedValue(file);
+    context.advance(300_000);
+    await context.run();
+    expect(context.store.get(job.id)).toMatchObject({ stage: 'succeeded', result_pending: 0 });
+    expect(context.service.archive!.get(job.id)?.state).toBe('stored');
   });
 
   it.each(['size', 'md5', 'sha256'] as const)('does not trust an object with the wrong %s', async field => {

@@ -23,6 +23,20 @@ export interface ResultArchiveRecord {
 }
 const waitMs = 600_000;
 const retentionMs = 86_400_000;
+const maxAttempts = 8;
+const deterministicAttempts = 3;
+// The SSH/GPU export channel is temporarily unavailable while an instance is
+// loading the next workflow or while the platform is re-registering its tools.
+// That is recoverable, unlike a changed or invalid result file, so keep retrying
+// with backoff instead of abandoning a paid result after a few seconds.
+const transientCode = 'COMFY_ARCHIVE_GPU_UNAVAILABLE';
+function attemptLimit(error: unknown): number {
+  const value = error as { code?: unknown } | null;
+  return typeof value?.code === 'string' && value.code === transientCode ? maxAttempts : deterministicAttempts;
+}
+function retryDelay(attempts: number): number {
+  return Math.min(300_000, 15_000 * 2 ** Math.max(0, attempts - 1));
+}
 
 export function validArchiveFile(file: ArchiveFile): boolean {
   return Number.isSafeInteger(file.size) && file.size > 0 && file.size <= 5 * 1024 ** 3
@@ -101,6 +115,7 @@ export class ComfyResultArchive {
   }
   private async process(row: ResultArchiveRecord): Promise<void> {
     let phase = 'archive_describe';
+    const attempts = Math.min(maxAttempts, row.attempts + 1);
     try {
       this.assertWorker();
       if (row.state === 'stored' || row.state === 'skipped' || row.state === 'failed') {
@@ -116,13 +131,13 @@ export class ComfyResultArchive {
           expires_at: row.file ? Date.now() + retentionMs : null, next_at: Date.now() + retentionMs });
         return;
       }
-      this.patch(row.job_id, { state: 'transferring', attempts: Math.min(3, row.attempts + 1) });
+      this.patch(row.job_id, { state: 'transferring', attempts: attempts });
       if (row.file) phase = 'archive_head';
       let file = row.file ? JSON.parse(row.file) as ArchiveFile : undefined;
       let object = file ? await this.options.storage.head(row.object_key) : null;
       this.assertWorker();
       if (!object) {
-        if (row.attempts >= 3) throw new Error('Archive attempts exhausted');
+        if (row.attempts >= maxAttempts) throw new Error('Archive attempts exhausted');
         phase = 'archive_describe';
         const exporter = this.options.exporter(row.instance_id);
         const output = JSON.parse(row.output) as ComfyOutput;
@@ -165,11 +180,11 @@ export class ComfyResultArchive {
       if (this.signal.aborted) return;
       try { this.assertWorker(); } catch { return; }
       const cleanup = ['stored', 'skipped', 'failed'].includes(row.state);
-      const failed = !cleanup && row.attempts >= 3;
+      const failed = !cleanup && row.attempts >= attemptLimit(error);
       this.store.db.transaction(() => {
         this.patch(row.job_id, { state: cleanup ? row.state : failed ? 'failed' : 'pending',
           ...(failed && this.get(row.job_id)?.file ? { expires_at: Date.now() + retentionMs } : {}),
-          next_at: Date.now() + 60_000, error_code: cleanup ? 'COMFY_ARCHIVE_DELETE_FAILED' : 'COMFY_ARCHIVE_TRANSFER_FAILED' },
+          next_at: Date.now() + (cleanup || failed ? 60_000 : retryDelay(row.attempts + 1)), error_code: cleanup ? 'COMFY_ARCHIVE_DELETE_FAILED' : 'COMFY_ARCHIVE_TRANSFER_FAILED' },
         { upstreamCode: phase, errorType: safeErrorType(error) });
         if (failed) this.abandonResult(row);
       })();
