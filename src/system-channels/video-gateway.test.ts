@@ -76,6 +76,19 @@ test('persistent resource ownership isolates system jobs and keys, with a live a
   expect(JSON.stringify(db.prepare('SELECT * FROM video_gateway_jobs').all())).not.toContain(key);
 });
 
+test('expired upload ownership is removed without deleting retained uploads or job provenance', () => {
+  const db = new Database(':memory:'); cleanup.push(() => db.close());
+  const records = new ManagedVideoGatewayRecords(new ChannelStore(db), key);
+  records.ownAsset('asset-expired'); records.ownAsset('asset-fresh'); records.ownJob(job().id);
+  const rotated = new ManagedVideoGatewayRecords(new ChannelStore(db), key + '-rotated');
+  rotated.ownAsset('asset-old-key-expired');
+  expect(records.pruneAssets(id => id === 'asset-fresh')).toBe(2);
+  expect(rotated.hasAsset('asset-old-key-expired')).toBe(false);
+  expect(records.hasAsset('asset-expired')).toBe(false);
+  expect(records.hasAsset('asset-fresh')).toBe(true);
+  expect(records.hasJob(job().id)).toBe(true);
+});
+
 test('job projection returns only video result and safe progress and error fields', () => {
   const videoUrl = 'https://video.miora.design/result.mp4?signature=preserved';
   const projected = projectGatewayJob(job({ status: 'failed', options: { modelId: 'private-option' }, result: { videoUrl, authToken: key, path: 'C:\\private\\asset', output: { cookie: key } },

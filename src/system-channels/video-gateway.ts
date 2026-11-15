@@ -65,6 +65,16 @@ export class ManagedVideoGatewayRecords {
   hasAsset(id: string): boolean {
     return resourceId.test(id) && !!this.channels.db.prepare('SELECT 1 FROM video_gateway_assets WHERE asset_id=? AND key_hash=?').get(id, this.keyHash);
   }
+  pruneAssets(available: (id: string) => boolean): number {
+    const rows = this.channels.db.prepare('SELECT asset_id FROM video_gateway_assets').all() as { asset_id: string }[];
+    return this.channels.db.transaction(() => {
+      let removed = 0;
+      for (const row of rows) if (!available(row.asset_id)) {
+        removed += this.channels.db.prepare('DELETE FROM video_gateway_assets WHERE asset_id=?').run(row.asset_id).changes;
+      }
+      return removed;
+    })();
+  }
   ownJob(id: string): void {
     if (!gatewayJobId.test(id)) throw new SystemError(400, 'GATEWAY_JOB_INVALID', 'Gateway job ID is invalid');
     this.channels.db.prepare('INSERT OR IGNORE INTO video_gateway_jobs(job_id,key_hash) VALUES(?,?)').run(id, this.keyHash);

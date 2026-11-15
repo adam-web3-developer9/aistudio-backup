@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AssetRecord } from '../types.js';
 
 const META_SUFFIX = '.meta.json';
+export const UPLOAD_RETENTION_MS = 24 * 60 * 60_000;
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   '.png': 'image/png',
@@ -39,7 +40,9 @@ export class AssetStore {
       if (!id.startsWith('asset_')) continue;
       const filePath = path.join(this.directory, entry);
       try {
-        const record = await this.readMeta(id) ?? await describeFile(id, entry, filePath);
+        const metadata = await this.readMeta(id);
+        const record = metadata && Number.isFinite(Date.parse(metadata.createdAt))
+          ? metadata : await describeFile(id, entry, filePath);
         // The data directory may have moved; the file we just found is the truth.
         this.assets.set(id, { ...record, id, path: filePath });
       } catch (error) {
@@ -75,12 +78,53 @@ export class AssetStore {
   }
 
   get(id: string): AssetRecord | undefined {
-    return this.assets.get(id);
+    const asset = this.assets.get(id);
+    return asset && Date.now() - Date.parse(asset.createdAt) < UPLOAD_RETENTION_MS ? asset : undefined;
   }
 
   async read(id: string): Promise<Buffer | undefined> {
-    const asset = this.assets.get(id);
+    const asset = this.get(id);
     return asset ? readFile(asset.path) : undefined;
+  }
+
+  /** Uploads expire after 24 hours even when an old job still references them. */
+  async prune(now = Date.now()): Promise<{ assets: number; metadata: number; bytes: number }> {
+    const removed = { assets: 0, metadata: 0, bytes: 0 };
+    for (const asset of this.assets.values()) {
+      if (now - Date.parse(asset.createdAt) < UPLOAD_RETENTION_MS) continue;
+      try {
+        const info = await stat(asset.path).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
+        });
+        await unlink(asset.path).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        });
+        this.assets.delete(asset.id);
+        if (info) { removed.assets++; removed.bytes += info.size; }
+        await unlink(this.metaPath(asset.id)).then(() => { removed.metadata++; }).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        });
+      } catch (error) {
+        this.options.onError?.(error, path.basename(asset.path));
+      }
+    }
+    // A previous cleanup/crash may have removed the bytes but left their sidecar.
+    for (const entry of await readdir(this.directory)) {
+      if (!entry.startsWith('asset_') || !entry.endsWith(META_SUFFIX)) continue;
+      const id = entry.slice(0, -META_SUFFIX.length);
+      if (this.assets.has(id)) continue;
+      try {
+        const file = this.metaPath(id);
+        const info = await stat(file);
+        if (now - info.mtimeMs < UPLOAD_RETENTION_MS) continue;
+        await unlink(file);
+        removed.metadata++;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.options.onError?.(error, entry);
+      }
+    }
+    return removed;
   }
 
   private async readMeta(id: string): Promise<AssetRecord | undefined> {
@@ -108,7 +152,7 @@ async function describeFile(id: string, fileName: string, filePath: string): Pro
     mimeType: MIME_BY_EXTENSION[extension] ?? 'application/octet-stream',
     size: info.size,
     path: filePath,
-    createdAt: (info.birthtime.getTime() > 0 ? info.birthtime : info.mtime).toISOString()
+    createdAt: info.mtime.toISOString()
   };
 }
 

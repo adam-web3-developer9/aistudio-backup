@@ -633,6 +633,6 @@ DreamMaker 也按秒计价，但单价随**模型和清晰度**变（500–3750 
 | `DREAMMAKER_PROXY_URL` | — | 一般不用：平台是国内站，默认直连 |
 | `CREDITS_CACHE_TTL_MS` | `60000` | 余额缓存时间 |
 | `MAX_UPLOAD_BYTES` | `10485760` | 上传大小上限 |
-| `DATA_DIR` | `./data` | 素材与 session 落盘目录 |
+| `DATA_DIR` | `./data` | 素材与 session 落盘目录。`uploads` 中上传素材固定保留 24 小时，过期立即不可使用，启动及每 15 分钟清理文件、元数据和网关素材归属索引；任务引用不延长保留期，需重新上传。旧版无元数据素材按文件最后写入时间计时。此规则与任务记录 `JOB_RETENTION_DAYS` 独立。 |
 
 生成任务走纯 HTTP 直连海螺，**不需要 Playwright 浏览器**。`BROWSER_POOL_SIZE` / `BROWSER_HEADLESS` 只影响旧的浏览器自动化路径。

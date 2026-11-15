@@ -1057,6 +1057,16 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   await pruneJobs();
   const pruneTimer = setInterval(() => void pruneJobs(), 60 * 60_000);
   pruneTimer.unref();
+  const pruneUploads = async () => {
+    try {
+      const removed = await assets.prune();
+      const references = gateway?.pruneAssets(id => !!assets.get(id)) ?? 0;
+      if (removed.assets || removed.metadata || references) app.log.info({ ...removed, references, retentionHours: 24 }, 'Pruned expired uploads');
+    } catch (error) { app.log.warn({ err: error }, 'Upload pruning failed'); }
+  };
+  await pruneUploads();
+  const uploadPruneTimer = setInterval(() => void pruneUploads(), 15 * 60_000);
+  uploadPruneTimer.unref();
 
   await app.register(multipart, {
     limits: { files: 1, fileSize: config.maxUploadBytes, fields: 5 }
@@ -1710,6 +1720,7 @@ app.get('/v1/jobs/:id/result', async (request, reply) => {
     if(managedAccountTimer)clearInterval(managedAccountTimer);
     await managedAccountOperations?.close();
     clearInterval(pruneTimer);
+    clearInterval(uploadPruneTimer);
     await browsers.close();
     await jobs.flush();
     } finally { mioraDiagnosticSink.flush(); }
