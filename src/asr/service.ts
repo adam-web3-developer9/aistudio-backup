@@ -41,9 +41,10 @@ const workerSchema = z.object({
 });
 type WorkerReceipt = z.infer<typeof workerSchema>;
 const preparationBudgetMs = 600_000;
-const minUploadBudgetMs = 120_000;
+const minUploadBudgetMs = 35_000;
 const maxUploadBudgetMs = 600_000;
-const uploadBudgetBytesPerSecond = 96 * 1024;
+const uploadHandoffMs = 8_000;
+const uploadBudgetBytesPerSecond = 384 * 1024;
 const schedulerIntervalMs = 1_000;
 const capacityRetryMs = 60_000;
 const activeStages = "('preparing','awaiting_upload','submitting','running')";
@@ -242,7 +243,7 @@ export class AsrService {
       const now = Date.now();
       const bytes = input.clips.reduce((total, clip) => total + clip.size, 0);
       const uploadBudgetMs = Math.min(maxUploadBudgetMs,
-        Math.max(minUploadBudgetMs, Math.ceil(bytes / uploadBudgetBytesPerSecond) * 1_000));
+        Math.max(minUploadBudgetMs, uploadHandoffMs + Math.ceil(bytes / uploadBudgetBytesPerSecond) * 1_000));
       this.db.prepare(`UPDATE aigate_asr_jobs SET stage='awaiting_upload', token=?, updated_at=?, upload_deadline=?
         WHERE id=? AND stage='preparing'`).run(value.uploadToken, now, now + uploadBudgetMs, active.id);
     } else if (active.stage === 'submitting') {

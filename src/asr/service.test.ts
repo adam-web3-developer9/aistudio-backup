@@ -112,11 +112,13 @@ it('persists the last transcription before requesting shutdown and releases the 
       { id: 'east2', areaName: '华东二区', imageId: '100', skuName: '5090', instanceId: '101' },
     ] },
   } }, 'gateway-key', error => errors.push(error));
-  const job = service.create(asrJobSchema.parse(source)).job;
+  const job = service.create(asrJobSchema.parse({ ...source, clips: [
+    { ...source.clips[0], size: 11_939_688 },
+  ] })).job;
   await service.step();
   expect(service.find(job.id).stage).toBe('awaiting_upload');
   expect(db.prepare('SELECT upload_deadline - updated_at AS budget FROM aigate_asr_jobs WHERE id=?').get(job.id))
-    .toEqual({ budget: 120_000 });
+    .toEqual({ budget: 39_000 });
   expect(closeInstance).not.toHaveBeenCalled();
   service.confirm(job.id);
   await service.step();
