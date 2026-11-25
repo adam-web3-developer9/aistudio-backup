@@ -8,7 +8,7 @@ type NodeState = {
   ssh_started_at: number | null; fingerprint: string | null;
 };
 const reconcileMs = 60_000;
-const observeMs = 5_000;
+const observeMs = 2_000;
 const stopped = new Set(['22', '26']);
 
 function asrEndpoint(metadata: AigateInstance) {

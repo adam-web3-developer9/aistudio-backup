@@ -40,7 +40,11 @@ const workerSchema = z.object({
   error: z.object({ code: z.string(), message: z.string() }).optional(),
 });
 type WorkerReceipt = z.infer<typeof workerSchema>;
-const uploadReservationMs = 600_000;
+const preparationBudgetMs = 600_000;
+const minUploadBudgetMs = 120_000;
+const maxUploadBudgetMs = 600_000;
+const uploadBudgetBytesPerSecond = 96 * 1024;
+const schedulerIntervalMs = 1_000;
 const capacityRetryMs = 60_000;
 const activeStages = "('preparing','awaiting_upload','submitting','running')";
 
@@ -140,7 +144,7 @@ export class AsrService {
       this.tick = this.step().catch(this.onError).finally(() => { this.tick = undefined; });
     };
     run();
-    this.timer = setInterval(run, 2_000);
+    this.timer = setInterval(run, schedulerIntervalMs);
     this.timer.unref();
   }
 
@@ -205,7 +209,7 @@ export class AsrService {
         WHERE id=(SELECT id FROM aigate_asr_jobs WHERE stage='queued' ORDER BY created_at, rowid LIMIT 1)
         AND NOT EXISTS (SELECT 1 FROM aigate_asr_jobs WHERE worker=? AND stage IN ${activeStages})
         AND NOT EXISTS (SELECT 1 FROM aigate_asr_slot_capacity WHERE worker=? AND retry_at>?) RETURNING *`)
-        .get(worker, now, now + uploadReservationMs, worker, worker, now) as Row | undefined;
+        .get(worker, now, now + preparationBudgetMs, worker, worker, now) as Row | undefined;
       if (!active) return;
     }
     if (instanceId || template) {
@@ -236,8 +240,11 @@ export class AsrService {
       });
       if (value.status !== 'awaiting_upload' || !value.uploadToken) throw new Error('ASR worker create response invalid');
       const now = Date.now();
+      const bytes = input.clips.reduce((total, clip) => total + clip.size, 0);
+      const uploadBudgetMs = Math.min(maxUploadBudgetMs,
+        Math.max(minUploadBudgetMs, Math.ceil(bytes / uploadBudgetBytesPerSecond) * 1_000));
       this.db.prepare(`UPDATE aigate_asr_jobs SET stage='awaiting_upload', token=?, updated_at=?, upload_deadline=?
-        WHERE id=? AND stage='preparing'`).run(value.uploadToken, now, now + uploadReservationMs, active.id);
+        WHERE id=? AND stage='preparing'`).run(value.uploadToken, now, now + uploadBudgetMs, active.id);
     } else if (active.stage === 'submitting') {
       try { this.applyReceipt(active, await this.workerReceipt(worker, `${path}/start`, active.id, {})); }
       catch (error) {

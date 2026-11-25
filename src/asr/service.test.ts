@@ -115,6 +115,8 @@ it('persists the last transcription before requesting shutdown and releases the 
   const job = service.create(asrJobSchema.parse(source)).job;
   await service.step();
   expect(service.find(job.id).stage).toBe('awaiting_upload');
+  expect(db.prepare('SELECT upload_deadline - updated_at AS budget FROM aigate_asr_jobs WHERE id=?').get(job.id))
+    .toEqual({ budget: 120_000 });
   expect(closeInstance).not.toHaveBeenCalled();
   service.confirm(job.id);
   await service.step();
