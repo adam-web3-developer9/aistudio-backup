@@ -9,9 +9,12 @@ export const aigateAsrTemplates = z.array(z.object({
   id: z.string().regex(/^[a-zA-Z0-9_-]{1,32}$/),
   areaName: z.enum(['华东一区', '华东二区']),
   imageId: instanceIdSchema,
-  skuName: z.string().min(1),
+  skuName: z.string().min(1).optional(),
+  skuNames: z.array(z.string().min(1)).min(1).optional(),
   instanceId: instanceIdSchema.optional(),
-})).refine(items => new Set(items.map(item => item.id)).size === items.length, 'Duplicate ASR AIGate template');
+}).refine(template => (template.skuName === undefined) !== (template.skuNames === undefined),
+  'ASR AIGate template requires either skuName or skuNames'))
+  .refine(items => new Set(items.map(item => item.id)).size === items.length, 'Duplicate ASR AIGate template');
 
 export type AsrAigateTemplate = z.infer<typeof aigateAsrTemplates>[number];
 export type AsrAigateRental = Pick<AigateClient, 'createInstance' | 'findInstancesByName'>;
@@ -60,11 +63,22 @@ export class AigateAsrTemplates {
       .run(name, now, template.id, now - cooldownMs);
     if (!claimed.changes) return;
     try {
-      const instance = await this.platform.createInstance({
-        areaName: template.areaName, skuName: template.skuName, imageId: template.imageId, imageType: '3',
-        count: 1, instanceName: name,
-      });
-      return this.bind(template.id, name, instance);
+      const skus = template.skuNames ?? [template.skuName!];
+      for (const [index, skuName] of skus.entries()) {
+        try {
+          const instance = await this.platform.createInstance({
+            areaName: template.areaName, skuName, imageId: template.imageId, imageType: '3',
+            count: 1, instanceName: name,
+          });
+          return this.bind(template.id, name, instance);
+        } catch (error) {
+          const failure = error as { code?: string; uncertain?: boolean };
+          // A confirmed capacity rejection leaves no instance. Other replies
+          // end this rental attempt and keep its name for reconciliation.
+          if (failure?.code !== 'CAPACITY_UNAVAILABLE' || failure.uncertain !== false
+              || index === skus.length - 1) throw error;
+        }
+      }
     } catch (error) {
       if ((error as { uncertain?: boolean })?.uncertain === false) {
         this.db.prepare('UPDATE aigate_asr_templates SET request_name=NULL WHERE id=? AND request_name=?')

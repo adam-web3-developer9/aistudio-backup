@@ -19,8 +19,15 @@ def call(path, *, query=None, body=None):
         'Authorization': 'Bearer ' + os.environ['AIGATE_ACCESS_TOKEN'],
         'Content-Type': 'application/json',
     }, data=None if body is None else json.dumps(body).encode())
-    with urllib.request.urlopen(request, timeout=30) as response:
-        value = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            value = json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.load(error)
+        except ValueError:
+            raise RuntimeError(f'{path}: HTTP {error.code}') from None
+        raise RuntimeError(f'{path}: HTTP {error.code}, {detail.get("errCode")} {detail.get("msg")}') from None
     if value['code'] != 0:
         raise RuntimeError(f'{path}: {value.get("errCode")} {value.get("msg")}')
     return value['data']

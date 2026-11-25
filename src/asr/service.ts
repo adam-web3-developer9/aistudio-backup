@@ -41,6 +41,7 @@ const workerSchema = z.object({
 });
 type WorkerReceipt = z.infer<typeof workerSchema>;
 const uploadReservationMs = 600_000;
+const capacityRetryMs = 60_000;
 const activeStages = "('preparing','awaiting_upload','submitting','running')";
 
 export interface AsrOptions {
@@ -73,7 +74,7 @@ export function asrOptionsFromEnv(env = process.env): AsrOptions | undefined {
   const token = env.AIGATE_ACCESS_TOKEN?.trim();
   if (!(ids.length || templates.length)) return { workers: [...new Set(workers)], key };
   if (!token) throw new Error('AIGATE_ACCESS_TOKEN is required for ASR instance power control');
-  const platform = new AigateClient({ token });
+  const platform = new AigateClient({ token, capacityErrorCodes: ['6001'] });
   return { workers: [...new Set(workers)], key, aigate: { ids, platform,
     ...(templates.length ? { elastic: { templates, rental: platform } } : {}) } };
 }
@@ -99,7 +100,8 @@ export class AsrService {
       UNIQUE(owner, request_key)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS aigate_asr_worker_slot ON aigate_asr_jobs(worker)
-      WHERE stage IN ${activeStages};`);
+      WHERE stage IN ${activeStages};
+    CREATE TABLE IF NOT EXISTS aigate_asr_slot_capacity (worker TEXT PRIMARY KEY, retry_at INTEGER NOT NULL);`);
     if (!(db.prepare('PRAGMA table_info(aigate_asr_jobs)').all() as Array<{ name: string }>).some(column => column.name === 'endpoint'))
       db.exec('ALTER TABLE aigate_asr_jobs ADD COLUMN endpoint TEXT');
     if (options.aigate) {
@@ -150,7 +152,7 @@ export class AsrService {
   async step() {
     await this.recoverReleasedReservations();
     this.db.prepare(`UPDATE aigate_asr_jobs SET stage='failed', token=NULL, updated_at=?, error_code='ASR_UPLOAD_TIMEOUT',
-      error_message='ASR upload reservation expired' WHERE stage IN ('preparing','awaiting_upload') AND upload_deadline <= ?`)
+      error_message='ASR upload reservation expired' WHERE stage IN ('queued','preparing','awaiting_upload') AND upload_deadline <= ?`)
       .run(Date.now(), Date.now());
     await Promise.all([
       ...this.options.workers.map(worker => this.stepWorker(worker).catch(this.onError)),
@@ -193,21 +195,24 @@ export class AsrService {
       }
       if (!instanceId && !template && !await this.healthy(worker)) return;
       const now = Date.now();
-      active = this.db.prepare(`UPDATE aigate_asr_jobs SET stage='preparing', worker=?, updated_at=?, upload_deadline=?
+      active = this.db.prepare(`UPDATE aigate_asr_jobs SET stage='preparing', worker=?, updated_at=?,
+        upload_deadline=COALESCE(upload_deadline, ?),error_code=NULL,error_message=NULL
         WHERE id=(SELECT id FROM aigate_asr_jobs WHERE stage='queued' ORDER BY created_at, rowid LIMIT 1)
-        AND NOT EXISTS (SELECT 1 FROM aigate_asr_jobs WHERE worker=? AND stage IN ${activeStages}) RETURNING *`)
-        .get(worker, now, now + uploadReservationMs, worker) as Row | undefined;
+        AND NOT EXISTS (SELECT 1 FROM aigate_asr_jobs WHERE worker=? AND stage IN ${activeStages})
+        AND NOT EXISTS (SELECT 1 FROM aigate_asr_slot_capacity WHERE worker=? AND retry_at>?) RETURNING *`)
+        .get(worker, now, now + uploadReservationMs, worker, worker, now) as Row | undefined;
       if (!active) return;
     }
-    if (template) {
-      instanceId = await this.aigateTemplates!.resolve(template, true, active.stage === 'preparing' && active.endpoint === null);
-      if (!instanceId) return;
-    }
-    if (instanceId) {
+    if (instanceId || template) {
       let endpoint: string | undefined;
       try {
+        if (template) {
+          instanceId = await this.aigateTemplates!.resolve(template, true, active.stage === 'preparing' && active.endpoint === null);
+        }
+        if (!instanceId) return;
         endpoint = await this.aigateNodes!.ready(instanceId, url => this.healthy(url).catch(() => false));
       } catch (error) {
+        if ((error as { code?: string })?.code === 'CAPACITY_UNAVAILABLE' && this.yieldCapacity(active, worker)) return;
         if (!active.endpoint || (active.stage !== 'submitting' && active.stage !== 'running')) throw error;
         endpoint = active.endpoint;
       }
@@ -239,6 +244,20 @@ export class AsrService {
     } else if (active.stage === 'running') {
       this.applyReceipt(active, await this.workerReceipt(worker, path, active.id));
     }
+  }
+
+  private yieldCapacity(active: Row, worker: string) {
+    const now = Date.now();
+    return this.db.transaction(() => {
+      const changed = this.db.prepare(`UPDATE aigate_asr_jobs SET stage='queued', worker=NULL, updated_at=?,
+        error_code='ASR_CAPACITY_UNAVAILABLE',error_message='AIGate GPU capacity unavailable'
+        WHERE id=? AND worker=? AND stage='preparing' AND endpoint IS NULL AND token IS NULL`)
+        .run(now, active.id, worker);
+      if (!changed.changes) return false;
+      this.db.prepare(`INSERT INTO aigate_asr_slot_capacity(worker,retry_at) VALUES (?,?)
+        ON CONFLICT(worker) DO UPDATE SET retry_at=excluded.retry_at`).run(worker, now + capacityRetryMs);
+      return true;
+    })();
   }
 
   private async request(worker: string, path: string, body?: object) {

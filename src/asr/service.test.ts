@@ -1,10 +1,10 @@
 import Database from 'better-sqlite3';
 import Fastify from 'fastify';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { assertVideoGatewayRequest } from '../system-channels/video-gateway.js';
 import { SystemError } from '../system/types.js';
 import { registerAsrRoutes } from './routes.js';
-import { AsrService, asrJobSchema } from './service.js';
+import { AsrService, asrJobSchema, asrOptionsFromEnv } from './service.js';
 
 const dbs: Database.Database[] = [];
 afterEach(() => { for (const db of dbs.splice(0)) db.close(); });
@@ -144,4 +144,65 @@ it('moves only unsubmitted reservations from retired instances to the replacemen
   } });
   expect(service.find(dispatched.id).stage).toBe('preparing');
   expect(rentals).toBe(0);
+});
+
+it.each(['open', 'rent'])('preserves the job and deadline and selects another slot after capacity rejects %s', async (rejected) => {
+  const db = new Database(':memory:');
+  dbs.push(db);
+  const capacity = Object.assign(new Error('AIGate capacity is unavailable'), { code: 'CAPACITY_UNAVAILABLE', uncertain: false });
+  const errors: unknown[] = [];
+  const attempted: string[] = [];
+  let reassignedDeadline: number | undefined;
+  const fetch = (async (raw, init) => {
+    const url = new URL(String(raw));
+    expect(url.hostname).toBe('east1.waas.aigate.cc');
+    if (url.pathname === '/health') return Response.json({ ready: true });
+    const id = JSON.parse(String(init?.body)).id;
+    reassignedDeadline = (db.prepare('SELECT upload_deadline FROM aigate_asr_jobs WHERE id=?').get(id) as { upload_deadline: number }).upload_deadline;
+    return Response.json({ id, status: 'awaiting_upload', uploadToken: 'upload-token' });
+  }) as typeof globalThis.fetch;
+  const platform = {
+    getInstance: async (id: string) => ({ id, status: id === '22' ? '2' : '22',
+      services: [{ host: 'east1.waas.aigate.cc', port: 18080, httpType: '1', protocol: 'HTTPS' }] }),
+    openInstance: async () => { attempted.push('open'); throw capacity; },
+    closeInstance: async () => {},
+    getSshConnection: async () => ({ host: 'ssh.waas.aigate.cc', port: 1234, username: 'root', password: 'test' }),
+    createInstance: async () => { attempted.push('rent'); throw capacity; },
+    findInstancesByName: async () => ({ records: [], complete: true, pagesScanned: 1 }),
+  };
+  const config = { workers: [], key: 'worker-key', fetch, aigate: {
+    ids: [], platform, elastic: { rental: platform, templates: [
+      { id: 'east2', areaName: '华东二区' as const, imageId: '101', skuName: '5090', ...(rejected === 'open' ? { instanceId: '21' } : {}) },
+      { id: 'east1', areaName: '华东一区' as const, imageId: '102', skuName: '5090', instanceId: '22' },
+    ] },
+  } };
+  let service = new AsrService(db, config, 'gateway-key', error => errors.push(error));
+  const before = Date.now();
+  const job = service.create(asrJobSchema.parse(source)).job;
+  await service.step();
+  expect(service.find(job.id)).toMatchObject({ stage: 'queued', error: { code: 'ASR_CAPACITY_UNAVAILABLE', providerTerminal: false } });
+  const reservation = db.prepare('SELECT upload_deadline FROM aigate_asr_jobs WHERE id=?').get(job.id) as { upload_deadline: number };
+  expect(reservation.upload_deadline).toBeGreaterThanOrEqual(before + 600_000);
+  const second = service.create(asrJobSchema.parse({ ...source, requestKey: 'second' })).job;
+  service = new AsrService(db, config, 'gateway-key', error => errors.push(error));
+  await service.step();
+  expect(service.find(job.id)).toMatchObject({ stage: 'awaiting_upload', upload: {
+    files: [{ url: `https://east1.waas.aigate.cc/v1/jobs/${job.id}/audio/shot-04` }],
+  } });
+  expect(service.find(job.id).error).toBeUndefined();
+  expect(reassignedDeadline).toBe(reservation.upload_deadline);
+  expect(service.find(second.id).stage).toBe('queued');
+  expect(attempted).toEqual([rejected]);
+  expect(errors).toEqual([]);
+});
+
+it('recognizes AIGate 6001 rental rejection from the live ASR capacity contract', async () => {
+  vi.stubGlobal('fetch', async () => Response.json({ code: 1, errCode: '6001', msg: '无可用资源节点,请稍后再试' }));
+  try {
+    const config = asrOptionsFromEnv({ AIGATE_ACCESS_TOKEN: 'token', SYSTEM_ASR_WORKER_KEY: 'worker-key',
+      SYSTEM_ASR_AIGATE_TEMPLATES: JSON.stringify([{ id: 'east1', areaName: '华东一区', imageId: '123', skuName: '5090' }]) })!;
+    await expect(config.aigate!.elastic!.rental.createInstance({
+      areaName: '华东一区', imageId: '123', imageType: '3', skuName: '5090', count: 1,
+    })).rejects.toMatchObject({ code: 'CAPACITY_UNAVAILABLE', uncertain: false });
+  } finally { vi.unstubAllGlobals(); }
 });

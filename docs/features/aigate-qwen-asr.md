@@ -12,6 +12,11 @@ ASR 与 ComfyUI 各自管理节点和作业。单个节点承接一批，任务�
   非 systemd 镜像通过 SSH 和文件锁启动同一份已安装的服务。
   队列为空且实例没有在途作业，空闲一分钟后关机保留实例。提交回执未知和
   重启恢复都保持原实例 ID。静态 HTTPS 节点继续由外部管理电源。
+- `SYSTEM_ASR_AIGATE_TEMPLATES` 接收包含 `id`、`areaName`、`imageId` 和
+  `skuNames` 的个人镜像清单。按视频池的机型顺序配置，既有单机型配置可用
+  `skuName`。可通过 `instanceId` 登记已准备的实例。实例释放后按同区镜像
+  重建，平台明确报告容量不足时可尝试清单下一机型或另一可用区。尚未发给
+  节点的任务保留原任务号与截止时间。
 - `POST /v1/asr/jobs` 以调用方的 `requestKey` 幂等创建。请求包含
   可选 `language`（`Chinese` 或 `Auto`）和 `clips`。每个分镜提供
   `id`、`filename`、`contentType`、`sha256`、`size` 和 `durationMs`。
