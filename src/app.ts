@@ -1,5 +1,7 @@
 import path from 'node:path';
 import { createComfyService, type ComfyRuntimeOptions } from './comfyui/runtime.js';
+import { AsrService, type AsrOptions } from './asr/service.js';
+import { registerAsrRoutes } from './asr/routes.js';
 import { comfyEventQuerySchema, comfyInputsSchema, comfyJobSchema, comfyRetrySchema } from './comfyui/routes.js';
 import { validMediaSignature } from './system-media/routes.js';
 import { randomUUID } from 'node:crypto';
@@ -116,12 +118,13 @@ const MIN_RETAINED_HAILUO_CREDITS = 28;
 /** Old desktop clients omit upload-intent options; reserve the provider's maximum H3 duration. */
 const MIORA_UPLOAD_INTENT_FALLBACK_DURATION_SECONDS = 15;
 
-export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; comfyui?: ComfyRuntimeOptions; managedAccountCreditReader?:ManagedAccountCreditReader; managedAccountArchived?:(id:string,reason:ManagedArchiveReason)=>void; trustProxy?: boolean | string[]; warmup?: boolean; onClose?: () => Promise<void> } = {}) {
+export async function buildApp(options: { managedChannels?: ChannelStore; managedGateway?: boolean; comfyui?: ComfyRuntimeOptions; asr?: AsrOptions; managedAccountCreditReader?:ManagedAccountCreditReader; managedAccountArchived?:(id:string,reason:ManagedArchiveReason)=>void; trustProxy?: boolean | string[]; warmup?: boolean; onClose?: () => Promise<void> } = {}) {
   if (options.managedGateway && !options.managedChannels) throw new Error('Managed video gateway requires managed channels');
   assertVideoGatewayConfiguration(options.managedGateway === true, config.apiKey);
   assertVideoGatewayProxyConfiguration(options.managedGateway === true, config.mioraProxyUrl);
   const gateway = options.managedGateway && options.managedChannels ? new ManagedVideoGatewayRecords(options.managedChannels, config.apiKey!) : undefined;
   if (options.comfyui && !gateway) throw new Error('ComfyUI requires the authenticated managed video gateway');
+  if (options.asr && !gateway) throw new Error('ASR requires the authenticated managed gateway');
   const uploadIntents = gateway && options.managedChannels ? new MioraUploadIntentStore(options.managedChannels.db, config.apiKey!) : undefined;
   const mioraTransfers = new MioraCosTransferCoordinator();
   const app = Fastify({ logger: systemLoggerOptions, trustProxy: options.trustProxy ?? false, bodyLimit: 2 * 1024 * 1024 });
@@ -138,6 +141,9 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const comfy = options.comfyui ? createComfyService({ ...options.comfyui, db: options.managedChannels!.db,
     dataDirectory: config.dataDir, apiKey: config.apiKey!, assets, ownsAsset: id => gateway!.hasAsset(id),
     eventSink: event => app.log.info({ comfyEvent: event }, 'ComfyUI pool event') }) : undefined;
+  const asr = options.asr ? new AsrService(options.managedChannels!.db, options.asr, config.apiKey!,
+    error => app.log.warn({ err: error }, 'ASR worker reconciliation failed')) : undefined;
+  if (asr) app.addHook('onReady', async () => { asr.start(); });
   if (comfy) app.log.info({ component: 'comfyui', autoOpen: comfy.options.configuration.autoOpen,
     instances: comfy.options.configuration.instances.map(instance => ({ id: instance.id, areaName: instance.areaName, gpuModel: instance.gpuModel })),
     workflows: comfy.options.configuration.workflows.map(profile => ({ id: profile.id, version: profile.version })),
@@ -1075,7 +1081,7 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/v1/')) return;
     if (options.managedChannels) {
-      try { assertVideoGatewayRequest(request, !!gateway, config.apiKey); }
+      try { assertVideoGatewayRequest(request, !!gateway, config.apiKey, !!asr); }
       catch (error) {
         if (error instanceof SystemError) return reply.code(error.statusCode).send(errorBody(error.code, error.message));
         throw error;
@@ -1705,9 +1711,11 @@ app.get('/v1/jobs/:id/result', async (request, reply) => {
     });
   });
 
+  if (asr) registerAsrRoutes(app, asr);
   app.addHook('onClose', async () => {
     try {
     await comfy?.close();
+    await asr?.close();
     mioraTransfers.close();
     await Promise.allSettled(importRuns.values());
     tokenWatcher.stop();

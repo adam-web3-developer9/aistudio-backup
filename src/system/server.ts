@@ -1,10 +1,12 @@
 import path from 'node:path';
 import { comfyOptionsFromEnv } from '../comfyui/runtime.js';
+import { asrOptionsFromEnv } from '../asr/service.js';
 import { systemOptionsFromEnv } from './index.js';
 import { buildSystemWebApp } from './web-app.js';
 const options=systemOptionsFromEnv();
 const {app}=await buildSystemWebApp({...options,
   comfyui:await comfyOptionsFromEnv(),
+  asr:asrOptionsFromEnv(),
   mediaDirectory:process.env.SYSTEM_MEDIA_DIRECTORY??path.join(path.dirname(options.databasePath),'private-media'),
   adminDirectory:process.env.SYSTEM_ADMIN_DIRECTORY??'apps/admin/dist',
   credentialKey:process.env.CHANNEL_CREDENTIAL_KEY,

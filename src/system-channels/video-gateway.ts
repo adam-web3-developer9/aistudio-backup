@@ -28,12 +28,13 @@ export function assertVideoGatewayProxyConfiguration(enabled: boolean, proxyUrl?
 }
 
 /** Check the route before authentication so other legacy administration APIs stay absent. */
-export function assertVideoGatewayRequest(request: FastifyRequest, enabled: boolean, apiKey?: string): void {
+export function assertVideoGatewayRequest(request: FastifyRequest, enabled: boolean, apiKey?: string, asrEnabled = false): void {
   const pathname = request.url.split('?')[0]!;
   const uploadIntentPath = /^\/v1\/upload-intents\/[A-Za-z0-9_-]{1,200}$/.test(pathname);
   const intentAction = /^\/v1\/upload-intents\/[A-Za-z0-9_-]{1,200}\/(complete|finalize|manifest|manifest-stream|status|items|diagnostics)$/.exec(pathname)?.[1];
   const comfyAction = /^\/v1\/jobs\/(job_gateway_comfy_[A-Za-z0-9_-]{1,170})\/(result|cancel|reconcile|retry|inputs|collected|events)$/.exec(pathname)?.[2];
-  const allowed = request.method === 'POST' && (pathname === '/v1/assets' || pathname === '/v1/jobs'
+  const allowed = (asrEnabled && isAsrGatewayRoute(request.method, pathname))
+    || request.method === 'POST' && (pathname === '/v1/assets' || pathname === '/v1/jobs'
       || pathname === '/v1/upload-intents' || pathname === '/v1/upload-intents/staged' || intentAction === 'complete' || intentAction === 'finalize' || comfyAction === 'cancel' || comfyAction === 'reconcile' || comfyAction === 'retry' || comfyAction === 'inputs' || comfyAction === 'collected')
     || request.method === 'PUT' && (intentAction === 'manifest' || intentAction === 'manifest-stream')
     || request.method === 'GET' && (pathname === '/v1/jobs' || /^\/v1\/jobs\/by-request-key\/[A-Za-z0-9_-]{1,200}$/.test(pathname) || pathname.startsWith('/v1/jobs/') && gatewayJobId.test(pathname.slice('/v1/jobs/'.length))
@@ -161,3 +162,4 @@ export function projectGatewayJob(job: JobRecord) {
       ...(typeof job.error.retryable === 'boolean' ? { retryable: job.error.retryable } : {}) } } : {}),
   };
 }
+import { isAsrGatewayRoute } from '../asr/routes.js';

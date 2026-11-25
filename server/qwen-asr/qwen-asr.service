@@ -1,0 +1,13 @@
+[Unit]
+Description=Qwen3 ASR inference worker
+After=network-online.target
+ConditionPathExists=/home/waas/qwen-asr/worker.env
+
+[Service]
+Type=simple
+ExecStart=/opt/qwen-asr/run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
