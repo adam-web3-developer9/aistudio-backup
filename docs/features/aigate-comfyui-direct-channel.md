@@ -48,6 +48,8 @@ AIGATE_ACCESS_TOKEN=实际AIGate平台令牌
 
 ## H3 工作流适配
 
+新客户端在 `values` 传 `resolution`（`480p`、`768p`、`1080p`）和 `aspectRatio`。Hailuo 在冻结作业前将其换算成符合 32 像素网格的画布。过往配置的 `720p` 沿用既有到原生 `768p` 的映射。16:9 原生档为 1344×768，1080p 为 1920×1088。旧版宽高请求及已冻结作业沿用原值。
+
 新建 `minimax-h3-9plus3` 作业时为 RandomNoise 的 noise_seed 生成安全整数随机种子，和工作流一起持久化冻结。同一 requestKey 重试、轮询、候卡及服务重启继续使用原种子；既有作业不改种子，不因恢复而重新生成。其他工作流及 ReservedVRAMSetter 的 seed 不受影响。
 
 随附脱敏API图保留已实测模型及采样节点。图片绑定为image1–image9、音频为audio1–audio3。`omitWhenMissing` 是管理员对可信可选loader的显式授权，只移除已审核的 LoadImage/LoadAudio 以及对应动态可选引用，拒绝普通必需连接、输出节点或图依赖，绝不拿示例素材凑数。

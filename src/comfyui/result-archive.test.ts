@@ -90,6 +90,21 @@ describe('GPU result archive fallback', () => {
     expect(JSON.parse(job.input).values).not.toBe(values);
   });
 
+  it('maps public H3 resolution presets into the frozen native dimensions and replays legacy requests', () => {
+    const { service } = fixture(true);
+    const base = { adapterId: 'comfyui-v1' as const, workflowId: 'minimax-h3-9plus3',
+      transport: 'direct' as const, resultDelivery: 'archive' as const, media: {} };
+    const legacy = service.submit({ ...base, requestKey: 'wide', values: { duration: 5, width: 1344, height: 768 } });
+    const preset = service.submit({ ...base, requestKey: 'wide', values: { duration: 5, resolution: '768p', aspectRatio: '16:9' } });
+    expect(preset).toMatchObject({ created: false, job: { id: legacy.job.id } });
+    const portrait = service.submit({ ...base, requestKey: 'portrait', values: { duration: 5, resolution: '720p', aspectRatio: '9:16' } });
+    expect(JSON.parse(portrait.job.input).values).toEqual({ duration: 5, width: 768, height: 1344 });
+    const square = service.submit({ ...base, requestKey: 'square', values: { duration: 5, resolution: '1080p', aspectRatio: '1:1' } });
+    expect(JSON.parse(square.job.input).values).toEqual({ duration: 5, width: 1088, height: 1088 });
+    expect(() => service.submit({ ...base, requestKey: 'custom', values: { duration: 5, resolution: '480p', width: 640, height: 480 } }))
+      .toThrow(expect.objectContaining({ code: 'COMFY_DIMENSIONS_INVALID' }));
+  });
+
   it('withholds commercial success and temporary GPU URLs until an immediate verified archive is stored', async () => {
     const context = fixture(true);
     const job = context.succeed();

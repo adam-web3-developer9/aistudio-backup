@@ -15,6 +15,7 @@ import { comfyPoolMetrics } from './metrics.js';
 import { ComfyResultArchive, type ResultArchiveOptions } from './result-archive.js';
 import { nativeCheckpoint, nativeRetryDelay, type NativeAttempt, type NativeCheckpoint } from './native-submission.js';
 import { ComfyPowerPolicy } from './power-policy.js';
+import { h3PresetInput } from './h3-resolution.js';
 
 type InstanceConfiguration = ComfyPoolConfiguration['instances'][number];
 type DataClient = Pick<ComfyClient, 'health' | 'queue' | 'upload' | 'submit' | 'history' | 'findAttempt' | 'download'>;
@@ -146,7 +147,8 @@ export class ComfyService {
   private async configureIdlePolicy(id: string): Promise<void> {
     await this.powerPolicy.reconcile(id, '2');
   }
-  submit(input: ComfyInput): { job: ComfyJob; created: boolean } {
+  submit(request: ComfyInput): { job: ComfyJob; created: boolean } {
+    const input = h3PresetInput(request);
     const prior = this.store.byRequest(this.options.owner, input.requestKey);
     if (prior) return this.store.submit(this.options.owner, { ...input, profile: (JSON.parse(prior.input) as FrozenComfyInput).profile }, this.options.configuration.jobTimeoutMs);
     const profile = this.options.configuration.workflows.find(candidate => candidate.id === input.workflowId);
