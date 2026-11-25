@@ -154,12 +154,21 @@ export class AsrService {
     this.db.prepare(`UPDATE aigate_asr_jobs SET stage='failed', token=NULL, updated_at=?, error_code='ASR_UPLOAD_TIMEOUT',
       error_message='ASR upload reservation expired' WHERE stage IN ('queued','preparing','awaiting_upload') AND upload_deadline <= ?`)
       .run(Date.now(), Date.now());
+    const managed: Array<{ worker: string; instanceId?: string; template?: AsrAigateTemplate }> = [
+      ...(this.options.aigate?.ids ?? []).map(instanceId => ({ worker: `aigate:${instanceId}`, instanceId })),
+      ...(this.options.aigate?.elastic?.templates ?? []).map(template => ({ worker: `aigate-template:${template.id}`, template })),
+    ];
     await Promise.all([
       ...this.options.workers.map(worker => this.stepWorker(worker).catch(this.onError)),
-      ...this.options.aigate?.ids.map(id => this.stepWorker(`aigate:${id}`, id).catch(this.onError)) ?? [],
-      ...this.options.aigate?.elastic?.templates.map(template =>
-        this.stepWorker(`aigate-template:${template.id}`, undefined, template).catch(this.onError)) ?? [],
+      ...managed.map(({ worker, instanceId, template }) => this.stepWorker(worker, instanceId, template).catch(this.onError)),
     ]);
+    if (this.waiting()) return;
+    await Promise.all(managed.map(async ({ worker, instanceId, template }) => {
+      const mayStop = () => !this.active(worker) && !this.waiting();
+      if (!mayStop()) return;
+      const id = template ? await this.aigateTemplates!.resolve(template, false, true) : instanceId;
+      if (id) await this.aigateNodes!.idle(id, mayStop, !!template);
+    }).map(operation => operation.catch(this.onError)));
   }
 
   private active(worker: string) {
@@ -188,11 +197,7 @@ export class AsrService {
   private async stepWorker(worker: string, instanceId?: string, template?: AsrAigateTemplate) {
     let active = this.active(worker);
     if (!active) {
-      if (!this.waiting()) {
-        if (template) instanceId = await this.aigateTemplates!.resolve(template, false, false);
-        if (instanceId) await this.aigateNodes!.idle(instanceId, () => !this.active(worker) && !this.waiting());
-        return;
-      }
+      if (!this.waiting()) return;
       if (!instanceId && !template && !await this.healthy(worker)) return;
       const now = Date.now();
       active = this.db.prepare(`UPDATE aigate_asr_jobs SET stage='preparing', worker=?, updated_at=?,

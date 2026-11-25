@@ -16,7 +16,7 @@ it('tries configured SKUs after a definite shortage and reconciles an uncertain 
     };
     const platform = {
       getInstance: async (id: string) => ({ id, status, services: [] }),
-      openInstance: async () => {}, closeInstance: async () => {},
+      openInstance: async () => {}, closeInstance: async () => {}, releaseInstance: async () => {},
       getSshConnection: async () => ({ host: 'ssh.waas.aigate.cc', port: 1234, username: 'root', password: 'test' }),
       createInstance: async (input: AigateCreateRequest) => {
         requests.push(input);

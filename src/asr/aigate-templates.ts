@@ -33,11 +33,12 @@ export class AigateAsrTemplates {
 
   async resolve(template: AsrAigateTemplate, demand: boolean, canReplace: boolean) {
     const row = this.db.prepare('SELECT * FROM aigate_asr_templates WHERE id=?').get(template.id) as Slot;
-    if (row.instance_id && (!demand || !canReplace || !await this.power.released(row.instance_id))) return row.instance_id;
     if (row.instance_id) {
+      if (!canReplace || !await this.power.released(row.instance_id)) return row.instance_id;
       this.db.prepare('UPDATE aigate_asr_templates SET instance_id=NULL, request_name=NULL, request_at=NULL WHERE id=? AND instance_id=?')
         .run(template.id, row.instance_id);
       row.request_at = null;
+      row.request_name = null;
     }
     const now = this.clock();
     if (row.request_at !== null && now - row.request_at < cooldownMs) return;

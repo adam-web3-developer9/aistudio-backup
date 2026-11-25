@@ -2,12 +2,11 @@ import type Database from 'better-sqlite3';
 import { Client } from 'ssh2';
 import type { AigateClient, AigateInstance, AigateSshConnection } from '../comfyui/aigate-client.js';
 
-export type AsrAigatePlatform = Pick<AigateClient, 'getInstance' | 'openInstance' | 'closeInstance' | 'getSshConnection'>;
+export type AsrAigatePlatform = Pick<AigateClient, 'getInstance' | 'openInstance' | 'closeInstance' | 'releaseInstance' | 'getSshConnection'>;
 type NodeState = {
-  power_request: 'open' | 'close' | null; power_requested_at: number | null;
-  ssh_started_at: number | null; idle_since: number | null; fingerprint: string | null;
+  power_request: 'open' | 'close' | 'release' | null; power_requested_at: number | null;
+  ssh_started_at: number | null; fingerprint: string | null;
 };
-const idleMs = 60_000;
 const reconcileMs = 60_000;
 const observeMs = 5_000;
 const stopped = new Set(['22', '26']);
@@ -69,11 +68,15 @@ export class AigateAsrNodes {
   }
 
   async ready(id: string, health: (endpoint: string) => Promise<boolean>) {
-    this.db.prepare('UPDATE aigate_asr_nodes SET idle_since=NULL WHERE id=? AND idle_since IS NOT NULL').run(id);
     const status = await this.observe(id);
     const state = this.node(id);
     const now = this.clock();
-    if (stopped.has(status.operationStatus ?? status.status)) {
+    const stateCode = status.operationStatus ?? status.status;
+    if (state.power_request === 'release') {
+      if (stopped.has(stateCode)) await this.requestIdleAction(id, 'release');
+      return;
+    }
+    if (stopped.has(stateCode)) {
       const claimed = this.db.prepare(`UPDATE aigate_asr_nodes SET power_request='open',power_requested_at=?,ssh_started_at=NULL
         WHERE id=? AND (power_request IS NOT 'open' OR power_requested_at <= ?)`).run(now, id, now - reconcileMs);
       if (!claimed.changes) return;
@@ -81,7 +84,7 @@ export class AigateAsrNodes {
       await this.platform.openInstance(id);
       return;
     }
-    if ((status.operationStatus ?? status.status) !== '2') return;
+    if (stateCode !== '2') return;
     if (state.power_request === 'close' && now - state.power_requested_at! < reconcileMs) return;
     if (state.power_request) this.clearPower(id);
     const endpoint = asrEndpoint(status);
@@ -100,26 +103,28 @@ export class AigateAsrNodes {
     return (metadata.operationStatus ?? metadata.status) === '4';
   }
 
-  async idle(id: string, mayStop: () => boolean) {
-    const state = this.node(id);
-    const now = this.clock();
-    if (state.idle_since === null) {
-      this.db.prepare('UPDATE aigate_asr_nodes SET idle_since=? WHERE id=? AND idle_since IS NULL').run(now, id);
-      return;
-    }
-    if (now - state.idle_since < idleMs || state.power_request && now - state.power_requested_at! < reconcileMs) return;
+  async idle(id: string, mayStop: () => boolean, release = false) {
     const metadata = await this.observe(id);
+    if (!mayStop()) return;
+    const state = this.node(id);
     const stateCode = metadata.operationStatus ?? metadata.status;
+    if (state.power_request === 'open' && this.clock() - state.power_requested_at! < reconcileMs) return;
     if (stopped.has(stateCode)) {
-      if (state.power_request || state.ssh_started_at !== null) this.clearPower(id, true);
+      if (release) await this.requestIdleAction(id, 'release');
+      else if (state.power_request || state.ssh_started_at !== null) this.clearPower(id, true);
       return;
     }
-    if (stateCode !== '2' || !mayStop()) return;
-    const claimed = this.db.prepare(`UPDATE aigate_asr_nodes SET power_request='close',power_requested_at=?
-      WHERE id=? AND (power_request IS NULL OR power_requested_at <= ?)`).run(now, id, now - reconcileMs);
+    if (stateCode === '2' && state.power_request !== 'release') await this.requestIdleAction(id, 'close');
+  }
+
+  private async requestIdleAction(id: string, action: 'close' | 'release') {
+    const now = this.clock();
+    const claimed = this.db.prepare(`UPDATE aigate_asr_nodes SET power_request=?, power_requested_at=?
+      WHERE id=? AND (power_request IS NOT ? OR power_requested_at <= ?)`).run(action, now, id, action, now - reconcileMs);
     if (!claimed.changes) return;
     this.observations.delete(id);
-    await this.platform.closeInstance(id);
+    if (action === 'release') await this.platform.releaseInstance(id);
+    else await this.platform.closeInstance(id);
   }
 
   private clearPower(id: string, stopped = false) {

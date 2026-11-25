@@ -81,6 +81,54 @@ it('uses one slot per worker and resumes the same submission after an uncertain 
   expect(service.find(third.id).stage).toBe('awaiting_upload');
 });
 
+it('persists the last transcription before requesting shutdown and releases the idle clone once stopped', async () => {
+  const db = new Database(':memory:');
+  dbs.push(db);
+  let status = '2';
+  const closeInstance = vi.fn(async () => { status = '22'; });
+  const releaseInstance = vi.fn(async () => { status = '4'; });
+  const platform = {
+    getInstance: async (id: string) => ({ id, status,
+      services: [{ host: 'asr.waas.aigate.cc', port: 18080, httpType: '1', protocol: 'HTTPS' }] }),
+    openInstance: vi.fn(),
+    closeInstance,
+    releaseInstance,
+    getSshConnection: vi.fn(),
+    createInstance: vi.fn(),
+    findInstancesByName: vi.fn(),
+  };
+  const entry = { id: 'shot-04', text: '许师傅' };
+  const fetch: typeof globalThis.fetch = async (raw, init) => {
+    const path = new URL(String(raw)).pathname;
+    if (path === '/health') return Response.json({ ready: true });
+    if (path === '/v1/jobs') return Response.json({
+      id: JSON.parse(String(init?.body)).id, status: 'awaiting_upload', uploadToken: 'upload-token',
+    });
+    return Response.json({ id: path.split('/')[3], status: 'succeeded', results: [entry] });
+  };
+  const errors: unknown[] = [];
+  const service = new AsrService(db, { workers: [], key: 'worker-key', fetch, aigate: {
+    ids: [], platform, elastic: { rental: platform, templates: [
+      { id: 'east2', areaName: '华东二区', imageId: '100', skuName: '5090', instanceId: '101' },
+    ] },
+  } }, 'gateway-key', error => errors.push(error));
+  const job = service.create(asrJobSchema.parse(source)).job;
+  await service.step();
+  expect(service.find(job.id).stage).toBe('awaiting_upload');
+  expect(closeInstance).not.toHaveBeenCalled();
+  service.confirm(job.id);
+  await service.step();
+  expect(service.find(job.id)).toMatchObject({ stage: 'succeeded', result: { transcripts: [entry] } });
+  expect(closeInstance).toHaveBeenCalledExactlyOnceWith('101');
+  expect(releaseInstance).not.toHaveBeenCalled();
+  await service.step();
+  expect(releaseInstance).toHaveBeenCalledExactlyOnceWith('101');
+  await service.step();
+  expect(db.prepare('SELECT instance_id FROM aigate_asr_templates WHERE id=?').get('east2')).toEqual({ instance_id: null });
+  expect(service.find(job.id)).toMatchObject({ stage: 'succeeded', result: { transcripts: [entry] } });
+  expect(errors).toEqual([]);
+});
+
 it('registers the ASR routes behind the existing gateway key', async () => {
   const db = new Database(':memory:');
   dbs.push(db);
@@ -122,7 +170,7 @@ it('moves only unsubmitted reservations from retired instances to the replacemen
   const platform = {
     getInstance: async (id: string) => ({ id, status: id === '13' ? '2' : '4',
       services: [{ host: 'asr.waas.aigate.cc', port: 18080, httpType: '1', protocol: 'HTTPS' }] }),
-    openInstance: async () => {}, closeInstance: async () => {},
+    openInstance: async () => {}, closeInstance: async () => {}, releaseInstance: async () => {},
     getSshConnection: async () => ({ host: 'ssh.waas.aigate.cc', port: 1234, username: 'root', password: 'test' }),
     createInstance: async () => { rentals++; return '13'; },
     findInstancesByName: async () => ({ records: [], complete: true, pagesScanned: 1 }),
@@ -165,7 +213,7 @@ it.each(['open', 'rent'])('preserves the job and deadline and selects another sl
     getInstance: async (id: string) => ({ id, status: id === '22' ? '2' : '22',
       services: [{ host: 'east1.waas.aigate.cc', port: 18080, httpType: '1', protocol: 'HTTPS' }] }),
     openInstance: async () => { attempted.push('open'); throw capacity; },
-    closeInstance: async () => {},
+    closeInstance: async () => {}, releaseInstance: async () => {},
     getSshConnection: async () => ({ host: 'ssh.waas.aigate.cc', port: 1234, username: 'root', password: 'test' }),
     createInstance: async () => { attempted.push('rent'); throw capacity; },
     findInstancesByName: async () => ({ records: [], complete: true, pagesScanned: 1 }),
