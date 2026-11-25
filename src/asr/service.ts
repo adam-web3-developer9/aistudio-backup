@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
+import { AigateClient } from '../comfyui/aigate-client.js';
 import { SystemError } from '../system/types.js';
+import { AigateAsrNodes, type AsrAigatePlatform, type AsrWorkerBootstrap } from './aigate-nodes.js';
 
 const identifier = /^[A-Za-z0-9_-]{1,128}$/;
 export const asrRequestKey = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/);
@@ -22,7 +24,7 @@ export const asrJobSchema = z.object({
   { path: ['clips'], message: 'Clip IDs must be unique' });
 type AsrInput = z.infer<typeof asrJobSchema>;
 type Stage = 'queued' | 'preparing' | 'awaiting_upload' | 'submitting' | 'running' | 'succeeded' | 'failed';
-type Row = { id: string; request_key: string; input: string; stage: Stage; worker: string | null; token: string | null;
+type Row = { id: string; request_key: string; input: string; stage: Stage; worker: string | null; endpoint: string | null; token: string | null;
   created_at: number; updated_at: number; upload_deadline: number | null; result: string | null;
   error_code: string | null; error_message: string | null; worker_timing: string | null };
 const transcriptSchema = z.object({ id: z.string(), text: z.string(), durationMs: z.number().int().nonnegative().optional() });
@@ -43,12 +45,13 @@ const activeStages = "('preparing','awaiting_upload','submitting','running')";
 export interface AsrOptions {
   workers: string[];
   key: string;
+  aigate?: { ids: string[]; platform: AsrAigatePlatform; bootstrap?: AsrWorkerBootstrap };
   fetch?: typeof fetch;
 }
 
 export function asrOptionsFromEnv(env = process.env): AsrOptions | undefined {
-  if (!env.SYSTEM_ASR_WORKERS) return undefined;
-  const workers = env.SYSTEM_ASR_WORKERS.split(',').map(value => {
+  if (!env.SYSTEM_ASR_WORKERS && !env.SYSTEM_ASR_AIGATE_INSTANCE_IDS) return undefined;
+  const workers = splitConfig(env.SYSTEM_ASR_WORKERS).map(value => {
     const url = new URL(value.trim());
     const local = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
     if ((url.protocol !== 'https:' && !(local && url.protocol === 'http:')) || url.search || url.hash ||
@@ -57,8 +60,13 @@ export function asrOptionsFromEnv(env = process.env): AsrOptions | undefined {
   });
   const key = env.SYSTEM_ASR_WORKER_KEY?.trim();
   if (!key) throw new Error('SYSTEM_ASR_WORKER_KEY is required for the ASR pool');
-  return { workers: [...new Set(workers)], key };
+  const ids = [...new Set(splitConfig(env.SYSTEM_ASR_AIGATE_INSTANCE_IDS))];
+  if (ids.some(id => !/^[1-9]\d{0,18}$/.test(id))) throw new Error('ASR AIGate instances must use numeric instance IDs');
+  const token = env.AIGATE_ACCESS_TOKEN?.trim();
+  if (ids.length && !token) throw new Error('AIGATE_ACCESS_TOKEN is required for ASR instance power control');
+  return { workers: [...new Set(workers)], key, ...(ids.length ? { aigate: { ids, platform: new AigateClient({ token: token! }) } } : {}) };
 }
+const splitConfig = (value?: string) => (value ?? '').split(',').map(item => item.trim()).filter(Boolean);
 
 class WorkerHttpError extends Error {
   constructor(readonly status: number, readonly code?: string) { super(`ASR worker HTTP ${status}`); }
@@ -68,17 +76,21 @@ export class AsrService {
   private timer?: NodeJS.Timeout;
   private tick?: Promise<void>;
   private readonly owner: string;
+  private readonly aigateNodes?: AigateAsrNodes;
   constructor(private readonly db: Database.Database, private readonly options: AsrOptions,
       apiKey: string, private readonly onError: (error: unknown) => void) {
     this.owner = createHash('sha256').update(apiKey).digest('hex');
     db.exec(`CREATE TABLE IF NOT EXISTS aigate_asr_jobs (
       id TEXT PRIMARY KEY, owner TEXT NOT NULL, request_key TEXT NOT NULL, input TEXT NOT NULL,
-      stage TEXT NOT NULL, worker TEXT, token TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      stage TEXT NOT NULL, worker TEXT, endpoint TEXT, token TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
       upload_deadline INTEGER, result TEXT, error_code TEXT, error_message TEXT, worker_timing TEXT,
       UNIQUE(owner, request_key)
     );
     CREATE UNIQUE INDEX IF NOT EXISTS aigate_asr_worker_slot ON aigate_asr_jobs(worker)
       WHERE stage IN ${activeStages};`);
+    if (!(db.prepare('PRAGMA table_info(aigate_asr_jobs)').all() as Array<{ name: string }>).some(column => column.name === 'endpoint'))
+      db.exec('ALTER TABLE aigate_asr_jobs ADD COLUMN endpoint TEXT');
+    if (options.aigate) this.aigateNodes = new AigateAsrNodes(db, options.aigate.platform, options.aigate.bootstrap);
   }
 
   create(input: AsrInput) {
@@ -123,22 +135,46 @@ export class AsrService {
     this.db.prepare(`UPDATE aigate_asr_jobs SET stage='failed', token=NULL, updated_at=?, error_code='ASR_UPLOAD_TIMEOUT',
       error_message='ASR upload reservation expired' WHERE stage IN ('preparing','awaiting_upload') AND upload_deadline <= ?`)
       .run(Date.now(), Date.now());
-    await Promise.all(this.options.workers.map(worker => this.stepWorker(worker).catch(this.onError)));
+    await Promise.all([
+      ...this.options.workers.map(worker => this.stepWorker(worker).catch(this.onError)),
+      ...this.options.aigate?.ids.map(id => this.stepWorker(`aigate:${id}`, id).catch(this.onError)) ?? [],
+    ]);
   }
 
-  private async stepWorker(worker: string) {
-    let active = this.db.prepare(`SELECT * FROM aigate_asr_jobs WHERE worker=? AND stage IN ${activeStages}`)
-      .get(worker) as Row | undefined;
+  private active(worker: string) {
+    return this.db.prepare(`SELECT * FROM aigate_asr_jobs WHERE worker=? AND stage IN ${activeStages}`).get(worker) as Row | undefined;
+  }
+  private waiting() { return !!this.db.prepare("SELECT 1 FROM aigate_asr_jobs WHERE stage='queued' LIMIT 1").get(); }
+  private async healthy(endpoint: string) { return (await this.request(endpoint, '/health'))?.ready === true; }
+
+  private async stepWorker(worker: string, instanceId?: string) {
+    let active = this.active(worker);
     if (!active) {
-      if (!this.db.prepare("SELECT 1 FROM aigate_asr_jobs WHERE stage='queued' LIMIT 1").get()) return;
-      const health = await this.request(worker, '/health');
-      if (health?.ready !== true) return;
+      if (!this.waiting()) {
+        if (instanceId) await this.aigateNodes!.idle(instanceId, () => !this.active(worker) && !this.waiting());
+        return;
+      }
+      if (!instanceId && !await this.healthy(worker)) return;
       const now = Date.now();
       active = this.db.prepare(`UPDATE aigate_asr_jobs SET stage='preparing', worker=?, updated_at=?, upload_deadline=?
         WHERE id=(SELECT id FROM aigate_asr_jobs WHERE stage='queued' ORDER BY created_at, rowid LIMIT 1)
         AND NOT EXISTS (SELECT 1 FROM aigate_asr_jobs WHERE worker=? AND stage IN ${activeStages}) RETURNING *`)
         .get(worker, now, now + uploadReservationMs, worker) as Row | undefined;
       if (!active) return;
+    }
+    if (instanceId) {
+      let endpoint: string | undefined;
+      try {
+        endpoint = await this.aigateNodes!.ready(instanceId, url => this.healthy(url).catch(() => false));
+      } catch (error) {
+        if (!active.endpoint || (active.stage !== 'submitting' && active.stage !== 'running')) throw error;
+        endpoint = active.endpoint;
+      }
+      if (!endpoint) return;
+      if (endpoint !== active.endpoint) {
+        this.db.prepare('UPDATE aigate_asr_jobs SET endpoint=? WHERE id=?').run(endpoint, active.id);
+      }
+      worker = endpoint;
     }
     const path = `/v1/jobs/${active.id}`;
     if (active.stage === 'preparing') {
@@ -228,7 +264,7 @@ export class AsrService {
       billing: { unit: 'second', requestedSeconds: Math.ceil(input.clips.reduce((sum, clip) => sum + clip.durationMs, 0) / 1_000) },
       ...(row.stage === 'awaiting_upload' ? { upload: {
         token: row.token,
-        files: input.clips.map(clip => ({ id: clip.id, url: `${row.worker}/v1/jobs/${row.id}/audio/${clip.id}` })),
+        files: input.clips.map(clip => ({ id: clip.id, url: `${row.endpoint ?? row.worker}/v1/jobs/${row.id}/audio/${clip.id}` })),
       } } : {}),
       ...(row.result ? { result: JSON.parse(row.result) } : {}),
       ...(row.worker_timing ? { workerTiming: JSON.parse(row.worker_timing) } : {}),

@@ -4,7 +4,7 @@ set -euo pipefail
 
 src="$(cd "$(dirname "$0")" && pwd)"
 prefix=/opt/qwen-asr
-torch_index="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}"
+torch_index="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 base_python="${QWEN_ASR_BASE_PYTHON:-python3}"
 
 if [[ "$base_python" == python3 ]]; then
@@ -25,19 +25,24 @@ if [[ "$base_python" == python3 ]]; then
         torch==2.8.0 torchvision==0.23.0
 fi
 "$python" -m pip install --no-cache-dir -r "$prefix/requirements.txt"
-"$python" -c 'import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.cuda.get_device_name(0))'
+"$python" -m pip install --no-cache-dir --no-deps qwen-asr==0.0.6
+"$python" -c 'import torch; from qwen_asr import Qwen3ASRModel; assert torch.cuda.is_available(); print(torch.__version__, torch.cuda.get_device_name(0))'
 
 cd "$prefix"
 "$python" - <<'PY'
 from huggingface_hub import snapshot_download
 from worker import MODEL_NAME, MODEL_PATH, MODEL_REVISION
 
-snapshot_download(
-    MODEL_NAME,
-    revision=MODEL_REVISION,
-    local_dir=MODEL_PATH,
-    ignore_patterns=["*.md", "*.png", ".gitattributes"],
-)
+import os
+from pathlib import Path
+
+if os.environ.get("QWEN_ASR_PREFETCH_MODEL") != "1" and not (Path(MODEL_PATH) / "model.safetensors").is_file():
+    snapshot_download(
+        MODEL_NAME,
+        revision=MODEL_REVISION,
+        local_dir=MODEL_PATH,
+        ignore_patterns=["*.md", "*.png", ".gitattributes"],
+    )
 PY
 
 if [[ -d /run/systemd/system ]]; then

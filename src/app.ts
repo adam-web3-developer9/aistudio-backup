@@ -141,6 +141,9 @@ export async function buildApp(options: { managedChannels?: ChannelStore; manage
   const comfy = options.comfyui ? createComfyService({ ...options.comfyui, db: options.managedChannels!.db,
     dataDirectory: config.dataDir, apiKey: config.apiKey!, assets, ownsAsset: id => gateway!.hasAsset(id),
     eventSink: event => app.log.info({ comfyEvent: event }, 'ComfyUI pool event') }) : undefined;
+  if (comfy && options.asr?.aigate?.ids.some(id => comfy.options.configuration.instances.some(instance => instance.id === id))) {
+    throw new Error('ASR power control requires AIGate instance IDs dedicated to ASR');
+  }
   const asr = options.asr ? new AsrService(options.managedChannels!.db, options.asr, config.apiKey!,
     error => app.log.warn({ err: error }, 'ASR worker reconciliation failed')) : undefined;
   if (asr) app.addHook('onReady', async () => { asr.start(); });
