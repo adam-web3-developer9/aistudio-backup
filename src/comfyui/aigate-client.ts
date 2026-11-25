@@ -63,6 +63,7 @@ export type AigateCreateRequest = {
   count: number;
   imageId: string;
   imageType: '2' | '3';
+  instanceName?: string;
 } & ({ skuName: string; gpuModel?: never } | { gpuModel: string; skuName?: never });
 
 export interface AigatePageRequest {
@@ -366,9 +367,11 @@ export class AigateClient {
   async createInstance(request: AigateCreateRequest): Promise<string> {
     if (!isRecord(request) || !nonEmpty(request.areaName) || !positiveInteger(request.count, 8)
       || !isInt64(request.imageId) || !['2', '3'].includes(request.imageType)
+      || (request.instanceName !== undefined && (!nonEmpty(request.instanceName) || request.instanceName.length > 20))
       || (request.skuName !== undefined) === (request.gpuModel !== undefined)
       || !nonEmpty(request.skuName ?? request.gpuModel)) return invalidArgument();
     const fields = { areaName: request.areaName, count: request.count, imageType: request.imageType,
+      ...(request.instanceName === undefined ? {} : { instanceName: request.instanceName }),
       ...(request.skuName !== undefined ? { skuName: request.skuName } : { gpuModel: request.gpuModel }) };
     const body = JSON.stringify(fields).slice(0, -1) + ',"imageId":' + request.imageId + '}';
     const data = await this.request('start', undefined, undefined, body);

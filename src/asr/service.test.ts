@@ -108,3 +108,40 @@ it('registers the ASR routes behind the existing gateway key', async () => {
     expect(early.json().error.code).toBe('ASR_UPLOAD_NOT_READY');
   } finally { await app.close(); }
 });
+
+it('moves only unsubmitted reservations from retired instances to the replacement template', async () => {
+  const db = new Database(':memory:');
+  dbs.push(db);
+  const fetch = (async (raw, init) => {
+    const url = new URL(String(raw));
+    if (url.pathname === '/health') return Response.json({ ready: true });
+    const body = JSON.parse(String(init?.body));
+    return Response.json({ id: body.id, status: 'awaiting_upload', uploadToken: 'upload-token' });
+  }) as typeof globalThis.fetch;
+  let rentals = 0;
+  const platform = {
+    getInstance: async (id: string) => ({ id, status: id === '13' ? '2' : '4',
+      services: [{ host: 'asr.waas.aigate.cc', port: 18080, httpType: '1', protocol: 'HTTPS' }] }),
+    openInstance: async () => {}, closeInstance: async () => {},
+    getSshConnection: async () => ({ host: 'ssh.waas.aigate.cc', port: 1234, username: 'root', password: 'test' }),
+    createInstance: async () => { rentals++; return '13'; },
+    findInstancesByName: async () => ({ records: [], complete: true, pagesScanned: 1 }),
+  };
+  const input = asrJobSchema.parse(source);
+  let service = new AsrService(db, { workers: [], key: 'worker-key', fetch, aigate: { ids: ['11', '12'], platform } },
+    'gateway-key', () => {});
+  const old = service.create(input).job;
+  const dispatched = service.create({ ...input, requestKey: 'already-dispatched' }).job;
+  await service.step();
+  db.prepare('UPDATE aigate_asr_jobs SET endpoint=? WHERE id=?').run('https://old.waas.aigate.cc', dispatched.id);
+  service = new AsrService(db, { workers: [], key: 'worker-key', fetch, aigate: {
+    ids: [], platform, elastic: { templates: [{ id: 'east2', areaName: '华东二区', imageId: '123', skuName: '5090', instanceId: '13' }],
+      rental: platform },
+  } }, 'gateway-key', () => {});
+  await service.step();
+  expect(service.find(old.id)).toMatchObject({ stage: 'awaiting_upload', upload: {
+    token: 'upload-token', files: [{ url: `https://asr.waas.aigate.cc/v1/jobs/${old.id}/audio/shot-04` }],
+  } });
+  expect(service.find(dispatched.id).stage).toBe('preparing');
+  expect(rentals).toBe(0);
+});

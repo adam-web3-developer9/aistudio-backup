@@ -95,6 +95,11 @@ export class AigateAsrNodes {
     await this.dispatch(connection, fingerprint => this.verifyHost(id, fingerprint));
   }
 
+  async released(id: string) {
+    const metadata = await this.observe(id);
+    return (metadata.operationStatus ?? metadata.status) === '4';
+  }
+
   async idle(id: string, mayStop: () => boolean) {
     const state = this.node(id);
     const now = this.clock();
