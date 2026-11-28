@@ -31,6 +31,11 @@ export class AigateAsrTemplates {
     for (const template of templates) insert.run(template.id, template.instanceId ?? null);
   }
 
+  boundInstance(templateId: string): string | undefined {
+    const row = this.db.prepare('SELECT instance_id FROM aigate_asr_templates WHERE id=?').get(templateId) as { instance_id: string | null } | undefined;
+    return row?.instance_id ?? undefined;
+  }
+
   async resolve(template: AsrAigateTemplate, demand: boolean, canReplace: boolean) {
     const row = this.db.prepare('SELECT * FROM aigate_asr_templates WHERE id=?').get(template.id) as Slot;
     if (row.instance_id) {
@@ -65,6 +70,7 @@ export class AigateAsrTemplates {
     if (!claimed.changes) return;
     try {
       const skus = template.skuNames ?? [template.skuName!];
+      let capacityError: unknown;
       for (const [index, skuName] of skus.entries()) {
         try {
           const instance = await this.platform.createInstance({
@@ -73,11 +79,14 @@ export class AigateAsrTemplates {
           });
           return this.bind(template.id, name, instance);
         } catch (error) {
-          const failure = error as { code?: string; uncertain?: boolean };
-          // A confirmed capacity rejection leaves no instance. Other replies
-          // end this rental attempt and keep its name for reconciliation.
-          if (failure?.code !== 'CAPACITY_UNAVAILABLE' || failure.uncertain !== false
-              || index === skus.length - 1) throw error;
+          const failure = error as { code?: string; uncertain?: boolean; reason?: string };
+          if (failure?.uncertain !== false) throw error;
+          if (failure.code === 'CAPACITY_UNAVAILABLE') capacityError ??= error;
+          // A confirmed rejection (shortage or retired/unavailable SKU, excluding
+          // insufficient balance) leaves no instance and may safely try the next SKU.
+          const canFailoverSku = failure.code === 'CAPACITY_UNAVAILABLE'
+            || (failure.code === 'BUSINESS_REJECTED' && failure.reason !== 'INSUFFICIENT_BALANCE');
+          if (!canFailoverSku || index === skus.length - 1) throw capacityError ?? error;
         }
       }
     } catch (error) {

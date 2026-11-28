@@ -69,47 +69,58 @@ it('uses one slot per worker and resumes the same submission after an uncertain 
   service = new AsrService(db, { ...options, fetch }, 'gateway-key', e => errors.push(e));
   await service.step();
   expect(service.find(first.id).stage).toBe('running');
+  // Warm worker pipelines third into awaiting_upload while first is running.
+  expect(service.find(third.id).stage).toBe('awaiting_upload');
   await service.step();
   expect(service.findRequest(input.requestKey)).toMatchObject({
     id: first.id, stage: 'succeeded', billing: { unit: 'second', requestedSeconds: 15 },
     result: { transcripts: [{ id: 'shot-04', text: '那我花九千请你俩做什么' }] },
   });
   expect(service.find(first.id).upload).toBeUndefined();
-  expect(creates).toEqual([first.id, second.id]);
+  expect(creates).toEqual([first.id, second.id, third.id]);
   expect(starts).toEqual([first.id, first.id, first.id]);
-  await service.step();
-  expect(service.find(third.id).stage).toBe('awaiting_upload');
 });
 
-it('persists the last transcription before requesting shutdown and releases the idle clone once stopped', async () => {
+it('keeps warm during idle grace for consecutive jobs, skips redundant probes, and releases after grace expires', async () => {
   const db = new Database(':memory:');
   dbs.push(db);
+  let now = 1_000_000;
   let status = '2';
+  let getInstanceCalls = 0;
+  let healthCalls = 0;
   const closeInstance = vi.fn(async () => { status = '22'; });
   const releaseInstance = vi.fn(async () => { status = '4'; });
+  const setGpuIdleShutdown = vi.fn(async () => {});
   const platform = {
-    getInstance: async (id: string) => ({ id, status,
-      services: [{ host: 'asr.waas.aigate.cc', port: 18080, httpType: '1', protocol: 'HTTPS' }] }),
+    getInstance: async (id: string) => {
+      getInstanceCalls++;
+      return { id, status,
+        services: [{ host: 'asr.waas.aigate.cc', port: 18080, httpType: '1', protocol: 'HTTPS' }] };
+    },
     openInstance: vi.fn(),
     closeInstance,
     releaseInstance,
     getSshConnection: vi.fn(),
+    setGpuIdleShutdown,
     createInstance: vi.fn(),
     findInstancesByName: vi.fn(),
   };
   const entry = { id: 'shot-04', text: '许师傅' };
   const fetch: typeof globalThis.fetch = async (raw, init) => {
     const path = new URL(String(raw)).pathname;
-    if (path === '/health') return Response.json({ ready: true });
+    if (path === '/health') {
+      healthCalls++;
+      return Response.json({ ready: true });
+    }
     if (path === '/v1/jobs') return Response.json({
       id: JSON.parse(String(init?.body)).id, status: 'awaiting_upload', uploadToken: 'upload-token',
     });
     return Response.json({ id: path.split('/')[3], status: 'succeeded', results: [entry] });
   };
   const errors: unknown[] = [];
-  const service = new AsrService(db, { workers: [], key: 'worker-key', fetch, aigate: {
-    ids: [], platform, elastic: { rental: platform, templates: [
-      { id: 'east2', areaName: '华东二区', imageId: '100', skuName: '5090', instanceId: '101' },
+  const service = new AsrService(db, { workers: [], key: 'worker-key', fetch, clock: () => now, aigate: {
+    ids: [], platform, idleGraceMs: 30_000, elastic: { rental: platform, templates: [
+      { id: 'east2', areaName: '华东二区', imageId: '100', skuName: 'A10G-24GB', instanceId: '101' },
     ] },
   } }, 'gateway-key', error => errors.push(error));
   const job = service.create(asrJobSchema.parse({ ...source, clips: [
@@ -119,10 +130,34 @@ it('persists the last transcription before requesting shutdown and releases the 
   expect(service.find(job.id).stage).toBe('awaiting_upload');
   expect(db.prepare('SELECT upload_deadline - updated_at AS budget FROM aigate_asr_jobs WHERE id=?').get(job.id))
     .toEqual({ budget: 39_000 });
+  expect(setGpuIdleShutdown).toHaveBeenCalledExactlyOnceWith('101');
+  // While awaiting_upload, ticks must not poll AIGate or worker /health.
+  const getsBeforeUploadWait = getInstanceCalls;
+  const healthBeforeUploadWait = healthCalls;
+  now += 5_000;
+  await service.step();
+  expect(getInstanceCalls).toBe(getsBeforeUploadWait);
+  expect(healthCalls).toBe(healthBeforeUploadWait);
   expect(closeInstance).not.toHaveBeenCalled();
+  // Confirming goes straight to the persisted endpoint without extra /health.
   service.confirm(job.id);
   await service.step();
   expect(service.find(job.id)).toMatchObject({ stage: 'succeeded', result: { transcripts: [entry] } });
+  expect(healthCalls).toBe(healthBeforeUploadWait);
+  expect(closeInstance).not.toHaveBeenCalled();
+  // A follow-up job arriving 4 seconds later reuses the warm GPU with zero shutdowns.
+  now += 4_000;
+  const job2 = service.create(asrJobSchema.parse({ ...source, requestKey: 'alice-episode-2' })).job;
+  await service.step();
+  expect(service.find(job2.id).stage).toBe('awaiting_upload');
+  expect(closeInstance).not.toHaveBeenCalled();
+  service.confirm(job2.id);
+  await service.step();
+  expect(service.find(job2.id).stage).toBe('succeeded');
+  expect(closeInstance).not.toHaveBeenCalled();
+  // After 30s of true idleness, close then release.
+  now += 30_000;
+  await service.step();
   expect(closeInstance).toHaveBeenCalledExactlyOnceWith('101');
   expect(releaseInstance).not.toHaveBeenCalled();
   await service.step();
@@ -180,7 +215,7 @@ it('moves only unsubmitted reservations from retired instances to the replacemen
     findInstancesByName: async () => ({ records: [], complete: true, pagesScanned: 1 }),
   };
   const input = asrJobSchema.parse(source);
-  let service = new AsrService(db, { workers: [], key: 'worker-key', fetch, aigate: { ids: ['11', '12'], platform } },
+  let service = new AsrService(db, { workers: [], key: 'worker-key', fetch, aigate: { ids: ['11', '12'], platform, scaleOutQueueDepth: 1 } },
     'gateway-key', () => {});
   const old = service.create(input).job;
   const dispatched = service.create({ ...input, requestKey: 'already-dispatched' }).job;
@@ -257,4 +292,74 @@ it('recognizes AIGate 6001 rental rejection from the live ASR capacity contract'
       areaName: '华东一区', imageId: '123', imageType: '3', skuName: '5090', count: 1,
     })).rejects.toMatchObject({ code: 'CAPACITY_UNAVAILABLE', uncertain: false });
   } finally { vi.unstubAllGlobals(); }
+});
+
+it('avoids cold-booting a second GPU for small bursts, pipelines on the warm GPU, and scales out on large bursts', async () => {
+  const db = new Database(':memory:');
+  dbs.push(db);
+  let now = 2_000_000;
+  const rentedAreas: string[] = [];
+  let nextId = 300;
+  const instances = new Map<string, string>();
+  const platform = {
+    getInstance: async (id: string) => ({ id, status: '2',
+      services: [{ host: `${instances.get(id)}.waas.aigate.cc`, port: 18080, httpType: '1', protocol: 'HTTPS' }] }),
+    openInstance: async () => {}, closeInstance: async () => {}, releaseInstance: async () => {},
+    getSshConnection: async () => ({ host: 'ssh.waas.aigate.cc', port: 1234, username: 'root', password: 'test' }),
+    createInstance: async (req: { areaName: string }) => {
+      rentedAreas.push(req.areaName);
+      const id = String(++nextId);
+      instances.set(id, req.areaName === '华东二区' ? 'east2' : 'east1');
+      return id;
+    },
+    findInstancesByName: async () => ({ records: [], complete: true, pagesScanned: 1 }),
+  };
+  const runningJobs = new Set<string>();
+  const fetch: typeof globalThis.fetch = async (raw, init) => {
+    const path = new URL(String(raw)).pathname;
+    if (path === '/health') return Response.json({ ready: true });
+    if (path === '/v1/jobs') {
+      const id = JSON.parse(String(init?.body)).id;
+      return Response.json({ id, status: 'awaiting_upload', uploadToken: 'upload-token' });
+    }
+    const id = path.split('/')[3]!;
+    if (path.endsWith('/start')) {
+      runningJobs.add(id);
+      return Response.json({ id, status: 'running' });
+    }
+    return Response.json({ id, status: runningJobs.has(id) ? 'running' : 'succeeded',
+      results: [{ id: 'shot-04', text: 'ok' }] });
+  };
+  const errors: unknown[] = [];
+  const service = new AsrService(db, { workers: [], key: 'worker-key', fetch, clock: () => now, aigate: {
+    ids: [], platform, scaleOutQueueDepth: 3, elastic: { rental: platform, templates: [
+      { id: 'east2', areaName: '华东二区', imageId: '101', skuNames: ['A10G-24GB'] },
+      { id: 'east1', areaName: '华东一区', imageId: '102', skuNames: ['A10G-24GB'] },
+    ] },
+  } }, 'gateway-key', error => errors.push(error));
+  const j1 = service.create(asrJobSchema.parse({ ...source, requestKey: 'ep-1' })).job;
+  const j2 = service.create(asrJobSchema.parse({ ...source, requestKey: 'ep-2' })).job;
+  await service.step();
+  // Small burst (2 jobs): only east2 rents a GPU; east1 stays cold.
+  expect(rentedAreas).toEqual(['华东二区']);
+  expect(service.find(j1.id).stage).toBe('awaiting_upload');
+  expect(service.find(j2.id).stage).toBe('queued');
+  // Once j1 starts running on east2, j2 immediately pipelines onto warm east2 for upload!
+  service.confirm(j1.id);
+  await service.step();
+  expect(service.find(j1.id).stage).toBe('running');
+  expect(service.find(j2.id)).toMatchObject({ stage: 'awaiting_upload', upload: {
+    files: [{ url: `https://east2.waas.aigate.cc/v1/jobs/${j2.id}/audio/shot-04` }],
+  } });
+  expect(rentedAreas).toEqual(['华东二区']);
+  // Large burst: 3 more jobs queued (queuedCount=3 >= 1 * scaleOutQueueDepth) triggers east1 scale-out!
+  const j3 = service.create(asrJobSchema.parse({ ...source, requestKey: 'ep-3' })).job;
+  service.create(asrJobSchema.parse({ ...source, requestKey: 'ep-4' }));
+  service.create(asrJobSchema.parse({ ...source, requestKey: 'ep-5' }));
+  await service.step();
+  expect(rentedAreas).toEqual(['华东二区', '华东一区']);
+  expect(service.find(j3.id)).toMatchObject({ stage: 'awaiting_upload', upload: {
+    files: [{ url: `https://east1.waas.aigate.cc/v1/jobs/${j3.id}/audio/shot-04` }],
+  } });
+  expect(errors).toEqual([]);
 });

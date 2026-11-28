@@ -130,7 +130,7 @@ def load_model():
         os.environ.get("QWEN_ASR_MODEL_PATH", MODEL_PATH),
         dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
         device_map="cuda:0",
-        max_inference_batch_size=8,
+        max_inference_batch_size=max(1, int(os.environ.get("QWEN_ASR_MAX_BATCH_SIZE", "16"))),
         max_new_tokens=512,
     )
 
@@ -213,9 +213,8 @@ def create_app(*, load=load_model, root=None, token=None):
                 if length != spec.size or digest.hexdigest() != spec.sha256:
                     fail(422, "ASR_INPUT_MISMATCH", "收到的音频与清单不符")
                 out.flush()
-                os.fsync(out.fileno())
             try:
-                duration = audio_duration(temp)
+                duration = await asyncio.to_thread(audio_duration, temp)
             except (RuntimeError, ValueError):
                 fail(422, "ASR_AUDIO_INVALID", "音频须为可读取的 WAV 或 FLAC")
             if abs(duration - spec.durationMs) > 10:
@@ -223,12 +222,6 @@ def create_app(*, load=load_model, root=None, token=None):
             _, reply = jobs.read(job_id)
             if reply["status"] == "awaiting_upload":
                 os.replace(temp, target)
-                if hasattr(os, "O_DIRECTORY"):
-                    fd = os.open(target.parent, os.O_DIRECTORY)
-                    try:
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
             return {**spec.model_dump(), "durationMs": duration}
         finally:
             if temp is not None:
@@ -265,7 +258,7 @@ async def run_jobs(state, transcribe):
         jobs.save(reply)
         try:
             audio = [jobs.audio(job_id, spec.id) for spec in job.inputs]
-            durations = [audio_duration(path) for path in audio]
+            durations = await asyncio.to_thread(lambda: [audio_duration(path) for path in audio])
             texts = await asyncio.to_thread(transcribe, audio, job.language)
             if len(texts) != len(audio):
                 raise RuntimeError("Qwen ASR returned the wrong number of transcripts")
